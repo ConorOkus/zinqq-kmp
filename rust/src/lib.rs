@@ -20,6 +20,7 @@ pub mod payment;
 mod signer;
 mod types;
 mod util;
+pub mod vss;
 mod wallet;
 
 pub use api::{Balances, Wallet, WalletConfig, WalletError};
