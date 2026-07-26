@@ -50,7 +50,7 @@ cd iosApp && xcodegen generate
 open iosApp.xcodeproj                       # build/run the iosApp scheme on simulator or device
 ```
 
-Configuration (Esplora URL, Megalith pubkey/address, RGS URL) lives in `rust/src/config.rs`. Default Esplora is `https://mempool.space/api`; the PWA's credentialed endpoint swaps in via the same config value.
+Configuration (Esplora URL, Megalith pubkey/address, RGS URL) lives in `rust/src/config.rs`. Esplora defaults to the Zinqq PWA's own proxy (`https://zinqq.app/api/esplora`), which fronts Blockstream Enterprise staging and keeps credentials server-side; `blockstream.info` and `mempool.space` remain configurable fallbacks. Public mempool.space throttled a single request to 75s under this repo's test volume, which stalls every sync pass — prefer the proxy.
 
 ## Mainnet acceptance protocol (manual — U8 in the plan)
 
