@@ -64,13 +64,15 @@ pub(crate) const PEER_RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 
-/// Megalith's LSPS2 node id (U4). Re-verify against
-/// <https://megalithic.me> before mainnet runs.
+/// Megalith's LSPS2 node id (U4), taken from the Zinqq PWA's own working
+/// configuration (`VITE_LSP_NODE_ID`) rather than a public explorer listing.
+/// The explorer-listed `038a9e56...e889bf` at 64.23.162.51 completes a BOLT8
+/// handshake but never answers `lsps2.get_info`; it is not the LSPS2 service.
 pub const MEGALITH_LSP_NODE_ID: &str =
-    "038a9e56512ec98da2b5789761f7af8f280baf98a09282360cd6ff1381b5e889bf";
+    "034066e29e402d9cf55af1ae1026cc5adf92eed1e0e421785442f53717ad1453b0";
 
-/// Megalith's public listening address.
-pub const MEGALITH_LSP_ADDRESS: &str = "64.23.162.51:9735";
+/// Megalith's LSPS2 listening address, matching the PWA's `VITE_LSP_HOST`.
+pub const MEGALITH_LSP_ADDRESS: &str = "64.23.159.177:9735";
 
 /// Timeout for one LSPS2 request round-trip (`lsps2.get_info` or `lsps2.buy`),
 /// copied from ldk-node's `LIQUIDITY_REQUEST_TIMEOUT_SECS`.

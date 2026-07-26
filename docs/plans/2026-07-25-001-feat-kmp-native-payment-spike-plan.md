@@ -17,7 +17,7 @@ deepened: 2026-07-25
 - **Objective:** Prove Zinqq's Lightning stack runs natively by building a Kotlin Multiplatform spike app — a shared core on the LDK crates — that receives and sends a real mainnet payment through a Megalith LSPS2 JIT channel on both Android and iOS.
 - **Product authority:** This plan owns the spike only. The Zinqq PWA remains the production client and is unaffected. Store distribution, background receive, and PWA feature parity are not active scope.
 - **Execution profile:** Greenfield scaffold in this repository. Work units in dependency order U1 → U8; U1 (walking skeleton) must pass before any Lightning code. Automated gates in the Verification Contract; final acceptance (U8) is a manual mainnet payment on both platforms with small amounts (< $10 equivalent).
-- **Stop conditions:** Stop and surface rather than guess if (a) Gobley cannot produce a working iOS or Android binary in U1 after applying the documented escape hatch check, (b) Megalith rejects `lsps2.get_info` and a token cannot be obtained, or (c) any step would import or derive from the existing Zinqq wallet seed (forbidden by R5).
+- **Stop conditions:** Stop and surface rather than guess if (a) Gobley cannot produce a working iOS or Android binary in U1 after applying the documented escape hatch check, (b) Megalith stops answering `lsps2.get_info` (resolved 2026-07-26: it answers tokenless at the PWA's LSP identity), or (c) any step would import or derive from the existing Zinqq wallet seed (forbidden by R5).
 - **Open blockers:** None. The canonical product record also lives in the Zinqq web repo at `docs/plans/2026-07-25-001-feat-kmp-native-payment-spike-plan.md`.
 
 ---
@@ -111,7 +111,7 @@ flowchart TB
 ### Dependencies / Assumptions
 
 - Gobley is 0.x; generated-binding stability between versions is not guaranteed. Mitigation: pin the version, keep the exposed Rust API small. Escape hatch: the same crate emits plain Kotlin + Swift bindings via upstream UniFFI, sacrificing shared bindings but preserving the Rust core.
-- Assumption: `lightning-liquidity`'s spec-compliant LSPS2 client interoperates with Megalith. High confidence (Megalith documents standard LSPS2) but unproven until the spike's first `get_info`.
+- **Proven 2026-07-26:** `lightning-liquidity`'s LSPS2 client interoperates with Megalith. A live run completed `get_info` -> cheapest-offer selection -> `buy` -> wrapped mainnet invoice (`lnbc60u...`, intercept SCID `16173016x1761102x16056`, CLTV delta 144) and emitted `InvoiceReady`. Only the external payment itself remains for U8.
 - Assumption: cargo cross-compilation to iOS via Gobley's Gradle plugin works as documented; this is the expected first-friction point and is proven with a walking skeleton (U1) before any Lightning code.
 - Megalith remains the LSP (existing relationship and config carry over conceptually).
 
@@ -119,8 +119,12 @@ flowchart TB
 
 All three questions the requirements phase deferred to planning are resolved in the Planning Contract: Esplora access (KTD-5: the Zinqq PWA's own proxy, configurable), exact crate versions and the UniFFI surface (KTD-1, U3), and repository/scaffold layout (this repo; see Output Structure). Two execution-time unknowns remain, one of them now answered by a live run:
 
-- Whether Megalith requires an access token on `lsps2.get_info`. **Answered by live runs on 2026-07-26: a tokenless `get_info` gets no reply.** The BOLT8 handshake completes, Megalith's `Init` advertises the LSPS2 prerequisites (`ZeroConf: supported`, `SCIDPrivacy: supported`), and the connection stays healthy (Ping/Pong observed), but `{"method":"lsps2.get_info","params":{"token":null}}` draws silence. Both client-side explanations were ruled out: a 45s timeout (9x the ldk-node-parity value) changed nothing, and a double-dial race that opened two connections was fixed and the run repeated on a single healthy connection. Remaining explanation is server-side — Megalith requires a token or does not serve LSPS2 to unknown peers. This is Goal Capsule stop condition (b): request access via megalithic.me/contact before U4 can complete, and set `LspConfig.token` once issued.
-- Megalith's live fee menu, payment-size bounds, and trust-model flag. Not published; read them from the `get_info` response at runtime and enforce client-side (U4). Still unknown — blocked behind the item above.
+Both are now **answered by live mainnet runs on 2026-07-26**; no token is required.
+
+- Whether Megalith requires an access token on `lsps2.get_info`. **No — `token: null` is accepted.** The apparent rejection during the first live run was a wrong LSP identity on our side: the node id and host had been taken from public explorer listings (`038a9e56...e889bf` at `64.23.162.51`), which completes a BOLT8 handshake and even answers Ping/Pong but never replies to `lsps2.get_info` because it is not the LSPS2 service. The Zinqq PWA's own working configuration (`VITE_LSP_NODE_ID` / `VITE_LSP_HOST`) names `034066e2...1453b0` at `64.23.159.177:9735`; with that identity, `get_info` answers in ~3s and the PWA likewise sends no token. Explorer listings are not authoritative for the LSPS2 endpoint — the PWA config is.
+- Megalith's live fee menu, payment-size bounds, and trust-model flag. **Observed live:** two offers, both `proportional = 14000` ppm (1.4%) with `min_lifetime = 13140` and `max_client_to_self_delay = 512`; the cheaper offer is `min_fee_msat = 2_500_000` with `min_payment_size_msat = 2_501_000` valid ~5h, the dearer `min_fee_msat = 3_125_000` with `min_payment_size_msat = 3_126_000` valid ~27h. Both cap at `max_payment_size_msat = 16_000_000_000`. `lsps2.buy` returns `lsp_cltv_expiry_delta = 144` and **`client_trusts_lsp: true`** — meaning the client releases the preimage before seeing the funding transaction, so the spike is exposed to the LSP not broadcasting it. Acceptable at spike amounts, but it makes the received amount the trust ceiling and is worth stating before amounts grow (see Risks).
+
+Consequence for the acceptance run (U8): the opening fee is a 2,500 sat floor, not a percentage at these sizes, so a receive must exceed 2,501 sats and only amounts well above it leave a sensible remainder. The README protocol uses 6,000 sats (fee 2,500, keep 3,500).
 
 ### Sources / Research
 
@@ -415,7 +419,9 @@ Exact Gradle task names are fixed once U1 lands the scaffold; the gates below ar
 | Risk | Mitigation |
 |---|---|
 | Gobley 0.x churn or iOS linking failures (LLVM mismatch, JNA direct-mapping regressions) | Exact 0.3.7 pin; U1 walking skeleton proves the whole toolchain before Lightning work; documented escape hatch to upstream UniFFI per-platform bindings |
-| Megalith LSPS2 not production-ready; token requirement unknown | `token: None` first; contact request sent during U1; all LSPS2 failures surface as distinct events; acceptance amounts are small |
+| Megalith LSPS2 not production-ready | Proven live 2026-07-26: `get_info` + `buy` + wrapped-invoice assembly all succeed tokenless against `034066e2...1453b0`. All LSPS2 failures surface as distinct events; acceptance amounts stay small |
+| `client_trusts_lsp: true` — the client releases the preimage before seeing the funding tx, so a non-broadcasting LSP keeps the payment | Inherent to Megalith's advertised mode; the received amount is the trust ceiling. Bounded by the < $10 acceptance cap; revisit before any larger amount |
+| LSP identity drift — explorer listings name a different node than the LSPS2 service | Identity is sourced from the PWA's own config and pinned in `rust/src/config.rs` with a comment recording why the explorer value is wrong |
 | Fund loss via monitor-persistence bugs | KTD-4 monitor-first durable writes; restart-safety test is a named gate; amounts < $10 |
 | Public Esplora rate limiting / outage | Capped retry with backoff; config-swappable URL (KTD-5) |
 | `lightning 0.3.0-beta` ecosystem churn mid-spike | Hard 0.2.x pins (KTD-1); no beta upgrades during the spike |

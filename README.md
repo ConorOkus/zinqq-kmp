@@ -57,8 +57,8 @@ Configuration (Esplora URL, Megalith pubkey/address, RGS URL) lives in `rust/src
 Amounts stay under $10 equivalent. The payer must be a **separate device** — the node is foreground-only and stops when the app backgrounds. Keep the app foregrounded from invoice display until `PaymentReceived`.
 
 1. Fresh install on Android. First launch generates a new seed (there is no import path).
-2. Request an invoice for an amount comfortably above Megalith's minimum fee (read from the live fee menu; the app rejects amounts at or below it).
-3. Pay from an external wallet on another device. Expect: JIT channel opens (0-conf), balance shows amount minus the skimmed opening fee.
+2. Request an invoice for at least **6,000 sats**. Megalith's observed floor is a flat 2,500 sat opening fee with a 2,501 sat minimum payment (1.4% proportional only matters above ~180k sats), so 6,000 sats received leaves ~3,500. The app reads the live menu and rejects amounts at or below the fee.
+3. Pay from an external wallet on another device. Expect: JIT channel opens (0-conf), balance shows amount minus the skimmed opening fee. Megalith advertises `client_trusts_lsp: true`, so the preimage is released before the funding transaction is visible — the received amount is the trust ceiling.
 4. Send a small payment out to an external invoice from the JIT channel balance.
 5. Repeat 1–4 on iOS with zero platform Lightning-code changes.
 6. Record results below (payment hashes only — never preimages or the seed; no secrets in screenshots).
@@ -69,3 +69,18 @@ _Not yet run._
 
 | Date | Platform | Received (msat) | Skimmed fee (msat) | Sent (msat) | Payment hashes | Notes |
 |---|---|---|---|---|---|---|
+
+### Verified live (2026-07-26)
+
+The client half of the JIT receive flow is proven against mainnet Megalith, so only
+the external payment remains manual:
+
+```bash
+cd rust
+cargo test --lib -- --ignored live_megalith_get_info      # real fee menu
+cargo test --lib -- --ignored live_megalith_receive_jit   # get_info + buy + invoice
+```
+
+The LSP identity in `rust/src/config.rs` comes from the Zinqq PWA's own working
+configuration, not from public explorer listings — the explorer-listed node
+completes a handshake but never answers `lsps2.get_info`.

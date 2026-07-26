@@ -778,6 +778,31 @@ mod tests {
 
     // ---------- live smoke test (plan-required, network) ----------
 
+    /// The FULL live receive flow against Megalith: `get_info` -> select
+    /// cheapest valid params -> `buy` -> build the wrapped invoice. Proves F1's
+    /// client half end to end with real LSP params (no funds move; the invoice
+    /// simply expires unpaid).
+    /// Run manually: `cargo test -- --ignored live_megalith_receive_jit`
+    #[test]
+    #[ignore]
+    fn live_megalith_receive_jit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::new(dir.path().to_str().unwrap().to_string());
+        let node = crate::node::Node::new(config);
+        node.start().expect("node must start (needs network)");
+
+        // Comfortably above Megalith's observed 2_501_000 msat minimum.
+        let (bolt11, expiry) = node
+            .receive_jit(6_000_000)
+            .expect("live receive_jit against Megalith must succeed");
+        eprintln!("JIT invoice (expires {expiry}):\n{bolt11}");
+        assert!(
+            bolt11.starts_with("lnbc"),
+            "must be a mainnet bolt11, got {bolt11}"
+        );
+        node.stop().unwrap();
+    }
+
     /// ONE real `lsps2.get_info` against Megalith, logging the fee menu.
     /// Run manually: `cargo test -- --ignored live_megalith_get_info`
     #[test]
