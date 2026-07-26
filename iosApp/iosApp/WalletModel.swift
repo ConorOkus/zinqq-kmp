@@ -20,7 +20,7 @@ enum WalletEvent {
     case syncFailed
     case syncCompleted
     case invoiceReady(bolt11: String, expiryUnixSecs: UInt64)
-    case paymentReceived(amountMsat: UInt64, skimmedFeeMsat: UInt64)
+    case paymentReceived(amountMsat: UInt64, skimmedFeeMsat: UInt64?)
     case paymentSuccessful
     case paymentFailed(reason: String)
     case channelPending
@@ -43,7 +43,8 @@ enum WalletEvent {
         case let e as Event.InvoiceReady:
             return .invoiceReady(bolt11: e.bolt11, expiryUnixSecs: e.expiryUnixSecs)
         case let e as Event.PaymentReceived:
-            return .paymentReceived(amountMsat: e.amountMsat, skimmedFeeMsat: e.skimmedFeeMsat)
+            // skimmed_fee_msat is Option<u64> in Rust, so it arrives as KotlinULong?
+            return .paymentReceived(amountMsat: e.amountMsat, skimmedFeeMsat: e.skimmedFeeMsat?.uint64Value)
         case is Event.PaymentSuccessful:
             return .paymentSuccessful
         case let e as Event.PaymentFailed:
@@ -263,7 +264,11 @@ final class WalletModel: ObservableObject {
             currentInvoice = Invoice(bolt11: bolt11, expiryUnixSecs: expiryUnixSecs)
         case let .paymentReceived(amountMsat, skimmedFeeMsat):
             currentInvoice = nil
-            lastOutcome = "Received \(amountMsat) msat (LSP fee \(skimmedFeeMsat) msat)"
+            if let skimmedFeeMsat {
+                lastOutcome = "Received \(amountMsat) msat (LSP fee \(skimmedFeeMsat) msat)"
+            } else {
+                lastOutcome = "Received \(amountMsat) msat"
+            }
             refreshBalances()
         case .paymentSuccessful:
             lastOutcome = "Payment sent"

@@ -4,7 +4,7 @@ package zinqq.spike
 // uniffi plugin (library mode) from the wallet-core cdylib; UniFFI lower-camels
 // the exported Rust fn names (core_version -> coreVersion) and maps the
 // exported Wallet object / Event enum / WalletConfig record to Kotlin types.
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.withContext
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.Wallet
@@ -45,16 +45,17 @@ object WalletCore {
      * Handle-then-ack event loop (KTD-8). Each event is passed to [onEvent]
      * BEFORE it is acked, so a crash between handling and acking redelivers
      * the same event on the next loop or restart — handlers must be
-     * idempotent. Runs on [Dispatchers.IO] and returns after handling and
-     * acking the terminal [Event.NodeStopped] (which `stop()` pushes to
-     * complete a pending `nextEvent`); restart the loop after the next
-     * `start()` on foreground (KTD-10).
+     * idempotent. Runs on [ioDispatcher] (`Dispatchers.IO` is unavailable in
+     * commonMain on Kotlin/Native) and returns after handling and acking the
+     * terminal [Event.NodeStopped] (which `stop()` pushes to complete a
+     * pending `nextEvent`); restart the loop after the next `start()` on
+     * foreground (KTD-10).
      */
     suspend fun runEventLoop(
         wallet: Wallet,
         onEvent: suspend (Event) -> Unit,
     ) {
-        withContext(Dispatchers.IO) {
+        withContext(ioDispatcher) {
             while (true) {
                 val event = wallet.nextEvent()
                 onEvent(event)
@@ -64,3 +65,9 @@ object WalletCore {
         }
     }
 }
+
+/**
+ * Dispatcher for the blocking FFI calls the event loop makes. `Dispatchers.IO`
+ * is JVM/Android-only from commonMain, so each platform supplies its own.
+ */
+internal expect val ioDispatcher: CoroutineDispatcher
