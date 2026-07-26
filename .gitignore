@@ -1,0 +1,20 @@
+# Gradle
+.gradle/
+build/
+local.properties
+
+# Rust
+rust/target/
+
+# IDE
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Xcode (iosApp.xcodeproj is generated from iosApp/project.yml via xcodegen)
+iosApp/iosApp.xcodeproj/
+xcuserdata/
+DerivedData/
+*.xcworkspace

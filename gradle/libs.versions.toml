@@ -1,0 +1,28 @@
+[versions]
+# KTD-2: Gobley pinned exactly at 0.3.7 (0.3.6 changed JNA mapping; 0.3.7 fixed
+# a loading regression). Kotlin stays on the 2.1.x line Gobley 0.3.7 targets.
+gobley = "0.3.7"
+kotlin = "2.1.21"
+agp = "8.9.2"
+coroutines = "1.10.2"
+androidx-activity-compose = "1.10.1"
+androidx-compose-bom = "2025.05.01"
+
+[libraries]
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activity-compose" }
+androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "androidx-compose-bom" }
+androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlin-atomicfu = { id = "org.jetbrains.kotlin.plugin.atomicfu", version.ref = "kotlin" }
+gobley-cargo = { id = "dev.gobley.cargo", version.ref = "gobley" }
+gobley-uniffi = { id = "dev.gobley.uniffi", version.ref = "gobley" }

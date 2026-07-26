@@ -1,0 +1,38 @@
+[package]
+name = "wallet-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "wallet_core"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+# Exact pin: Gobley 0.3.7 pairs with uniffi 0.29.4 (KTD-2); a semver-open
+# requirement drifts to 0.29.5+.
+uniffi = "=0.29.4"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+# KTD-1: ldk-node 0.7.0-parity pin set. Declared in full so the walking
+# skeleton compiles and links the real dependency graph (secp256k1 C build,
+# rustls/HTTP stack) before any Lightning code lands in U2.
+lightning = "0.2.4"
+lightning-liquidity = "0.2.3"
+lightning-transaction-sync = { version = "0.2.1", features = ["esplora-async-https"] }
+lightning-background-processor = "0.2.3"
+lightning-net-tokio = "0.2.0"
+lightning-persister = "0.2.3"
+lightning-invoice = "0.34.1"
+bdk_wallet = "2.4.0"
+bdk_esplora = "0.22"
+bitcoin = "0.32"
+esplora-client = "0.12"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# NOTE: panic = "abort" is deliberately NOT set — UniFFI relies on unwinding
+# to surface Rust panics as foreign exceptions.
