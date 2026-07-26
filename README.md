@@ -21,9 +21,10 @@ iosApp/      SwiftUI shell (same shape; XcodeGen project.yml)
 ## Prerequisites
 
 - Rust (stable) with mobile targets: `rustup target add aarch64-linux-android x86_64-linux-android aarch64-apple-ios aarch64-apple-ios-sim`
-- JDK 17+, Android SDK with **NDK r28+** (16 KB page alignment), `ANDROID_HOME` set
+- JDK **21** (JDK 26 is too new for the Android Gradle Plugin in use)
+- Android SDK 35 with **NDK r28+** (16 KB page alignment) and an emulator system image; point `local.properties` at it via `sdk.dir=`
 - Xcode 16+ (full install, not CommandLineTools) and [XcodeGen](https://github.com/yonaskolb/XcodeGen) for `iosApp`
-- A Gradle install to generate the wrapper once: `gradle wrapper`
+- The Gradle wrapper is committed, so `./gradlew` needs no separate Gradle install
 
 ## Build and run
 
@@ -31,8 +32,8 @@ Rust core (host, no mobile toolchain needed):
 
 ```bash
 cd rust
-cargo test                                  # 67 offline tests
-cargo test -- --ignored live_megalith_get_info   # one live LSPS2 get_info against Megalith (network)
+cargo test                                  # 68 offline tests
+cargo test --lib -- --ignored live_megalith_receive_jit  # live LSPS2 flow (network)
 ```
 
 Android:
