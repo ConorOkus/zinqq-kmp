@@ -72,6 +72,9 @@ pub const KV_STORE_SUBDIR: &str = "store";
 pub enum BuildError {
     /// The node is already running.
     AlreadyRunning,
+    /// Another node already holds the storage directory's lock. Two live nodes
+    /// on one seed diverge on channel state, so the second start is refused.
+    InstanceAlreadyRunning,
     /// The node is not running.
     NotRunning,
     /// The storage directory or seed file could not be written.
@@ -101,6 +104,9 @@ impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
             BuildError::AlreadyRunning => "the node is already running",
+            BuildError::InstanceAlreadyRunning => {
+                "another node is already running against this storage directory"
+            }
             BuildError::NotRunning => "the node is not running",
             BuildError::WriteFailed => "failed to write node data",
             BuildError::ReadFailed => "failed to read persisted node data",

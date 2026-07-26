@@ -257,3 +257,34 @@ fn balances_require_a_running_node_and_read_zero_on_fresh_start() {
 
     assert_eq!(wallet.balances(), Err(WalletError::NotRunning));
 }
+
+/// The Android back-press scenario: an activity is destroyed without stopping
+/// the node, so its `Wallet` and the still-running LDK node leak into the
+/// cached process; relaunching builds a *second* `Wallet` over the same
+/// `filesDir/wallet`. Two live nodes on one seed write the same monitors and
+/// manager with last-writer-wins, which is the channel-state divergence the
+/// plan's fresh-wallet decision exists to avoid. The second start must be
+/// refused rather than silently succeed.
+#[test]
+fn a_second_wallet_over_the_same_storage_dir_cannot_start() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let first = test_wallet(dir.path());
+    first.start().expect("first wallet must start");
+
+    // The leaked-activity case: a brand-new Wallet over the same directory.
+    let second = test_wallet(dir.path());
+    let result = second.start();
+    assert!(
+        matches!(result, Err(WalletError::InstanceAlreadyRunning)),
+        "a second wallet over the same storage dir must be refused, got {result:?}"
+    );
+
+    // Once the first releases, a normal relaunch works — the guard must not
+    // strand the wallet after a legitimate stop.
+    first.stop().expect("first wallet must stop");
+    second
+        .start()
+        .expect("after the first stops, a relaunch must start");
+    second.stop().unwrap();
+}

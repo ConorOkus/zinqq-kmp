@@ -43,6 +43,10 @@ pub struct Balances {
 pub enum WalletError {
     /// `start()` while already running.
     AlreadyRunning,
+    /// Another node already holds this storage directory's lock — a second
+    /// wallet instance (another activity, another process) tried to start over
+    /// the same seed. Refused: two live nodes diverge on channel state.
+    InstanceAlreadyRunning,
     /// An operation that needs a running node while stopped.
     NotRunning,
     /// The node failed to start (restore/persistence/config problem).
@@ -74,6 +78,10 @@ impl std::fmt::Display for WalletError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WalletError::AlreadyRunning => write!(f, "the node is already running"),
+            WalletError::InstanceAlreadyRunning => write!(
+                f,
+                "another wallet instance is already running against this storage directory"
+            ),
             WalletError::NotRunning => write!(f, "the node is not running"),
             WalletError::Startup { detail } => write!(f, "failed to start the node: {detail}"),
             WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
@@ -105,6 +113,7 @@ impl From<BuildError> for WalletError {
     fn from(error: BuildError) -> Self {
         match error {
             BuildError::AlreadyRunning => WalletError::AlreadyRunning,
+            BuildError::InstanceAlreadyRunning => WalletError::InstanceAlreadyRunning,
             BuildError::NotRunning => WalletError::NotRunning,
             other => WalletError::Startup {
                 detail: other.to_string(),
