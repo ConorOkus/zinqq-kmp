@@ -13,7 +13,9 @@ use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
 use lightning::sign::{InMemorySigner, KeysManager};
 use lightning::util::logger::{Logger as LdkLogger, Record};
+use lightning::util::persist::KVStoreSyncWrapper;
 use lightning::util::sweep::OutputSweeperSync;
+use lightning_liquidity::utils::time::DefaultTimeProvider;
 use lightning_net_tokio::SocketDescriptor;
 use lightning_persister::fs_store::FilesystemStore;
 
@@ -73,15 +75,30 @@ pub(crate) type OnionMessenger = LdkOnionMessenger<
     IgnoringMessageHandler,
 >;
 
+/// The LSPS2 client (U4). The async-`KVStore` variant is required because the
+/// background processor's `_with_kv_store_sync` entry point still takes the
+/// async `ALiquidityManager` bound; `KVStoreSyncWrapper` adapts our
+/// `FilesystemStore`. Client-only (no service config), system clock.
+pub(crate) type LiquidityManager = lightning_liquidity::LiquidityManager<
+    Arc<KeysManager>,
+    Arc<KeysManager>,
+    Arc<ChannelManager>,
+    Arc<ChainSource>,
+    KVStoreSyncWrapper<Arc<FilesystemStore>>,
+    DefaultTimeProvider,
+    Arc<Broadcaster>,
+>;
+
 /// Gossip arrives via RGS (KTD-6), so the routing message handler is ignoring;
-/// the custom message handler slot is where U4 plugs the `LiquidityManager` in.
+/// the custom message handler slot carries the `LiquidityManager` — without
+/// this, LSPS2 silently does nothing (KTD-9).
 pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
     SocketDescriptor,
     Arc<ChannelManager>,
     Arc<IgnoringMessageHandler>,
     Arc<OnionMessenger>,
     Arc<Logger>,
-    Arc<IgnoringMessageHandler>,
+    Arc<LiquidityManager>,
     Arc<KeysManager>,
     Arc<ChainMonitor>,
 >;

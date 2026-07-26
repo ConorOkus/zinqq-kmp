@@ -117,6 +117,7 @@ fn constructor_surface_has_no_seed_or_mnemonic_input() {
         esplora_url: _,
         rgs_url: _,
         peers: _,
+        lsp: _,
     } = test_config(tempfile::tempdir().unwrap().path());
 }
 

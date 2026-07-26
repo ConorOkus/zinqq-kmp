@@ -15,28 +15,43 @@ use lightning::events::{Event, ReplayEvent};
 use lightning::log_error;
 use lightning::log_info;
 use lightning::util::logger::Logger as _;
-use lightning_background_processor::{
-    process_events_async_with_kv_store_sync, GossipSync, NO_LIQUIDITY_MANAGER,
-};
+use lightning_background_processor::{process_events_async_with_kv_store_sync, GossipSync};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
 use crate::builder::{build, persist_channel_manager, BuildError, NodeComponents};
 use crate::config::{
-    Config, FEE_UPDATE_INTERVAL, LIGHTNING_SYNC_INTERVAL, ONCHAIN_SYNC_INTERVAL,
+    Config, PeerInfo, FEE_UPDATE_INTERVAL, LIGHTNING_SYNC_INTERVAL, ONCHAIN_SYNC_INTERVAL,
     PEER_RECONNECT_INTERVAL, RGS_SYNC_INTERVAL,
 };
+use crate::liquidity::{LiquiditySource, Lsps2Error};
 use crate::types::{Logger, Sweeper};
 
-/// Internal core events. This is the seam U3's persisted event queue plugs
-/// into: the queue will implement [`EventSink`] and map/extend these into the
-/// public FFI `Event` enum. Until then a logging sink consumes them.
+/// Internal core events, mapped into the public FFI `Event` enum by the
+/// persisted event queue (the [`EventSink`] seam).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CoreEvent {
     /// A background chain sync pass reached the tip.
     ChainSyncCompleted,
     /// A background chain sync pass failed; it will be retried.
     ChainSyncFailed,
+    /// A JIT invoice is ready to display (U4).
+    InvoiceReady {
+        bolt11: String,
+        expiry_unix_secs: u64,
+    },
+    /// An inbound payment was durably claimed (U4). `skimmed_fee_msat` is the
+    /// JIT opening fee the LSP withheld, observed on the claimable event.
+    PaymentReceived {
+        amount_msat: u64,
+        skimmed_fee_msat: Option<u64>,
+    },
+    /// An inbound (JIT) channel is pending confirmation.
+    ChannelPending,
+    /// An inbound (JIT) channel is usable.
+    ChannelReady,
+    /// The LSPS2 flow failed (U4).
+    Lsps2Failed { reason: String },
 }
 
 /// Consumer of [`CoreEvent`]s (U3 seam).
@@ -57,7 +72,8 @@ impl EventSink for LoggingEventSink {
 struct RunningState {
     runtime: Runtime,
     components: NodeComponents,
-    /// Stops the sync/broadcast/reconnect tasks.
+    liquidity_source: Arc<LiquiditySource>,
+    /// Stops the sync/broadcast/reconnect/liquidity tasks.
     stop_sender: watch::Sender<()>,
     /// Stops the background processor (which persists on the way out).
     bp_stop_sender: watch::Sender<()>,
@@ -118,6 +134,11 @@ impl Node {
 
         let components = build(&self.config, &runtime)?;
         let chain_synced = Arc::new(AtomicBool::new(components.chain_synced_at_start));
+        let liquidity_source = Arc::new(LiquiditySource::from_components(
+            &components,
+            self.config.lsp.clone(),
+            self.config.network,
+        ));
 
         let (stop_sender, _) = watch::channel(());
         let (bp_stop_sender, _) = watch::channel(());
@@ -130,18 +151,102 @@ impl Node {
             Arc::clone(&chain_synced),
         );
         self.spawn_peer_reconnect_task(&runtime, &components, stop_sender.subscribe());
-        let bp_handle =
-            spawn_background_processor(&runtime, &components, bp_stop_sender.subscribe());
+        self.spawn_liquidity_event_task(
+            &runtime,
+            &components,
+            Arc::clone(&liquidity_source),
+            stop_sender.subscribe(),
+        );
+        let bp_handle = spawn_background_processor(
+            &runtime,
+            &components,
+            Arc::clone(&liquidity_source),
+            Arc::clone(&self.event_sink),
+            bp_stop_sender.subscribe(),
+        );
 
         *state_lock = Some(RunningState {
             runtime,
             components,
+            liquidity_source,
             stop_sender,
             bp_stop_sender,
             bp_handle,
             chain_synced,
         });
         Ok(())
+    }
+
+    /// Requests a JIT invoice for `amount_msat` from the configured LSP,
+    /// driving connect → get_info → buy → invoice in one blocking call (call
+    /// from a background dispatcher, like `start`). On success the invoice is
+    /// ALSO pushed as `InvoiceReady`; every failure is pushed as
+    /// `Lsps2Failed` with a distinct reason.
+    pub fn receive_jit(&self, amount_msat: u64) -> Result<(String, u64), Lsps2Error> {
+        let (liquidity_source, runtime_handle) = {
+            let state_lock = self.state.lock().unwrap();
+            let state = state_lock.as_ref().ok_or(Lsps2Error::NotRunning)?;
+            (
+                Arc::clone(&state.liquidity_source),
+                state.runtime.handle().clone(),
+            )
+        };
+
+        // Run the flow on the node runtime and wait outside the state lock,
+        // so a concurrent stop() can't deadlock; a dropped runtime surfaces
+        // as a closed channel, not a hang.
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        runtime_handle.spawn(async move {
+            let _ = result_sender.send(liquidity_source.receive_jit(amount_msat).await);
+        });
+        let result = result_receiver
+            .blocking_recv()
+            .unwrap_or(Err(Lsps2Error::Shutdown));
+
+        match result {
+            Ok((invoice, expiry_unix_secs)) => {
+                let bolt11 = invoice.to_string();
+                self.event_sink.emit(CoreEvent::InvoiceReady {
+                    bolt11: bolt11.clone(),
+                    expiry_unix_secs,
+                });
+                Ok((bolt11, expiry_unix_secs))
+            }
+            Err(error) => {
+                self.event_sink.emit(CoreEvent::Lsps2Failed {
+                    reason: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Test-only: one real `lsps2.get_info` round-trip (the plan's live
+    /// Megalith smoke test).
+    #[cfg(test)]
+    pub(crate) fn lsps2_get_info_live(
+        &self,
+    ) -> Result<Vec<lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams>, Lsps2Error> {
+        let (liquidity_source, runtime_handle) = {
+            let state_lock = self.state.lock().unwrap();
+            let state = state_lock.as_ref().ok_or(Lsps2Error::NotRunning)?;
+            (
+                Arc::clone(&state.liquidity_source),
+                state.runtime.handle().clone(),
+            )
+        };
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        runtime_handle.spawn(async move {
+            let result = async {
+                liquidity_source.ensure_lsp_connected().await?;
+                liquidity_source.request_opening_params().await
+            }
+            .await;
+            let _ = result_sender.send(result);
+        });
+        result_receiver
+            .blocking_recv()
+            .unwrap_or(Err(Lsps2Error::Shutdown))
     }
 
     /// Stops the node: signals every task, waits for the background processor
@@ -330,10 +435,13 @@ impl Node {
         components: &NodeComponents,
         mut stop_receiver: watch::Receiver<()>,
     ) {
-        if self.config.peers.is_empty() {
-            return;
-        }
-        let peers = self.config.peers.clone();
+        // The LSP peer is always kept connected (U4); LSPS2 requests
+        // additionally connect on demand if this loop hasn't run yet.
+        let mut peers = self.config.peers.clone();
+        peers.push(PeerInfo {
+            node_id: self.config.lsp.node_id,
+            address: self.config.lsp.address,
+        });
         let peer_manager = Arc::clone(&components.peer_manager);
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(PEER_RECONNECT_INTERVAL);
@@ -364,15 +472,39 @@ impl Node {
             }
         });
     }
+
+    /// Pumps `LiquidityManager` events into the [`LiquiditySource`], which
+    /// resolves the pending get_info/buy awaits (U4).
+    fn spawn_liquidity_event_task(
+        &self,
+        runtime: &Runtime,
+        components: &NodeComponents,
+        liquidity_source: Arc<LiquiditySource>,
+        mut stop_receiver: watch::Receiver<()>,
+    ) {
+        let liquidity_manager = Arc::clone(&components.liquidity_manager);
+        runtime.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_receiver.changed() => return,
+                    event = liquidity_manager.next_event_async() => {
+                        liquidity_source.handle_liquidity_event(event);
+                    }
+                }
+            }
+        });
+    }
 }
 
-/// Handles LDK events. Only durable handling of `SpendableOutputs` matters for
-/// U2 (fund safety on channel close); every other variant is tolerated by
-/// logging and acking. U3/U4/U5 extend this with the payment/channel logic and
-/// route events into the public queue.
+/// Handles LDK events: durable `SpendableOutputs` (U2 fund safety), the U4
+/// JIT-receive cluster (0-conf channel acceptance, claimable→claim_funds,
+/// claimed→PaymentReceived, channel pending/ready), and log-and-ack for the
+/// rest (U5 extends this with the send-payment outcomes).
 fn handle_ldk_event(
     event: Event,
     sweeper: &Sweeper,
+    liquidity_source: &LiquiditySource,
+    event_sink: &Arc<dyn EventSink>,
     logger: &Arc<Logger>,
 ) -> Result<(), ReplayEvent> {
     match event {
@@ -394,6 +526,50 @@ fn handle_ldk_event(
                     ReplayEvent()
                 })
         }
+        // KTD-9: 0-conf acceptance from the trusted LSP only.
+        Event::OpenChannelRequest {
+            temporary_channel_id,
+            counterparty_node_id,
+            ..
+        } => {
+            liquidity_source.on_open_channel_request(temporary_channel_id, counterparty_node_id);
+            Ok(())
+        }
+        Event::PaymentClaimable {
+            payment_hash,
+            counterparty_skimmed_fee_msat,
+            purpose,
+            ..
+        } => {
+            // claim_funds is idempotent in LDK, so a replayed claimable after
+            // an unacked claim is tolerated.
+            liquidity_source.on_payment_claimable(
+                payment_hash,
+                counterparty_skimmed_fee_msat,
+                &purpose,
+            );
+            Ok(())
+        }
+        // The durable success signal for a receive.
+        Event::PaymentClaimed {
+            payment_hash,
+            amount_msat,
+            ..
+        } => {
+            event_sink.emit(CoreEvent::PaymentReceived {
+                amount_msat,
+                skimmed_fee_msat: liquidity_source.take_skim(&payment_hash),
+            });
+            Ok(())
+        }
+        Event::ChannelPending { .. } => {
+            event_sink.emit(CoreEvent::ChannelPending);
+            Ok(())
+        }
+        Event::ChannelReady { .. } => {
+            event_sink.emit(CoreEvent::ChannelReady);
+            Ok(())
+        }
         other => {
             log_info!(logger, "Acking unhandled LDK event: {other:?}");
             Ok(())
@@ -404,11 +580,14 @@ fn handle_ldk_event(
 fn spawn_background_processor(
     runtime: &Runtime,
     components: &NodeComponents,
+    liquidity_source: Arc<LiquiditySource>,
+    event_sink: Arc<dyn EventSink>,
     bp_stop_receiver: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     let kv_store = Arc::clone(&components.kv_store);
     let chain_monitor = Arc::clone(&components.chain_monitor);
     let channel_manager = Arc::clone(&components.channel_manager);
+    let liquidity_manager = Arc::clone(&components.liquidity_manager);
     let onion_messenger = Arc::clone(&components.onion_messenger);
     let gossip_sync = components.gossip_source.gossip_sync();
     let peer_manager = Arc::clone(&components.peer_manager);
@@ -421,8 +600,10 @@ fn spawn_background_processor(
     let event_logger = Arc::clone(&components.logger);
     let event_handler = move |event: Event| {
         let sweeper = Arc::clone(&event_sweeper);
+        let liquidity_source = Arc::clone(&liquidity_source);
+        let event_sink = Arc::clone(&event_sink);
         let logger = Arc::clone(&event_logger);
-        async move { handle_ldk_event(event, &sweeper, &logger) }
+        async move { handle_ldk_event(event, &sweeper, &liquidity_source, &event_sink, &logger) }
     };
 
     let sleeper = move |duration: Duration| {
@@ -444,9 +625,10 @@ fn spawn_background_processor(
             Some(onion_messenger),
             GossipSync::rapid(gossip_sync),
             peer_manager,
-            // U4 wires the LiquidityManager into this slot (and the peer
-            // manager's custom message handler).
-            NO_LIQUIDITY_MANAGER,
+            // The LiquidityManager rides in BOTH this slot (message-queue
+            // polling + persistence) and the peer manager's custom message
+            // handler — omitting either makes LSPS2 silently do nothing.
+            Some(liquidity_manager),
             Some(sweeper),
             logger,
             Some(scorer),

@@ -30,6 +30,7 @@ use lightning::routing::scoring::{
 };
 use lightning::sign::{EntropySource, InMemorySigner, KeysManager, NodeSigner};
 use lightning::util::logger::Logger as _;
+use lightning::util::persist::KVStoreSyncWrapper;
 use lightning::util::persist::{
     read_channel_monitors, KVStoreSync, CHANNEL_MANAGER_PERSISTENCE_KEY,
     CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -41,14 +42,16 @@ use lightning::util::persist::{
 };
 use lightning::util::ser::{ReadableArgs, Writeable};
 use lightning::util::sweep::OutputSweeperSync;
+use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
+use lightning_liquidity::LiquidityClientConfig;
 use lightning_persister::fs_store::FilesystemStore;
 
 use crate::chain::{Broadcaster, ChainSource, GossipSource};
 use crate::config::{default_user_config, Config};
 use crate::fees::CachedFeeEstimator;
 use crate::types::{
-    ChainMonitor, ChannelManager, Graph, Logger, MessageRouter, OnionMessenger, PeerManager,
-    Scorer, Sweeper,
+    ChainMonitor, ChannelManager, Graph, LiquidityManager, Logger, MessageRouter, OnionMessenger,
+    PeerManager, Scorer, Sweeper,
 };
 use crate::wallet::OnchainWallet;
 
@@ -121,9 +124,11 @@ pub(crate) struct NodeComponents {
     pub(crate) chain_source: Arc<ChainSource>,
     pub(crate) broadcaster: Arc<Broadcaster>,
     pub(crate) onchain_wallet: Arc<OnchainWallet>,
+    pub(crate) keys_manager: Arc<KeysManager>,
     pub(crate) chain_monitor: Arc<ChainMonitor>,
     pub(crate) channel_manager: Arc<ChannelManager>,
     pub(crate) onion_messenger: Arc<OnionMessenger>,
+    pub(crate) liquidity_manager: Arc<LiquidityManager>,
     pub(crate) peer_manager: Arc<PeerManager>,
     pub(crate) scorer: Arc<Mutex<Scorer>>,
     pub(crate) gossip_source: Arc<GossipSource>,
@@ -423,11 +428,42 @@ pub(crate) fn build(
         Arc::clone(&logger),
     ));
 
+    // LSPS2 client (U4): the LiquidityManager is BOTH the PeerManager's
+    // custom message handler (below) and the background processor's liquidity
+    // slot — omitting either makes LSPS2 silently do nothing (KTD-9). The
+    // constructor is async only because of the async-KVStore bound; over the
+    // sync FilesystemStore it resolves on the first poll.
+    let liquidity_manager: Arc<LiquidityManager> = Arc::new(
+        runtime
+            .block_on(LiquidityManager::new(
+                Arc::clone(&keys_manager),
+                Arc::clone(&keys_manager),
+                Arc::clone(&channel_manager),
+                Some(Arc::clone(&chain_source)),
+                Some(ChainParameters {
+                    network: config.network,
+                    best_block: channel_manager.current_best_block(),
+                }),
+                KVStoreSyncWrapper(Arc::clone(&kv_store)),
+                Arc::clone(&broadcaster),
+                None,
+                Some(LiquidityClientConfig {
+                    lsps1_client_config: None,
+                    lsps2_client_config: Some(LSPS2ClientConfig::default()),
+                    lsps5_client_config: None,
+                }),
+            ))
+            .map_err(|e| {
+                log_error!(logger, "Failed to build liquidity manager: {e}");
+                BuildError::ReadFailed
+            })?,
+    );
+
     let msg_handler = MessageHandler {
         chan_handler: Arc::clone(&channel_manager),
         route_handler: Arc::new(IgnoringMessageHandler {}),
         onion_message_handler: Arc::clone(&onion_messenger),
-        custom_message_handler: Arc::new(IgnoringMessageHandler {}),
+        custom_message_handler: Arc::clone(&liquidity_manager),
         send_only_message_handler: Arc::clone(&chain_monitor),
     };
     let ephemeral_bytes: [u8; 32] = keys_manager.get_secure_random_bytes();
@@ -481,9 +517,11 @@ pub(crate) fn build(
         chain_source,
         broadcaster,
         onchain_wallet,
+        keys_manager,
         chain_monitor,
         channel_manager,
         onion_messenger,
+        liquidity_manager,
         peer_manager,
         scorer,
         gossip_source,

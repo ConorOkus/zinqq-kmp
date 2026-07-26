@@ -10,14 +10,17 @@ mod chain;
 pub mod config;
 pub mod events;
 mod fees;
+mod invoice;
+pub mod liquidity;
 pub mod node;
 mod types;
 mod wallet;
 
 pub use api::{Balances, Wallet, WalletConfig, WalletError};
 pub use builder::BuildError;
-pub use config::{Config, PeerInfo};
+pub use config::{Config, LspConfig, PeerInfo};
 pub use events::Event;
+pub use liquidity::Lsps2Error;
 pub use node::Node;
 
 uniffi::setup_scaffolding!();

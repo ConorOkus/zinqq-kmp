@@ -182,6 +182,23 @@ impl EventSink for EventQueue {
         let event = match event {
             CoreEvent::ChainSyncCompleted => Event::SyncCompleted,
             CoreEvent::ChainSyncFailed => Event::SyncFailed,
+            CoreEvent::InvoiceReady {
+                bolt11,
+                expiry_unix_secs,
+            } => Event::InvoiceReady {
+                bolt11,
+                expiry_unix_secs,
+            },
+            CoreEvent::PaymentReceived {
+                amount_msat,
+                skimmed_fee_msat,
+            } => Event::PaymentReceived {
+                amount_msat,
+                skimmed_fee_msat,
+            },
+            CoreEvent::ChannelPending => Event::ChannelPending,
+            CoreEvent::ChannelReady => Event::ChannelReady,
+            CoreEvent::Lsps2Failed { reason } => Event::Lsps2Failed { reason },
         };
         self.push(event);
     }
@@ -307,9 +324,44 @@ mod tests {
 
         queue.emit(CoreEvent::ChainSyncFailed);
         queue.emit(CoreEvent::ChainSyncCompleted);
+        queue.emit(CoreEvent::InvoiceReady {
+            bolt11: "lnbc1example".to_string(),
+            expiry_unix_secs: 1_753_500_000,
+        });
+        queue.emit(CoreEvent::PaymentReceived {
+            amount_msat: 250_000,
+            skimmed_fee_msat: Some(2_000),
+        });
+        queue.emit(CoreEvent::ChannelPending);
+        queue.emit(CoreEvent::ChannelReady);
+        queue.emit(CoreEvent::Lsps2Failed {
+            reason: "all LSP-offered opening fee params are expired".to_string(),
+        });
 
         assert_eq!(queue.ack(), Some(Event::SyncFailed));
         assert_eq!(queue.ack(), Some(Event::SyncCompleted));
+        assert_eq!(
+            queue.ack(),
+            Some(Event::InvoiceReady {
+                bolt11: "lnbc1example".to_string(),
+                expiry_unix_secs: 1_753_500_000,
+            })
+        );
+        assert_eq!(
+            queue.ack(),
+            Some(Event::PaymentReceived {
+                amount_msat: 250_000,
+                skimmed_fee_msat: Some(2_000),
+            })
+        );
+        assert_eq!(queue.ack(), Some(Event::ChannelPending));
+        assert_eq!(queue.ack(), Some(Event::ChannelReady));
+        assert_eq!(
+            queue.ack(),
+            Some(Event::Lsps2Failed {
+                reason: "all LSP-offered opening fee params are expired".to_string(),
+            })
+        );
     }
 
     #[test]

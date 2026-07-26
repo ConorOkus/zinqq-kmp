@@ -11,6 +11,7 @@ use lightning_persister::fs_store::FilesystemStore;
 use crate::builder::{BuildError, KV_STORE_SUBDIR};
 use crate::config::Config;
 use crate::events::{Event, EventQueue};
+use crate::liquidity::Lsps2Error;
 use crate::node::Node;
 use crate::types::Logger;
 
@@ -47,7 +48,10 @@ pub enum WalletError {
     Startup { message: String },
     /// `event_handled()` with no event pending — an ack without a handle.
     NoPendingEvent,
-    /// The operation's unit ships later in the plan (U4/U5).
+    /// The LSPS2 JIT flow failed; `reason` is the same distinct reason the
+    /// corresponding [`Event::Lsps2Failed`] carries.
+    Lsps2 { reason: String },
+    /// The operation's unit ships later in the plan (U5).
     NotImplemented { operation: String },
 }
 
@@ -58,6 +62,7 @@ impl std::fmt::Display for WalletError {
             WalletError::NotRunning => write!(f, "the node is not running"),
             WalletError::Startup { message } => write!(f, "failed to start the node: {message}"),
             WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
+            WalletError::Lsps2 { reason } => write!(f, "LSPS2 request failed: {reason}"),
             WalletError::NotImplemented { operation } => {
                 write!(f, "{operation} is not implemented yet")
             }
@@ -148,12 +153,19 @@ impl Wallet {
     }
 
     /// Requests a Megalith JIT invoice for `amount_msat`; the invoice arrives
-    /// as [`Event::InvoiceReady`]. Wired in U4 — signature is final.
+    /// as [`Event::InvoiceReady`] (with its `valid_until` expiry), failures as
+    /// [`Event::Lsps2Failed`] AND a typed error here. Blocking (LSP network
+    /// round-trips): call from a background dispatcher.
     pub fn receive_jit(&self, amount_msat: u64) -> Result<(), WalletError> {
-        let _ = amount_msat;
-        Err(WalletError::NotImplemented {
-            operation: "receive_jit".to_string(),
-        })
+        self.node
+            .receive_jit(amount_msat)
+            .map(|_bolt11_and_expiry| ())
+            .map_err(|error| match error {
+                Lsps2Error::NotRunning => WalletError::NotRunning,
+                other => WalletError::Lsps2 {
+                    reason: other.to_string(),
+                },
+            })
     }
 
     /// Pays a BOLT11 invoice; the outcome arrives as

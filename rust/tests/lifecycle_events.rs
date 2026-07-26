@@ -118,14 +118,17 @@ fn unacked_events_are_redelivered_by_a_rebuilt_wallet() {
 }
 
 #[test]
-fn stubbed_operations_return_typed_not_implemented_errors() {
+fn stubbed_operations_return_typed_errors_while_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let wallet = test_wallet(dir.path());
 
+    // receive_jit is wired (U4): on a stopped wallet it fails typed, without
+    // ever touching the network.
     assert!(matches!(
         wallet.receive_jit(100_000),
-        Err(WalletError::NotImplemented { .. })
+        Err(WalletError::NotRunning)
     ));
+    // send ships in U5 — still a typed NotImplemented stub.
     assert!(matches!(
         wallet.send("lnbc1exampleinvoice".to_string()),
         Err(WalletError::NotImplemented { .. })
