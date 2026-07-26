@@ -1,7 +1,7 @@
 //! The exported FFI surface (U3). Deliberately tiny — exactly the six wallet
 //! operations (`start`, `stop`, `receive_jit`, `send`, `next_event` +
-//! `event_handled`, `balances`) plus U1's two demo fns in `lib.rs`; Gobley
-//! risk shrinks with API size.
+//! `event_handled`, `balances`) plus the two demo fns in `lib.rs` and the
+//! AE1 `derive_debug_info` helper (U1); Gobley risk shrinks with API size.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,16 +11,19 @@ use lightning_persister::fs_store::FilesystemStore;
 use crate::builder::{BuildError, KV_STORE_SUBDIR};
 use crate::config::Config;
 use crate::events::{Event, EventQueue};
+use crate::keys::{self, KeysError};
 use crate::liquidity::Lsps2Error;
 use crate::node::Node;
 use crate::payment::SendError;
 use crate::types::Logger;
 
-/// FFI-facing configuration. Network is fixed to mainnet and there is no
-/// seed/mnemonic input (AE2); the URL overrides exist for tests and fallback.
+/// FFI-facing configuration. Network is fixed to mainnet; the mnemonic is
+/// auto-created in `storage_dir` on first start (U1, R1 — restore-from-words
+/// arrives with U4); the URL overrides exist for tests and fallback.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WalletConfig {
-    /// App-private data directory holding the seed and all persisted state.
+    /// App-private data directory holding the mnemonic and all persisted
+    /// state.
     pub storage_dir: String,
     /// Esplora REST endpoint override (defaults to KTD-5's Zinqq proxy).
     pub esplora_url: Option<String>,
@@ -51,6 +54,8 @@ pub enum WalletError {
     NotRunning,
     /// The node failed to start (restore/persistence/config problem).
     Startup { detail: String },
+    /// A mnemonic that is not a valid BIP39 English 12-word mnemonic (U1).
+    InvalidMnemonic,
     /// `event_handled()` with no event pending — an ack without a handle.
     NoPendingEvent,
     /// The LSPS2 JIT flow failed; `reason` is the same distinct reason the
@@ -84,6 +89,10 @@ impl std::fmt::Display for WalletError {
             ),
             WalletError::NotRunning => write!(f, "the node is not running"),
             WalletError::Startup { detail } => write!(f, "failed to start the node: {detail}"),
+            WalletError::InvalidMnemonic => write!(
+                f,
+                "the mnemonic is not a valid BIP39 English 12-word mnemonic"
+            ),
             WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
             WalletError::Lsps2 { reason } => write!(f, "LSPS2 request failed: {reason}"),
             WalletError::InvalidInvoice { detail } => {
@@ -122,6 +131,17 @@ impl From<BuildError> for WalletError {
     }
 }
 
+impl From<KeysError> for WalletError {
+    fn from(error: KeysError) -> Self {
+        match error {
+            KeysError::InvalidMnemonic => WalletError::InvalidMnemonic,
+            other => WalletError::Startup {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl From<SendError> for WalletError {
     fn from(error: SendError) -> Self {
         match error {
@@ -142,6 +162,14 @@ impl From<SendError> for WalletError {
             }
         }
     }
+}
+
+/// AE1 debug helper (U1, R2): the node id a 12-word mnemonic yields — the
+/// same value the PWA reports for the same words, so cross-client identity
+/// can be verified without moving funds.
+#[uniffi::export]
+pub fn derive_debug_info(mnemonic: String) -> Result<String, WalletError> {
+    keys::derive_debug_info(&mnemonic).map_err(WalletError::from)
 }
 
 /// The one FFI object: a node handle plus the persisted event queue.

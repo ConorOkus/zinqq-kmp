@@ -17,6 +17,7 @@ use lightning::util::persist::{
 };
 use lightning_persister::fs_store::FilesystemStore;
 use wallet_core::builder::KV_STORE_SUBDIR;
+use wallet_core::keys::{MNEMONIC_FILE_NAME, RESTORE_IN_PROGRESS_FILE_NAME};
 use wallet_core::{BuildError, Config, Node};
 
 /// A local port nothing listens on: connection refused, instantly, offline.
@@ -52,10 +53,11 @@ fn fresh_node_starts_degraded_offline_and_restarts_from_disk() {
     assert_eq!(node.onchain_balance_sats(), Some(0));
     let first_node_id = node.node_id().expect("running node has a node id");
 
-    // The seed landed as a file in the node data dir (KTD-11)...
-    let seed_path = dir.path().join("keys_seed");
-    assert!(seed_path.exists());
-    assert_eq!(std::fs::read(&seed_path).unwrap().len(), 64);
+    // The mnemonic landed as a 12-word file in the node data dir (U1, R1)...
+    let mnemonic_path = dir.path().join(MNEMONIC_FILE_NAME);
+    assert!(mnemonic_path.exists());
+    let words = std::fs::read_to_string(&mnemonic_path).unwrap();
+    assert_eq!(words.split_whitespace().count(), 12);
 
     // ...and the manager was persisted under LDK's persist key constants.
     let store = kv_store(dir.path());
@@ -84,13 +86,20 @@ fn fresh_node_starts_degraded_offline_and_restarts_from_disk() {
     assert_eq!(
         rebuilt.node_id().unwrap(),
         first_node_id,
-        "restart must reload the same node identity from the seed file"
+        "restart must reload the same node identity from the mnemonic file"
     );
     rebuilt.stop().unwrap();
+
+    // Write-once (R1): restarts reuse the words, never regenerate them.
+    assert_eq!(
+        std::fs::read_to_string(&mnemonic_path).unwrap(),
+        words,
+        "the mnemonic file must be byte-stable across restarts"
+    );
 }
 
 #[test]
-fn each_data_dir_gets_its_own_fresh_seed_and_identity() {
+fn each_data_dir_gets_its_own_fresh_mnemonic_and_identity() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
@@ -101,25 +110,53 @@ fn each_data_dir_gets_its_own_fresh_seed_and_identity() {
     assert_ne!(
         node_a.node_id().unwrap(),
         node_b.node_id().unwrap(),
-        "fresh installs must generate distinct identities (AE2)"
+        "fresh installs must auto-generate distinct mnemonics (R1)"
+    );
+    assert_ne!(
+        std::fs::read_to_string(dir_a.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+        std::fs::read_to_string(dir_b.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+        "each data dir must hold its own words"
     );
     node_a.stop().unwrap();
     node_b.stop().unwrap();
 }
 
-/// AE2, compile-level: `Config` is the node's entire constructor surface.
-/// The exhaustive destructuring below stops compiling if anyone adds a
-/// seed/mnemonic-import field to it.
+/// U1: a corrupt/invalid mnemonic file fails start with a typed error rather
+/// than being silently replaced (replacing it would strand the old funds).
 #[test]
-fn constructor_surface_has_no_seed_or_mnemonic_input() {
-    let Config {
-        network: _,
-        storage_dir: _,
-        esplora_url: _,
-        rgs_url: _,
-        peers: _,
-        lsp: _,
-    } = test_config(tempfile::tempdir().unwrap().path());
+fn corrupt_mnemonic_file_fails_start_with_typed_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(MNEMONIC_FILE_NAME),
+        "not twelve valid words",
+    )
+    .unwrap();
+
+    let node = Node::new(test_config(dir.path()));
+    assert_eq!(node.start().unwrap_err(), BuildError::InvalidMnemonic);
+    assert!(!node.is_running());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+        "not twelve valid words",
+        "a failed start must not touch the mnemonic file"
+    );
+}
+
+/// U1: while a restore-in-progress marker (written by the U4 restore flow)
+/// exists and no mnemonic does, start refuses to auto-generate fresh words —
+/// the interrupted restore owns the directory.
+#[test]
+fn restore_marker_blocks_mnemonic_generation_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME), b"").unwrap();
+
+    let node = Node::new(test_config(dir.path()));
+    assert_eq!(node.start().unwrap_err(), BuildError::RestoreInProgress);
+    assert!(!node.is_running());
+    assert!(
+        !dir.path().join(MNEMONIC_FILE_NAME).exists(),
+        "no mnemonic may be generated while a restore is incomplete"
+    );
 }
 
 #[test]

@@ -11,6 +11,10 @@ name = "wallet_core"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+# U1 (KTD-4): BIP39 English mnemonic — the root of the whole key hierarchy.
+bip39 = "2.2"
+# U1: best-effort scrubbing of seed/key material after use.
+zeroize = "1"
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Exact pin: Gobley 0.3.7 pairs with uniffi 0.29.4 (KTD-2); a semver-open
 # requirement drifts to 0.29.5+.

@@ -21,6 +21,7 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use crate::chain::{Broadcaster, ChainSource};
 use crate::fees::CachedFeeEstimator;
+use crate::signer::WalletSignerProvider;
 use crate::wallet::OnchainWallet;
 
 pub(crate) type Graph = NetworkGraph<Arc<Logger>>;
@@ -51,12 +52,16 @@ pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
     Arc<KeysManager>,
 >;
 
+/// The signer-provider slot (5th param) carries U1's custom
+/// [`WalletSignerProvider`] (KTD-4): PWA-parity `channel_keys_id` HMAC
+/// derivation and bdk-backed destination/shutdown scripts; entropy and node
+/// signing stay on the bare `KeysManager`.
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
     Arc<ChainMonitor>,
     Arc<Broadcaster>,
     Arc<KeysManager>,
     Arc<KeysManager>,
-    Arc<KeysManager>,
+    Arc<WalletSignerProvider>,
     Arc<CachedFeeEstimator>,
     Arc<Router>,
     Arc<MessageRouter>,

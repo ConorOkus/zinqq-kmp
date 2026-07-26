@@ -1,14 +1,14 @@
-//! On-chain wallet: a BIP84 `bdk_wallet` over the node seed, persisted into
-//! the shared KVStore as a merged `ChangeSet` blob and synced via the shared
-//! esplora client. Also serves as the sweeper's change-destination source.
+//! On-chain wallet: a BIP84 `bdk_wallet` over the mnemonic-derived
+//! descriptors (U1, KTD-4), persisted into the shared KVStore as a merged
+//! `ChangeSet` blob and synced via the shared esplora client. Also serves as
+//! the sweeper's change-destination source and the signer's address source
+//! (deterministic destination scripts, next-unused shutdown scripts).
 
 use std::sync::{Arc, Mutex};
 
 use bdk_esplora::EsploraAsyncExt;
 use bdk_wallet::chain::Merge;
-use bdk_wallet::template::Bip84;
 use bdk_wallet::{ChangeSet, KeychainKind, PersistedWallet, Wallet as BdkWallet, WalletPersister};
-use bitcoin::bip32::Xpriv;
 use bitcoin::{Network, ScriptBuf};
 use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::log_error;
@@ -102,16 +102,19 @@ pub(crate) struct OnchainWallet {
 }
 
 impl OnchainWallet {
-    /// Loads the persisted wallet, or creates a fresh one from the node seed's
-    /// BIP84 descriptors.
+    /// Loads the persisted wallet, or creates a fresh one from the
+    /// mnemonic-derived BIP84 descriptors (KTD-4). No network access: eager
+    /// construction must precede any LDK monitor/manager deserialization so
+    /// the custom signer can resolve destination scripts during restore.
     pub(crate) fn new(
-        xprv: Xpriv,
+        descriptor: &str,
+        change_descriptor: &str,
         network: Network,
         kv_store: Arc<FilesystemStore>,
         logger: Arc<Logger>,
     ) -> Result<Self, BuildError> {
-        let descriptor = Bip84(xprv, KeychainKind::External);
-        let change_descriptor = Bip84(xprv, KeychainKind::Internal);
+        let descriptor = descriptor.to_string();
+        let change_descriptor = change_descriptor.to_string();
         let mut persister = KVStoreWalletPersister::new(kv_store);
 
         let wallet_opt = BdkWallet::load()
@@ -197,6 +200,46 @@ impl OnchainWallet {
     pub(crate) fn balance(&self) -> bdk_wallet::Balance {
         self.inner.lock().unwrap().wallet.balance()
     }
+
+    /// Deterministic external script at `index` for the signer's
+    /// `get_destination_script` (KTD-4): peek the address, then
+    /// `reveal_addresses_to` so bdk tracks it for syncing, and persist the
+    /// reveal — a restored wallet must watch the same close scripts.
+    pub(crate) fn destination_script_for_index(&self, index: u32) -> Result<ScriptBuf, ()> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, persister } = &mut *inner;
+        let script = wallet
+            .peek_address(KeychainKind::External, index)
+            .address
+            .script_pubkey();
+        // reveal_addresses_to stages the index update eagerly; the returned
+        // iterator of newly revealed addresses is not needed.
+        drop(wallet.reveal_addresses_to(KeychainKind::External, index));
+        wallet.persist(persister).map_err(|e| {
+            log_error!(
+                self.logger,
+                "Failed to persist destination address reveal: {e}"
+            );
+        })?;
+        Ok(script)
+    }
+
+    /// Next unused external script for the signer's
+    /// `get_shutdown_scriptpubkey` — non-deterministic by design (PWA parity):
+    /// shutdown scripts are recorded at channel open and replayed from
+    /// serialized state, so they need no cross-device re-derivation.
+    pub(crate) fn next_unused_address_script(&self) -> Result<ScriptBuf, ()> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, persister } = &mut *inner;
+        let address = wallet.next_unused_address(KeychainKind::External);
+        wallet.persist(persister).map_err(|e| {
+            log_error!(
+                self.logger,
+                "Failed to persist shutdown address reveal: {e}"
+            );
+        })?;
+        Ok(address.address.script_pubkey())
+    }
 }
 
 impl ChangeDestinationSourceSync for OnchainWallet {
@@ -226,22 +269,28 @@ mod tests {
         (dir, store)
     }
 
-    fn test_xprv() -> Xpriv {
-        Xpriv::new_master(Network::Bitcoin, &[7u8; 64]).unwrap()
+    fn test_wallet(
+        store: Arc<FilesystemStore>,
+        network: Network,
+    ) -> Result<OnchainWallet, BuildError> {
+        let keys = crate::keys::derive_wallet_keys(
+            &crate::keys::parse_mnemonic(crate::keys::tests::TEST_MNEMONIC).unwrap(),
+            Network::Bitcoin,
+        );
+        OnchainWallet::new(
+            &keys.descriptor_external,
+            &keys.descriptor_internal,
+            network,
+            store,
+            Arc::new(Logger),
+        )
     }
 
     #[test]
     fn wallet_persists_and_reloads_from_the_kv_store() {
         let (_dir, store) = fresh_store();
-        let logger = Arc::new(Logger);
 
-        let wallet = OnchainWallet::new(
-            test_xprv(),
-            Network::Bitcoin,
-            Arc::clone(&store),
-            Arc::clone(&logger),
-        )
-        .unwrap();
+        let wallet = test_wallet(Arc::clone(&store), Network::Bitcoin).unwrap();
         // Reveal an address so the persisted state carries indexer data.
         let script = wallet.get_change_destination_script().unwrap();
         assert!(!script.is_empty());
@@ -249,7 +298,7 @@ mod tests {
 
         // Reload: same descriptors, existing changeset -> load path, and the
         // revealed index survives (the next change script differs).
-        let reloaded = OnchainWallet::new(test_xprv(), Network::Bitcoin, store, logger).unwrap();
+        let reloaded = test_wallet(store, Network::Bitcoin).unwrap();
         let next_script = reloaded.get_change_destination_script().unwrap();
         assert_ne!(
             script, next_script,
@@ -260,17 +309,38 @@ mod tests {
     #[test]
     fn network_mismatch_fails_wallet_setup() {
         let (_dir, store) = fresh_store();
-        let logger = Arc::new(Logger);
-        OnchainWallet::new(
-            test_xprv(),
-            Network::Bitcoin,
-            Arc::clone(&store),
-            Arc::clone(&logger),
-        )
-        .unwrap();
-        match OnchainWallet::new(test_xprv(), Network::Testnet, store, logger) {
+        test_wallet(Arc::clone(&store), Network::Bitcoin).unwrap();
+        match test_wallet(store, Network::Testnet) {
             Err(err) => assert_eq!(err, BuildError::WalletSetupFailed),
             Ok(_) => panic!("network mismatch must fail wallet setup"),
         }
+    }
+
+    #[test]
+    fn destination_reveal_survives_a_reload() {
+        // The signer's deterministic destination indexes must stay revealed
+        // (watched) across restarts: reveal to a high index, reload, and the
+        // next change/shutdown reveals must not have collapsed the index.
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(Arc::clone(&store), Network::Bitcoin).unwrap();
+        let script = wallet.destination_script_for_index(735).unwrap();
+        drop(wallet);
+
+        let reloaded = test_wallet(store, Network::Bitcoin).unwrap();
+        assert_eq!(
+            reloaded.destination_script_for_index(735).unwrap(),
+            script,
+            "same index must resolve to the same script after reload"
+        );
+        assert_eq!(
+            reloaded
+                .inner
+                .lock()
+                .unwrap()
+                .wallet
+                .derivation_index(KeychainKind::External),
+            Some(735),
+            "the revealed external index must survive persistence"
+        );
     }
 }

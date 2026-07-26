@@ -118,14 +118,15 @@ pub struct PeerInfo {
 
 /// Top-level node configuration.
 ///
-/// Deliberately has no seed/mnemonic input (AE2): the seed is always generated
-/// fresh on first start and persisted inside `storage_dir` (KTD-11).
+/// Has no mnemonic input: the 12 words are auto-generated on first start and
+/// persisted write-once inside `storage_dir` (U1, R1). Restore-from-words is
+/// a separate destructive flow (U4), not a constructor parameter.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Bitcoin network the node runs on.
     pub network: Network,
-    /// App-private data directory holding the seed, channel monitors, and all
-    /// other persisted state.
+    /// App-private data directory holding the mnemonic, channel monitors, and
+    /// all other persisted state.
     pub storage_dir: String,
     /// Esplora REST endpoint.
     pub esplora_url: String,

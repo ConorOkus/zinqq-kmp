@@ -97,9 +97,9 @@ struct RunningState {
 
 /// A foreground-only mainnet LDK node over the wallet-core stack.
 ///
-/// There is deliberately no way to construct a `Node` from an existing seed or
-/// mnemonic (AE2): the only input is a [`Config`], and entropy is generated
-/// into the storage dir on first start.
+/// The only constructor input is a [`Config`]: the mnemonic is auto-generated
+/// into the storage dir on first start (U1, R1). Restore-from-words is a
+/// separate destructive flow (U4), not a constructor parameter.
 pub struct Node {
     config: Config,
     state: Mutex<Option<RunningState>>,
@@ -581,8 +581,10 @@ fn handle_ldk_event(
         } => {
             // `track_spendable_outputs` persists before returning Ok; on
             // failure we replay the event rather than dropping funds.
-            // Static outputs are NOT excluded: our SignerProvider is the bare
-            // KeysManager, so the sweeper (not the bdk wallet) owns them.
+            // Static outputs are NOT excluded: the signer's payment keys are
+            // still KeysManager-derived (U1's provider only redirects
+            // destination/shutdown scripts), so the sweeper (not the bdk
+            // wallet) owns them.
             sweeper
                 .track_spendable_outputs(outputs, channel_id, false, None)
                 .map_err(|()| {

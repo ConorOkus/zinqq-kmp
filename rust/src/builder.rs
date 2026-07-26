@@ -1,22 +1,23 @@
 //! Node assembly with first-class fresh and restore paths, mirroring
-//! ldk-node's wiring order: KeysManager → ChainMonitor → ChannelManager →
+//! ldk-node's wiring order: mnemonic-derived keys (U1, KTD-4) → bdk wallet →
+//! KeysManager + custom SignerProvider → ChainMonitor → ChannelManager →
 //! OnionMessenger → PeerManager.
 //!
 //! The restore sequence is load-bearing (see the plan's lifecycle diagram):
-//! read all monitors → `ChannelManagerReadArgs` → deserialize the manager →
-//! Esplora `Confirm` sync on BOTH manager and monitors → `watch_channel` each
-//! monitor. Only then may peers connect and the background processor run.
+//! initialize the bdk wallet from the descriptors (eager, no network — the
+//! signer resolves destination scripts during deserialization) → read all
+//! monitors with the custom SignerProvider → `ChannelManagerReadArgs` →
+//! deserialize the manager → Esplora `Confirm` sync on BOTH manager and
+//! monitors → `watch_channel` each monitor. Only then may peers connect and
+//! the background processor run.
 
 use std::fmt;
 use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use bitcoin::bip32::Xpriv;
-use bitcoin::secp256k1::rand::rngs::OsRng;
-use bitcoin::secp256k1::rand::RngCore;
 use bitcoin::BlockHash;
 use lightning::chain::channelmonitor::ChannelMonitor;
 use lightning::chain::{BestBlock, Confirm, Watch};
@@ -49,16 +50,13 @@ use lightning_persister::fs_store::FilesystemStore;
 use crate::chain::{Broadcaster, ChainSource, GossipSource};
 use crate::config::{default_user_config, Config};
 use crate::fees::CachedFeeEstimator;
+use crate::keys::{derive_wallet_keys, read_or_generate_mnemonic, KeysError};
+use crate::signer::WalletSignerProvider;
 use crate::types::{
     ChainMonitor, ChannelManager, Graph, LiquidityManager, Logger, MessageRouter, OnionMessenger,
     PeerManager, Scorer, Sweeper,
 };
 use crate::wallet::OnchainWallet;
-
-/// File inside the storage dir holding the node's entropy (KTD-11). Generated
-/// fresh on first start; there is deliberately no import path (AE2).
-pub(crate) const SEED_FILE_NAME: &str = "keys_seed";
-pub(crate) const SEED_LEN: usize = 64;
 
 /// Subdirectory of the storage dir backing the `FilesystemStore`. Public as
 /// test-support API surface: integration tests open the store at this path to
@@ -77,12 +75,21 @@ pub enum BuildError {
     InstanceAlreadyRunning,
     /// The node is not running.
     NotRunning,
-    /// The storage directory or seed file could not be written.
+    /// The storage directory or mnemonic file could not be written.
     WriteFailed,
     /// Persisted state exists but could not be read or deserialized.
     ReadFailed,
-    /// The seed file exists but does not contain a valid seed.
-    InvalidSeed,
+    /// The mnemonic file exists but does not hold a valid BIP39 English
+    /// 12-word mnemonic (U1, R1).
+    InvalidMnemonic,
+    /// A mnemonic already exists where one was about to be written;
+    /// overwriting would destroy access to the existing wallet's funds (R1:
+    /// the mnemonic file is write-once).
+    MnemonicExists,
+    /// No mnemonic exists but the restore-in-progress marker does (U4):
+    /// auto-generating fresh words now would silently abandon the wallet
+    /// being restored, so the start is refused.
+    RestoreInProgress,
     /// The on-chain wallet could not be set up.
     WalletSetupFailed,
     /// A persisted channel monitor is unreadable or corrupt.
@@ -110,7 +117,13 @@ impl fmt::Display for BuildError {
             BuildError::NotRunning => "the node is not running",
             BuildError::WriteFailed => "failed to write node data",
             BuildError::ReadFailed => "failed to read persisted node data",
-            BuildError::InvalidSeed => "the persisted seed file is invalid",
+            BuildError::InvalidMnemonic => {
+                "the persisted mnemonic file is not a valid BIP39 English 12-word mnemonic"
+            }
+            BuildError::MnemonicExists => "a mnemonic already exists; refusing to overwrite it",
+            BuildError::RestoreInProgress => {
+                "a restore is in progress; refusing to generate a fresh mnemonic"
+            }
             BuildError::WalletSetupFailed => "failed to set up the on-chain wallet",
             BuildError::InvalidMonitorData => "persisted channel monitor data is unreadable",
             BuildError::WatchChannelFailed => "failed to watch a restored channel monitor",
@@ -124,6 +137,18 @@ impl fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+impl From<KeysError> for BuildError {
+    fn from(error: KeysError) -> Self {
+        match error {
+            KeysError::WriteFailed => BuildError::WriteFailed,
+            KeysError::ReadFailed => BuildError::ReadFailed,
+            KeysError::InvalidMnemonic => BuildError::InvalidMnemonic,
+            KeysError::MnemonicExists => BuildError::MnemonicExists,
+            KeysError::RestoreInProgress => BuildError::RestoreInProgress,
+        }
+    }
+}
 
 /// Everything the running node owns, fully wired.
 pub(crate) struct NodeComponents {
@@ -144,22 +169,6 @@ pub(crate) struct NodeComponents {
     /// Whether the initial chain sync reached the tip. `false` is a degraded
     /// start (only possible with zero monitors); the background loop retries.
     pub(crate) chain_synced_at_start: bool,
-}
-
-/// Reads the node seed, generating a fresh one on first start (KTD-11, AE2).
-pub(crate) fn read_or_generate_seed(storage_dir: &Path) -> Result<[u8; SEED_LEN], BuildError> {
-    let seed_path = storage_dir.join(SEED_FILE_NAME);
-    if seed_path.exists() {
-        let bytes = fs::read(&seed_path).map_err(|_| BuildError::ReadFailed)?;
-        let seed: [u8; SEED_LEN] = bytes.try_into().map_err(|_| BuildError::InvalidSeed)?;
-        Ok(seed)
-    } else {
-        let mut seed = [0u8; SEED_LEN];
-        OsRng.fill_bytes(&mut seed);
-        fs::create_dir_all(storage_dir).map_err(|_| BuildError::WriteFailed)?;
-        fs::write(&seed_path, seed).map_err(|_| BuildError::WriteFailed)?;
-        Ok(seed)
-    }
 }
 
 /// Persists the channel manager under LDK's persist key constants. The
@@ -190,9 +199,10 @@ pub(crate) fn build(
     let storage_dir = PathBuf::from(&config.storage_dir);
     fs::create_dir_all(&storage_dir).map_err(|_| BuildError::WriteFailed)?;
 
-    // Entropy: fresh seed on first start, reused afterwards (KTD-11, AE2).
-    let seed = read_or_generate_seed(&storage_dir)?;
-    let xprv = Xpriv::new_master(config.network, &seed).map_err(|_| BuildError::InvalidSeed)?;
+    // U1 (KTD-4, R1/R2): one BIP39 mnemonic — auto-generated on first start,
+    // write-once — roots every key. Derivations are byte-identical to the PWA.
+    let mnemonic = read_or_generate_mnemonic(&storage_dir)?;
+    let keys = derive_wallet_keys(&mnemonic, config.network);
 
     let kv_store = Arc::new(FilesystemStore::new(storage_dir.join(KV_STORE_SUBDIR)));
 
@@ -211,31 +221,43 @@ pub(crate) fn build(
         })?,
     );
 
+    // BDK wallet FIRST (KTD-4 ordering): eager, no network — the custom
+    // signer below resolves destination scripts during LDK deserialization.
     let onchain_wallet = Arc::new(OnchainWallet::new(
-        xprv,
+        &keys.descriptor_external,
+        &keys.descriptor_internal,
         config.network,
         Arc::clone(&kv_store),
         Arc::clone(&logger),
     )?);
 
-    // KeysManager: the LDK seed is derived from the master key so lightning
-    // and on-chain keys share one backup (the seed file).
+    // KeysManager over the m/535'/0' LDK seed. `v2_remote_key_derivation =
+    // false` is not merely parity (KTD-4): `true` forbids downgrade below LDK
+    // 0.2 and changes counterparty-close script pubkeys, breaking byte-compat
+    // with the PWA's WASM signer.
     let cur_time = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| BuildError::InvalidSystemTime)?;
-    let ldk_seed: [u8; 32] = xprv.private_key.secret_bytes();
     let keys_manager = Arc::new(KeysManager::new(
-        &ldk_seed,
+        &keys.ldk_seed,
         cur_time.as_secs(),
         cur_time.subsec_nanos(),
-        true,
+        false,
     ));
+    let signer_provider = Arc::new(WalletSignerProvider::new(
+        Arc::clone(&keys_manager),
+        Arc::clone(&onchain_wallet),
+        keys.channel_keys_id_hmac_key,
+        Arc::clone(&logger),
+    ));
+    drop(keys); // Scrubs the derived key material (WalletKeys::drop).
 
-    // Read ALL channel monitors before anything touches the manager.
+    // Read ALL channel monitors — with the custom SignerProvider — before
+    // anything touches the manager.
     let channel_monitors: Vec<(BlockHash, ChannelMonitor<InMemorySigner>)> = read_channel_monitors(
         Arc::clone(&kv_store),
         Arc::clone(&keys_manager),
-        Arc::clone(&keys_manager),
+        Arc::clone(&signer_provider),
     )
     .map_err(|e| {
         log_error!(logger, "Failed to read channel monitors: {e}");
@@ -324,7 +346,7 @@ pub(crate) fn build(
             let read_args = ChannelManagerReadArgs::new(
                 Arc::clone(&keys_manager),
                 Arc::clone(&keys_manager),
-                Arc::clone(&keys_manager),
+                Arc::clone(&signer_provider),
                 Arc::clone(&fee_estimator),
                 Arc::clone(&chain_monitor),
                 Arc::clone(&broadcaster),
@@ -358,7 +380,7 @@ pub(crate) fn build(
                 Arc::clone(&logger),
                 Arc::clone(&keys_manager),
                 Arc::clone(&keys_manager),
-                Arc::clone(&keys_manager),
+                Arc::clone(&signer_provider),
                 user_config,
                 chain_params,
                 cur_time.as_secs() as u32,
@@ -543,24 +565,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seed_is_generated_once_and_reused() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = read_or_generate_seed(dir.path()).unwrap();
-        let second = read_or_generate_seed(dir.path()).unwrap();
-        assert_eq!(first, second, "seed must be stable across restarts");
-
-        let other_dir = tempfile::tempdir().unwrap();
-        let other = read_or_generate_seed(other_dir.path()).unwrap();
-        assert_ne!(first, other, "each data dir must get its own fresh seed");
-    }
-
-    #[test]
-    fn truncated_seed_file_is_a_typed_error() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(SEED_FILE_NAME), [1u8; 12]).unwrap();
-        assert_eq!(
-            read_or_generate_seed(dir.path()).unwrap_err(),
-            BuildError::InvalidSeed
-        );
+    fn keys_errors_map_to_distinct_typed_build_errors() {
+        // Mnemonic loading/generation failures must stay distinguishable at
+        // the start() surface (U1: typed start errors).
+        let cases = [
+            (KeysError::WriteFailed, BuildError::WriteFailed),
+            (KeysError::ReadFailed, BuildError::ReadFailed),
+            (KeysError::InvalidMnemonic, BuildError::InvalidMnemonic),
+            (KeysError::MnemonicExists, BuildError::MnemonicExists),
+            (KeysError::RestoreInProgress, BuildError::RestoreInProgress),
+        ];
+        for (keys_error, build_error) in cases {
+            assert_eq!(BuildError::from(keys_error), build_error);
+        }
     }
 }
