@@ -1,17 +1,24 @@
 //! Chain access: the Esplora-backed transaction sync client (which doubles as
-//! the `ChainMonitor`'s `Filter`), the queued transaction broadcaster, the
-//! fee-rate cache refresh, and the Rapid Gossip Sync source.
+//! the `ChainMonitor`'s `Filter`), the queued transaction broadcaster with
+//! persisted pending broadcasts (U12/KTD-9: startup drain + 48 h TTL), the
+//! startup genesis-hash network check (U12/KTD-12), the fee-rate cache
+//! refresh, and the Rapid Gossip Sync source.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use bitcoin::{Script, Transaction, Txid};
+use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::{BlockHash, Script, Transaction, Txid};
 use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::chain::chaininterface::BroadcasterInterface;
 use lightning::chain::{Confirm, Filter, WatchedOutput};
 use lightning::log_error;
+use lightning::log_info;
 use lightning::util::logger::Logger as _;
+use lightning::util::persist::KVStoreSync;
+use lightning_persister::fs_store::FilesystemStore;
 use lightning_transaction_sync::EsploraSyncClient;
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 
@@ -21,15 +28,21 @@ use crate::config::{
 };
 use crate::fees::{cache_from_esplora_estimates, CachedFeeEstimator};
 use crate::types::{Graph, Logger, RapidGossipSync};
+use crate::util::unix_now;
 use crate::wallet::OnchainWallet;
 
 /// Runtime chain-access failures. These are logged and retried by the
 /// background sync loop; only start-up turns them into hard errors (and only
-/// when channel monitors exist).
+/// when channel monitors exist), except [`ChainError::WrongNetworkBackend`],
+/// which always fails the start (U12/KTD-12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
     /// The Esplora endpoint could not be reached or returned an error.
     EsploraUnreachable(String),
+    /// The Esplora endpoint ANSWERED the genesis-hash probe with a hash that
+    /// is not mainnet's: it serves the wrong chain (U12/KTD-12). Never
+    /// degraded-start over this — a wrong-chain view is not fund-safe.
+    WrongNetworkBackend { got: String },
     /// The endpoint answered, but with unusable fee estimates on mainnet.
     EmptyFeeEstimates,
     /// The RGS server could not be reached or the snapshot failed to apply.
@@ -42,6 +55,10 @@ impl fmt::Display for ChainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ChainError::EsploraUnreachable(e) => write!(f, "esplora unreachable: {e}"),
+            ChainError::WrongNetworkBackend { got } => write!(
+                f,
+                "the esplora backend serves a different network (genesis hash {got})"
+            ),
             ChainError::EmptyFeeEstimates => write!(f, "empty fee estimates on mainnet"),
             ChainError::GossipUpdateFailed(e) => write!(f, "gossip update failed: {e}"),
             ChainError::WalletSyncFailed(e) => write!(f, "wallet sync failed: {e}"),
@@ -51,23 +68,184 @@ impl fmt::Display for ChainError {
 
 impl std::error::Error for ChainError {}
 
+/// KVStore namespace for pending broadcasts (U12/KTD-9), keyed by txid hex.
+/// Mirrors the PWA's `ldk_pending_broadcasts` IDB store: persisted before
+/// the broadcast attempt, removed on success/already-known, drained at
+/// startup, expired after [`PENDING_BROADCAST_TTL`].
+pub(crate) const PENDING_BROADCASTS_PRIMARY_NAMESPACE: &str = "pending_broadcasts";
+pub(crate) const PENDING_BROADCASTS_SECONDARY_NAMESPACE: &str = "";
+
+/// How long a pending broadcast is retried across restarts before being
+/// discarded (inputs likely spent by then) — PWA `PENDING_BROADCAST_TTL_MS`.
+pub(crate) const PENDING_BROADCAST_TTL: Duration = Duration::from_secs(48 * 60 * 60);
+
+/// Encodes a pending-broadcast entry: `created_at` UNIX seconds (LE) followed
+/// by the consensus-serialized transaction. Pure, for offline tests.
+pub(crate) fn encode_pending_broadcast(created_at_secs: u64, tx: &Transaction) -> Vec<u8> {
+    let mut bytes = created_at_secs.to_le_bytes().to_vec();
+    bytes.extend(serialize(tx));
+    bytes
+}
+
+/// Decodes [`encode_pending_broadcast`]'s format; `None` on corrupt entries
+/// (which are dropped, never retried).
+pub(crate) fn decode_pending_broadcast(bytes: &[u8]) -> Option<(u64, Transaction)> {
+    let created_at_secs = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+    let tx = deserialize(bytes.get(8..)?).ok()?;
+    Some((created_at_secs, tx))
+}
+
+/// Persisted pending-broadcast store over the node's KVStore (U12/KTD-9).
+/// The [`Broadcaster`] writes entries before queueing; the [`ChainSource`]
+/// removes them once the network knows the transaction; the startup drain
+/// rebroadcasts survivors and expires stale ones.
+pub(crate) struct PendingBroadcasts {
+    kv_store: Arc<FilesystemStore>,
+    logger: Arc<Logger>,
+}
+
+impl PendingBroadcasts {
+    pub(crate) fn new(kv_store: Arc<FilesystemStore>, logger: Arc<Logger>) -> Self {
+        Self { kv_store, logger }
+    }
+
+    /// Persists a transaction pending broadcast. Failures are logged, not
+    /// fatal: the live broadcast attempt still proceeds.
+    pub(crate) fn persist(&self, tx: &Transaction, created_at_secs: u64) {
+        let key = tx.compute_txid().to_string();
+        if let Err(e) = self.kv_store.write(
+            PENDING_BROADCASTS_PRIMARY_NAMESPACE,
+            PENDING_BROADCASTS_SECONDARY_NAMESPACE,
+            &key,
+            encode_pending_broadcast(created_at_secs, tx),
+        ) {
+            log_error!(
+                self.logger,
+                "Failed to persist pending broadcast {key}: {e}"
+            );
+        }
+    }
+
+    /// Removes a pending entry once the network knows the transaction.
+    pub(crate) fn remove(&self, txid: &Txid) {
+        let key = txid.to_string();
+        if let Err(e) = self.kv_store.remove(
+            PENDING_BROADCASTS_PRIMARY_NAMESPACE,
+            PENDING_BROADCASTS_SECONDARY_NAMESPACE,
+            &key,
+            false,
+        ) {
+            log_error!(self.logger, "Failed to remove pending broadcast {key}: {e}");
+        }
+    }
+
+    /// Loads every entry younger than [`PENDING_BROADCAST_TTL`], removing
+    /// expired and corrupt ones (the startup-drain read half).
+    pub(crate) fn load_fresh(&self, now_secs: u64) -> Vec<Transaction> {
+        let keys = match self.kv_store.list(
+            PENDING_BROADCASTS_PRIMARY_NAMESPACE,
+            PENDING_BROADCASTS_SECONDARY_NAMESPACE,
+        ) {
+            Ok(keys) => keys,
+            Err(e) => {
+                log_error!(self.logger, "Failed to list pending broadcasts: {e}");
+                return Vec::new();
+            }
+        };
+
+        let mut fresh = Vec::new();
+        for key in keys {
+            let bytes = match self.kv_store.read(
+                PENDING_BROADCASTS_PRIMARY_NAMESPACE,
+                PENDING_BROADCASTS_SECONDARY_NAMESPACE,
+                &key,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    log_error!(self.logger, "Failed to read pending broadcast {key}: {e}");
+                    continue;
+                }
+            };
+            match decode_pending_broadcast(&bytes) {
+                Some((created_at_secs, tx))
+                    if now_secs.saturating_sub(created_at_secs)
+                        <= PENDING_BROADCAST_TTL.as_secs() =>
+                {
+                    fresh.push(tx);
+                }
+                Some(_) | None => {
+                    // Expired (inputs likely spent) or corrupt: discard.
+                    if let Err(e) = self.kv_store.remove(
+                        PENDING_BROADCASTS_PRIMARY_NAMESPACE,
+                        PENDING_BROADCASTS_SECONDARY_NAMESPACE,
+                        &key,
+                        false,
+                    ) {
+                        log_error!(
+                            self.logger,
+                            "Failed to discard stale pending broadcast {key}: {e}"
+                        );
+                    }
+                }
+            }
+        }
+        fresh
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_txids(&self) -> Vec<String> {
+        self.kv_store
+            .list(
+                PENDING_BROADCASTS_PRIMARY_NAMESPACE,
+                PENDING_BROADCASTS_SECONDARY_NAMESPACE,
+            )
+            .unwrap_or_default()
+    }
+}
+
+/// Per-transaction broadcast outcome (U12/KTD-9): "already known" is a
+/// distinguishable success sentinel, not a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BroadcastOutcome {
+    /// The endpoint accepted the transaction.
+    Accepted,
+    /// The mempool/chain already knows the transaction — success for our
+    /// purposes (the pending entry is cleared either way).
+    AlreadyKnown,
+    /// The broadcast failed; the pending entry is kept for retry.
+    Failed(String),
+}
+
+impl BroadcastOutcome {
+    pub(crate) fn is_success(&self) -> bool {
+        matches!(
+            self,
+            BroadcastOutcome::Accepted | BroadcastOutcome::AlreadyKnown
+        )
+    }
+}
+
 const BCAST_PACKAGE_QUEUE_SIZE: usize = 50;
 
 /// `BroadcasterInterface` that queues packages for async broadcast via
 /// Esplora. LDK's broadcast call sites are sync; the queue decouples them
-/// from HTTP.
+/// from HTTP. Every transaction is persisted to the pending-broadcast store
+/// BEFORE it is queued (U12/KTD-9 crash safety: a crash mid-broadcast is
+/// redelivered by the startup drain).
 pub(crate) struct Broadcaster {
     queue_sender: mpsc::Sender<Vec<Transaction>>,
     queue_receiver: Mutex<mpsc::Receiver<Vec<Transaction>>>,
+    pending: Arc<PendingBroadcasts>,
     logger: Arc<Logger>,
 }
 
 impl Broadcaster {
-    pub(crate) fn new(logger: Arc<Logger>) -> Self {
+    pub(crate) fn new(pending: Arc<PendingBroadcasts>, logger: Arc<Logger>) -> Self {
         let (queue_sender, queue_receiver) = mpsc::channel(BCAST_PACKAGE_QUEUE_SIZE);
         Self {
             queue_sender,
             queue_receiver: Mutex::new(queue_receiver),
+            pending,
             logger,
         }
     }
@@ -80,6 +258,10 @@ impl Broadcaster {
 impl BroadcasterInterface for Broadcaster {
     fn broadcast_transactions(&self, txs: &[&Transaction]) {
         let package = txs.iter().map(|&tx| tx.clone()).collect::<Vec<_>>();
+        let now_secs = unix_now().as_secs();
+        for tx in &package {
+            self.pending.persist(tx, now_secs);
+        }
         if let Err(e) = self.queue_sender.try_send(package) {
             log_error!(
                 self.logger,
@@ -114,6 +296,7 @@ pub(crate) struct ChainSource {
     esplora_client: EsploraAsyncClient,
     tx_sync: Arc<EsploraSyncClient<Arc<Logger>>>,
     fee_estimator: Arc<CachedFeeEstimator>,
+    pending_broadcasts: Arc<PendingBroadcasts>,
     network: bitcoin::Network,
     logger: Arc<Logger>,
 }
@@ -123,6 +306,7 @@ impl ChainSource {
         esplora_url: &str,
         network: bitcoin::Network,
         fee_estimator: Arc<CachedFeeEstimator>,
+        pending_broadcasts: Arc<PendingBroadcasts>,
         logger: Arc<Logger>,
     ) -> Result<Self, esplora_client::Error> {
         let esplora_client = esplora_client::Builder::new(esplora_url)
@@ -136,9 +320,31 @@ impl ChainSource {
             esplora_client,
             tx_sync,
             fee_estimator,
+            pending_broadcasts,
             network,
             logger,
         })
+    }
+
+    /// U12/KTD-12 startup network check: asks the backend for block 0's hash
+    /// (`/block-height/0`) and compares it to `expected`.
+    ///
+    /// Only an ANSWERED probe with the wrong hash is
+    /// [`ChainError::WrongNetworkBackend`] (a hard start error); an
+    /// unreachable or garbled endpoint is [`ChainError::EsploraUnreachable`],
+    /// which preserves the fresh-node degraded start.
+    pub(crate) async fn check_genesis_hash(&self, expected: BlockHash) -> Result<(), ChainError> {
+        let got = tokio::time::timeout(FEE_UPDATE_TIMEOUT, self.esplora_client.get_block_hash(0))
+            .await
+            .map_err(|e| ChainError::EsploraUnreachable(format!("genesis probe timed out: {e}")))?
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?;
+        if got == expected {
+            Ok(())
+        } else {
+            Err(ChainError::WrongNetworkBackend {
+                got: got.to_string(),
+            })
+        }
     }
 
     /// Sync the given `Confirm` listeners (channel manager, chain monitor,
@@ -168,8 +374,24 @@ impl ChainSource {
             .await
     }
 
-    /// Refresh the fee-rate cache from the Esplora fee-estimates endpoint.
+    /// Whether the fee cache is due a refresh (60 s TTL / 15 s failure
+    /// backoff, U12/KTD-9); polled by the node's background tick.
+    pub(crate) fn fee_refresh_due(&self) -> bool {
+        self.fee_estimator.needs_refresh()
+    }
+
+    /// Refresh the fee-rate cache from the Esplora fee-estimates endpoint,
+    /// recording success/failure for the TTL/backoff policy.
     pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), ChainError> {
+        let result = self.fetch_fee_estimates().await;
+        match &result {
+            Ok(()) => {}
+            Err(_) => self.fee_estimator.record_failure(),
+        }
+        result
+    }
+
+    async fn fetch_fee_estimates(&self) -> Result<(), ChainError> {
         let estimates =
             tokio::time::timeout(FEE_UPDATE_TIMEOUT, self.esplora_client.get_fee_estimates())
                 .await
@@ -187,32 +409,59 @@ impl ChainSource {
         Ok(())
     }
 
+    /// Broadcasts one transaction, mapping "already known" responses to the
+    /// [`BroadcastOutcome::AlreadyKnown`] success sentinel (U12/KTD-9). On
+    /// either success the pending-broadcast entry is cleared; on failure it
+    /// stays for the next startup drain.
+    pub(crate) async fn broadcast_transaction(&self, tx: &Transaction) -> BroadcastOutcome {
+        let txid = tx.compute_txid();
+        let res =
+            tokio::time::timeout(TX_BROADCAST_TIMEOUT, self.esplora_client.broadcast(tx)).await;
+        let outcome = match res {
+            Ok(Ok(())) => BroadcastOutcome::Accepted,
+            Ok(Err(esplora_client::Error::HttpResponse { status, message }))
+                if broadcast_error_is_benign(&message) =>
+            {
+                // The mempool/chain already knows this transaction; that is
+                // success for our purposes, not a failure (status is
+                // typically 400 here).
+                let _ = status;
+                BroadcastOutcome::AlreadyKnown
+            }
+            Ok(Err(e)) => BroadcastOutcome::Failed(e.to_string()),
+            Err(e) => BroadcastOutcome::Failed(format!("timed out: {e}")),
+        };
+        if outcome.is_success() {
+            self.pending_broadcasts.remove(&txid);
+        } else if let BroadcastOutcome::Failed(e) = &outcome {
+            log_error!(self.logger, "Failed to broadcast transaction {txid}: {e}");
+        }
+        outcome
+    }
+
     /// Broadcast one queued package, tolerating already-known transactions.
     pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
         for tx in &package {
-            let txid = tx.compute_txid();
-            let res =
-                tokio::time::timeout(TX_BROADCAST_TIMEOUT, self.esplora_client.broadcast(tx)).await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(esplora_client::Error::HttpResponse { status, message }))
-                    if broadcast_error_is_benign(&message) =>
-                {
-                    // The mempool/chain already knows this transaction; that
-                    // is success for our purposes, not a failure (status is
-                    // typically 400 here).
-                    let _ = status;
-                }
-                Ok(Err(e)) => {
-                    log_error!(self.logger, "Failed to broadcast transaction {txid}: {e}");
-                }
-                Err(e) => {
-                    log_error!(
-                        self.logger,
-                        "Broadcast of transaction {txid} timed out: {e}"
-                    );
-                }
-            }
+            let _ = self.broadcast_transaction(tx).await;
+        }
+    }
+
+    /// Startup drain (U12/KTD-9): rebroadcasts every persisted pending
+    /// transaction younger than the 48 h TTL (a crash mid-broadcast must not
+    /// lose a force-close tx), expiring the rest. Failures are tolerated —
+    /// the entries stay persisted for the next start.
+    pub(crate) async fn drain_pending_broadcasts(&self, now_secs: u64) {
+        let pending = self.pending_broadcasts.load_fresh(now_secs);
+        if pending.is_empty() {
+            return;
+        }
+        log_info!(
+            self.logger,
+            "Draining {} pending broadcast(s) from a previous run",
+            pending.len()
+        );
+        for tx in &pending {
+            let _ = self.broadcast_transaction(tx).await;
         }
     }
 }
@@ -316,5 +565,150 @@ mod tests {
                 "expected fatal: {message}"
             );
         }
+    }
+
+    // ---------- pending broadcasts (U12/KTD-9) ----------
+
+    fn dummy_tx(lock_time: u32) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::from_consensus(lock_time),
+            input: Vec::new(),
+            output: Vec::new(),
+        }
+    }
+
+    fn pending_store(dir: &std::path::Path) -> Arc<PendingBroadcasts> {
+        let kv_store = Arc::new(FilesystemStore::new(dir.join("store")));
+        Arc::new(PendingBroadcasts::new(kv_store, Arc::new(Logger)))
+    }
+
+    #[test]
+    fn pending_broadcast_encoding_round_trips() {
+        let tx = dummy_tx(7);
+        let bytes = encode_pending_broadcast(1_700_000_000, &tx);
+        let (created_at, decoded) = decode_pending_broadcast(&bytes).unwrap();
+        assert_eq!(created_at, 1_700_000_000);
+        assert_eq!(decoded, tx);
+        // Corrupt entries decode to None (dropped, never retried).
+        assert!(decode_pending_broadcast(&bytes[..7]).is_none());
+        assert!(decode_pending_broadcast(&bytes[..12]).is_none());
+    }
+
+    #[test]
+    fn pending_broadcasts_persist_and_expire_after_48_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = pending_store(dir.path());
+        let now = 1_700_000_000u64;
+
+        let fresh = dummy_tx(1);
+        let stale = dummy_tx(2);
+        pending.persist(&fresh, now - PENDING_BROADCAST_TTL.as_secs() + 60);
+        pending.persist(&stale, now - PENDING_BROADCAST_TTL.as_secs() - 60);
+        assert_eq!(pending.pending_txids().len(), 2);
+
+        let survivors = pending.load_fresh(now);
+        assert_eq!(survivors, vec![fresh.clone()], "only the fresh tx survives");
+        assert_eq!(
+            pending.pending_txids(),
+            vec![fresh.compute_txid().to_string()],
+            "the expired entry is discarded from the store"
+        );
+
+        // Explicit removal (the success path) clears the entry.
+        pending.remove(&fresh.compute_txid());
+        assert!(pending.pending_txids().is_empty());
+    }
+
+    /// The startup drain over an unreachable Esplora keeps fresh entries (a
+    /// failed rebroadcast must survive to the next start) while still
+    /// expiring stale ones.
+    #[test]
+    fn startup_drain_keeps_failed_rebroadcasts_and_expires_stale_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv_store = Arc::new(FilesystemStore::new(dir.path().join("store")));
+        let logger = Arc::new(Logger);
+        let pending = Arc::new(PendingBroadcasts::new(
+            Arc::clone(&kv_store),
+            Arc::clone(&logger),
+        ));
+        let chain_source = ChainSource::new(
+            "http://127.0.0.1:1",
+            bitcoin::Network::Bitcoin,
+            Arc::new(CachedFeeEstimator::new()),
+            Arc::clone(&pending),
+            logger,
+        )
+        .unwrap();
+
+        let now = 1_700_000_000u64;
+        let fresh = dummy_tx(1);
+        let stale = dummy_tx(2);
+        pending.persist(&fresh, now - 60);
+        pending.persist(&stale, now - PENDING_BROADCAST_TTL.as_secs() - 60);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(chain_source.drain_pending_broadcasts(now));
+
+        assert_eq!(
+            pending.pending_txids(),
+            vec![fresh.compute_txid().to_string()],
+            "the fresh entry survives a failed rebroadcast; the stale one is expired"
+        );
+    }
+
+    /// The LDK-facing `Broadcaster` persists every transaction BEFORE it is
+    /// queued for HTTP, so a crash mid-broadcast is redelivered by the
+    /// startup drain.
+    #[test]
+    fn broadcaster_persists_transactions_before_queueing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = pending_store(dir.path());
+        let broadcaster = Broadcaster::new(Arc::clone(&pending), Arc::new(Logger));
+
+        let tx = dummy_tx(9);
+        broadcaster.broadcast_transactions(&[&tx]);
+        assert_eq!(
+            pending.pending_txids(),
+            vec![tx.compute_txid().to_string()],
+            "the pending entry must exist as soon as LDK hands us the tx"
+        );
+    }
+
+    /// A failed broadcast returns the Failed outcome and keeps the persisted
+    /// entry; the sentinel mapping (Accepted/AlreadyKnown) is exercised by
+    /// `broadcast_error_is_benign` above and the success-path removal in
+    /// `broadcast_transaction`.
+    #[test]
+    fn failed_broadcast_returns_failed_outcome_and_keeps_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv_store = Arc::new(FilesystemStore::new(dir.path().join("store")));
+        let logger = Arc::new(Logger);
+        let pending = Arc::new(PendingBroadcasts::new(
+            Arc::clone(&kv_store),
+            Arc::clone(&logger),
+        ));
+        let chain_source = ChainSource::new(
+            "http://127.0.0.1:1",
+            bitcoin::Network::Bitcoin,
+            Arc::new(CachedFeeEstimator::new()),
+            Arc::clone(&pending),
+            logger,
+        )
+        .unwrap();
+
+        let tx = dummy_tx(3);
+        pending.persist(&tx, 1_700_000_000);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt.block_on(chain_source.broadcast_transaction(&tx));
+        assert!(matches!(outcome, BroadcastOutcome::Failed(_)));
+        assert!(!outcome.is_success());
+        assert_eq!(pending.pending_txids().len(), 1);
     }
 }

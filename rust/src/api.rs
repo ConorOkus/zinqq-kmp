@@ -19,7 +19,9 @@ use crate::types::Logger;
 
 /// FFI-facing configuration. Network is fixed to mainnet; the mnemonic is
 /// auto-created in `storage_dir` on first start (U1, R1 — restore-from-words
-/// arrives with U4); the URL overrides exist for tests and fallback.
+/// arrives with U4); the overrides exist for tests and fallback and default
+/// to the PWA's infrastructure (U12/KTD-12). Every new field has a uniffi
+/// default, so existing shell call sites keep compiling.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WalletConfig {
     /// App-private data directory holding the mnemonic and all persisted
@@ -30,6 +32,32 @@ pub struct WalletConfig {
     /// Rapid Gossip Sync snapshot server override (defaults to KTD-6's LDK
     /// public server).
     pub rgs_url: Option<String>,
+    /// VSS endpoint override (defaults to the Zinqq pass-through proxy,
+    /// `https://zinqq.app/api/vss-proxy`).
+    #[uniffi(default = None)]
+    pub vss_url: Option<String>,
+    /// Disables VSS entirely (local-only persistence) when `true`.
+    #[uniffi(default = false)]
+    pub vss_disabled: bool,
+    /// Block-explorer base URL override (defaults to
+    /// `https://mempool.space`).
+    #[uniffi(default = None)]
+    pub explorer_url: Option<String>,
+    /// LSP override: node id (66-char hex pubkey). All three of
+    /// `lsp_node_id`/`lsp_host`/`lsp_port` must be set together (defaults to
+    /// Megalith from the PWA's config).
+    #[uniffi(default = None)]
+    pub lsp_node_id: Option<String>,
+    /// LSP override: host (IP or DNS name).
+    #[uniffi(default = None)]
+    pub lsp_host: Option<String>,
+    /// LSP override: port.
+    #[uniffi(default = None)]
+    pub lsp_port: Option<u16>,
+    /// Extra LSP node ids trusted for 0-conf inbound channels, on top of the
+    /// Megalith seed and the configured LSP (KTD-10: a set + predicate).
+    #[uniffi(default = [])]
+    pub trusted_lsp_node_ids: Vec<String>,
 }
 
 /// Wallet balances, from U2's bdk wallet and channel monitors.
@@ -44,6 +72,9 @@ pub struct Balances {
 /// Typed FFI errors (Kotlin `WalletException`).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
 pub enum WalletError {
+    /// A [`WalletConfig`] override failed to parse (bad LSP node id/address,
+    /// or an incomplete LSP override triple).
+    InvalidConfig { detail: String },
     /// `start()` while already running.
     AlreadyRunning,
     /// Another node already holds this storage directory's lock — a second
@@ -82,6 +113,9 @@ pub enum WalletError {
 impl std::fmt::Display for WalletError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            WalletError::InvalidConfig { detail } => {
+                write!(f, "invalid wallet configuration: {detail}")
+            }
             WalletError::AlreadyRunning => write!(f, "the node is already running"),
             WalletError::InstanceAlreadyRunning => write!(
                 f,
@@ -164,6 +198,64 @@ impl From<SendError> for WalletError {
     }
 }
 
+/// Applies the FFI config's overrides over the core defaults (U12). Pure and
+/// separate from the constructor so the override/validation matrix is
+/// unit-testable.
+fn apply_config_overrides(config: WalletConfig) -> Result<Config, WalletError> {
+    use std::str::FromStr as _;
+
+    let mut core_config = Config::new(config.storage_dir);
+    if let Some(esplora_url) = config.esplora_url {
+        core_config.esplora_url = esplora_url;
+    }
+    if let Some(rgs_url) = config.rgs_url {
+        core_config.rgs_url = rgs_url;
+    }
+    if let Some(vss_url) = config.vss_url {
+        core_config.vss_url = vss_url;
+    }
+    core_config.vss_disabled = config.vss_disabled;
+    if let Some(explorer_url) = config.explorer_url {
+        core_config.explorer_url = explorer_url;
+    }
+
+    match (config.lsp_node_id, config.lsp_host, config.lsp_port) {
+        (None, None, None) => {}
+        (Some(node_id), Some(host), Some(port)) => {
+            core_config.lsp.node_id =
+                bitcoin::secp256k1::PublicKey::from_str(&node_id).map_err(|e| {
+                    WalletError::InvalidConfig {
+                        detail: format!("lsp_node_id is not a valid public key: {e}"),
+                    }
+                })?;
+            core_config.lsp.address =
+                format!("{host}:{port}")
+                    .parse()
+                    .map_err(|e| WalletError::InvalidConfig {
+                        detail: format!("lsp_host/lsp_port is not a valid ip:port address: {e}"),
+                    })?;
+        }
+        _ => {
+            return Err(WalletError::InvalidConfig {
+                detail: "lsp_node_id, lsp_host, and lsp_port must be set together".to_string(),
+            })
+        }
+    }
+
+    for trusted in config.trusted_lsp_node_ids {
+        let node_id = bitcoin::secp256k1::PublicKey::from_str(&trusted).map_err(|e| {
+            WalletError::InvalidConfig {
+                detail: format!("trusted LSP node id {trusted} is not a valid public key: {e}"),
+            }
+        })?;
+        if !core_config.trusted_lsps.contains(&node_id) {
+            core_config.trusted_lsps.push(node_id);
+        }
+    }
+
+    Ok(core_config)
+}
+
 /// AE1 debug helper (U1, R2): the node id a 12-word mnemonic yields — the
 /// same value the PWA reports for the same words, so cross-client identity
 /// can be verified without moving funds.
@@ -191,23 +283,19 @@ pub struct Wallet {
 #[uniffi::export]
 impl Wallet {
     /// Creates a stopped wallet over the given config, reloading any
-    /// previously persisted (unacked) events from the storage dir.
+    /// previously persisted (unacked) events from the storage dir. Fails with
+    /// [`WalletError::InvalidConfig`] when an override fails to parse (U12) —
+    /// a misconfigured override must never silently fall back to defaults.
     #[uniffi::constructor]
-    pub fn new(config: WalletConfig) -> Self {
-        let mut core_config = Config::new(config.storage_dir);
-        if let Some(esplora_url) = config.esplora_url {
-            core_config.esplora_url = esplora_url;
-        }
-        if let Some(rgs_url) = config.rgs_url {
-            core_config.rgs_url = rgs_url;
-        }
+    pub fn new(config: WalletConfig) -> Result<Self, WalletError> {
+        let core_config = apply_config_overrides(config)?;
 
         let kv_store = Arc::new(FilesystemStore::new(
             PathBuf::from(&core_config.storage_dir).join(KV_STORE_SUBDIR),
         ));
         let events = Arc::new(EventQueue::new(kv_store, Arc::new(Logger)));
         let node = Node::with_event_sink(core_config, Arc::clone(&events) as _);
-        Self { node, events }
+        Ok(Self { node, events })
     }
 
     /// Starts the node. Blocking (initial restore + sync attempt): call from
@@ -306,5 +394,101 @@ impl Wallet {
             lightning_msat,
             onchain_sats,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr as _;
+
+    use crate::config::{
+        DEFAULT_ESPLORA_URL, DEFAULT_EXPLORER_URL, DEFAULT_RGS_URL, DEFAULT_VSS_URL,
+        MEGALITH_LSP_NODE_ID,
+    };
+
+    fn base_config() -> WalletConfig {
+        WalletConfig {
+            storage_dir: "/tmp/data".to_string(),
+            esplora_url: None,
+            rgs_url: None,
+            vss_url: None,
+            vss_disabled: false,
+            explorer_url: None,
+            lsp_node_id: None,
+            lsp_host: None,
+            lsp_port: None,
+            trusted_lsp_node_ids: Vec::new(),
+        }
+    }
+
+    /// U12/KTD-12: no overrides yields the PWA's infrastructure defaults.
+    #[test]
+    fn no_overrides_yield_the_pwa_infrastructure_defaults() {
+        let config = apply_config_overrides(base_config()).unwrap();
+        assert_eq!(config.esplora_url, DEFAULT_ESPLORA_URL);
+        assert_eq!(config.rgs_url, DEFAULT_RGS_URL);
+        assert_eq!(config.vss_url, DEFAULT_VSS_URL);
+        assert!(!config.vss_disabled);
+        assert_eq!(config.explorer_url, DEFAULT_EXPLORER_URL);
+        assert_eq!(
+            config.lsp.node_id,
+            bitcoin::secp256k1::PublicKey::from_str(MEGALITH_LSP_NODE_ID).unwrap()
+        );
+    }
+
+    #[test]
+    fn overrides_apply_and_the_lsp_override_is_trusted() {
+        let other = "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619";
+        let extra = "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f";
+        let mut ffi_config = base_config();
+        ffi_config.vss_url = Some("http://127.0.0.1:1/vss".to_string());
+        ffi_config.vss_disabled = true;
+        ffi_config.explorer_url = Some("http://127.0.0.1:1/explorer".to_string());
+        ffi_config.lsp_node_id = Some(other.to_string());
+        ffi_config.lsp_host = Some("127.0.0.1".to_string());
+        ffi_config.lsp_port = Some(9736);
+        ffi_config.trusted_lsp_node_ids = vec![extra.to_string()];
+
+        let config = apply_config_overrides(ffi_config).unwrap();
+        assert_eq!(config.vss_url, "http://127.0.0.1:1/vss");
+        assert!(config.vss_disabled);
+        assert_eq!(config.explorer_url, "http://127.0.0.1:1/explorer");
+        assert_eq!(config.lsp.address.to_string(), "127.0.0.1:9736");
+        let other = bitcoin::secp256k1::PublicKey::from_str(other).unwrap();
+        let extra = bitcoin::secp256k1::PublicKey::from_str(extra).unwrap();
+        assert_eq!(config.lsp.node_id, other);
+        assert!(config.is_trusted_lsp(&other), "the LSP override is trusted");
+        assert!(config.is_trusted_lsp(&extra), "extra trusted ids are added");
+        assert!(
+            config.is_trusted_lsp(
+                &bitcoin::secp256k1::PublicKey::from_str(MEGALITH_LSP_NODE_ID).unwrap()
+            ),
+            "the Megalith seed survives an LSP override"
+        );
+    }
+
+    /// U12: a misconfigured override is a typed error with a distinct
+    /// message, never a silent fallback to defaults.
+    #[test]
+    fn invalid_overrides_fail_with_typed_config_errors() {
+        let mut partial = base_config();
+        partial.lsp_node_id = Some(MEGALITH_LSP_NODE_ID.to_string());
+        let err = apply_config_overrides(partial).unwrap_err();
+        assert!(matches!(err, WalletError::InvalidConfig { .. }), "{err}");
+        assert!(err.to_string().contains("must be set together"), "{err}");
+
+        let mut bad_key = base_config();
+        bad_key.trusted_lsp_node_ids = vec!["not-a-key".to_string()];
+        let err = apply_config_overrides(bad_key).unwrap_err();
+        assert!(matches!(err, WalletError::InvalidConfig { .. }), "{err}");
+        assert!(err.to_string().contains("not-a-key"), "{err}");
+
+        let mut bad_addr = base_config();
+        bad_addr.lsp_node_id = Some(MEGALITH_LSP_NODE_ID.to_string());
+        bad_addr.lsp_host = Some("not an address".to_string());
+        bad_addr.lsp_port = Some(9735);
+        let err = apply_config_overrides(bad_addr).unwrap_err();
+        assert!(matches!(err, WalletError::InvalidConfig { .. }), "{err}");
     }
 }

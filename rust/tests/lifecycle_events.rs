@@ -16,7 +16,15 @@ fn test_wallet(storage_dir: &Path) -> Wallet {
         storage_dir: storage_dir.to_str().unwrap().to_string(),
         esplora_url: Some(UNREACHABLE_ESPLORA.to_string()),
         rgs_url: Some(UNREACHABLE_RGS.to_string()),
+        vss_url: None,
+        vss_disabled: false,
+        explorer_url: None,
+        lsp_node_id: None,
+        lsp_host: None,
+        lsp_port: None,
+        trusted_lsp_node_ids: Vec::new(),
     })
+    .expect("default overrides are valid")
 }
 
 /// A runtime standing in for the foreign executor that drives UniFFI async

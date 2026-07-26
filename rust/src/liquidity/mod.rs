@@ -10,9 +10,10 @@
 //!
 //! The KTD-9 0-conf cluster's per-channel half also lives here:
 //! [`LiquiditySource::on_open_channel_request`] accepts 0-conf from the
-//! configured LSP only (with the underpaying-HTLC override so the skimmed
-//! opening fee is claimable), and [`ClaimTracker`] guards the skim at
-//! `PaymentClaimable` time before `claim_funds`.
+//! trusted-LSP set only (U12/KTD-10: a set + predicate, with the shared JIT
+//! overrides from `config` so the skimmed opening fee is claimable), and
+//! [`ClaimTracker`] guards the skim at `PaymentClaimable` time before
+//! `claim_funds`.
 //!
 //! Module layout: [`selection`] holds the fee-menu selection logic and
 //! [`Lsps2Error`]; [`claim`] holds the skim guard; this module owns the
@@ -48,13 +49,13 @@ use lightning_liquidity::lsps2::event::LSPS2ClientEvent;
 use lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams;
 use tokio::sync::oneshot;
 
-use crate::config::{LspConfig, LSP_CONNECT_TIMEOUT};
+use crate::config::{
+    LspConfig, JIT_ACCEPT_UNDERPAYING_HTLCS, JIT_INVOICE_DESCRIPTION, JIT_MAX_INBOUND_INFLIGHT_PCT,
+    LSP_CONNECT_TIMEOUT,
+};
 use crate::invoice::{build_jit_invoice, JitInvoiceParams, JIT_MIN_FINAL_CLTV_EXPIRY_DELTA};
 use crate::types::{ChannelManager, LiquidityManager, Logger, PeerManager};
 use crate::util::{peer_is_connected, unix_now};
-
-/// Fixed description on the spike's JIT invoices.
-const JIT_INVOICE_DESCRIPTION: &str = "zinqq";
 
 /// The `lsps2.buy` outcome relayed from `InvoiceParametersReady`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,9 @@ pub(crate) struct LiquiditySource {
     liquidity_manager: Arc<LiquidityManager>,
     peer_manager: Arc<PeerManager>,
     lsp: LspConfig,
+    /// LSP node ids trusted for 0-conf inbound channels beyond the configured
+    /// LSP (U12/KTD-10: a set + predicate, never a single pubkey compare).
+    trusted_lsps: Vec<bitcoin::secp256k1::PublicKey>,
     network: Network,
     node_secret: bitcoin::secp256k1::SecretKey,
     request_timeout: Duration,
@@ -90,6 +94,7 @@ impl LiquiditySource {
     pub(crate) fn from_components(
         components: &crate::builder::NodeComponents,
         lsp: LspConfig,
+        trusted_lsps: Vec<bitcoin::secp256k1::PublicKey>,
         network: Network,
         request_timeout: Duration,
     ) -> Self {
@@ -98,6 +103,7 @@ impl LiquiditySource {
             liquidity_manager: Arc::clone(&components.liquidity_manager),
             peer_manager: Arc::clone(&components.peer_manager),
             lsp,
+            trusted_lsps,
             network,
             node_secret: components.keys_manager.get_node_secret_key(),
             request_timeout,
@@ -342,15 +348,23 @@ impl LiquiditySource {
         }
     }
 
+    /// Whether `node_id` may open 0-conf channels to us (U12/KTD-10): the
+    /// configured LSP or any member of the trusted set — the same semantics
+    /// as `Config::is_trusted_lsp` (the set is handed over at construction).
+    pub(crate) fn is_trusted_lsp(&self, node_id: &bitcoin::secp256k1::PublicKey) -> bool {
+        *node_id == self.lsp.node_id || self.trusted_lsps.contains(node_id)
+    }
+
     /// KTD-9 (copied from ldk-node's `Event::OpenChannelRequest` arm): accept
-    /// 0-conf from the configured LSP with the underpaying-HTLC + 100%
-    /// in-flight overrides; reject everyone else.
+    /// 0-conf from the trusted-LSP set with the underpaying-HTLC + 100%
+    /// in-flight overrides (the shared KTD-10 JIT constants); reject everyone
+    /// else.
     pub(crate) fn on_open_channel_request(
         &self,
         temporary_channel_id: ChannelId,
         counterparty_node_id: bitcoin::secp256k1::PublicKey,
     ) {
-        if counterparty_node_id != self.lsp.node_id {
+        if !self.is_trusted_lsp(&counterparty_node_id) {
             log_error!(
                 self.logger,
                 "Rejecting inbound channel from untrusted peer {counterparty_node_id}"
@@ -370,14 +384,18 @@ impl LiquiditySource {
         // When we're an LSPS2 client, allow claiming underpaying HTLCs as the
         // LSP will skim off some fee. We'll check that they don't take too
         // much before claiming. We also set the maximum allowed inbound HTLC
-        // value in flight to 100% (verbatim ldk-node).
+        // value in flight to 100%. Both values come from the shared KTD-10
+        // constants in `config`, the same source `default_user_config` reads,
+        // so the per-channel override can never drift from the global default.
         let channel_override_config = Some(ChannelConfigOverrides {
             handshake_overrides: Some(ChannelHandshakeConfigUpdate {
-                max_inbound_htlc_value_in_flight_percent_of_channel: Some(100),
+                max_inbound_htlc_value_in_flight_percent_of_channel: Some(
+                    JIT_MAX_INBOUND_INFLIGHT_PCT,
+                ),
                 ..Default::default()
             }),
             update_overrides: Some(ChannelConfigUpdate {
-                accept_underpaying_htlcs: Some(true),
+                accept_underpaying_htlcs: Some(JIT_ACCEPT_UNDERPAYING_HTLCS),
                 ..Default::default()
             }),
         });
@@ -536,6 +554,7 @@ mod tests {
         Arc::new(LiquiditySource::from_components(
             &components,
             config.lsp.clone(),
+            config.trusted_lsps.clone(),
             config.network,
             Duration::from_millis(200),
         ))
@@ -561,6 +580,39 @@ mod tests {
 
     fn megalith() -> PublicKey {
         PublicKey::from_str(MEGALITH_LSP_NODE_ID).unwrap()
+    }
+
+    /// U12/KTD-10: the 0-conf gate consults the trusted-LSP set, not a single
+    /// pubkey compare — a set member that is NOT the configured LSP passes.
+    #[test]
+    fn trusted_lsp_predicate_gates_the_zero_conf_accept_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = rt();
+        let extra_trusted = PublicKey::from_str(
+            "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619",
+        )
+        .unwrap();
+        let stranger = PublicKey::from_str(
+            "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
+        )
+        .unwrap();
+
+        let mut config = Config::new(dir.path().to_str().unwrap().to_string());
+        config.esplora_url = "http://127.0.0.1:1".to_string();
+        config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        config.trusted_lsps.push(extra_trusted);
+        let components = build(&config, &rt).expect("offline build must succeed");
+        let source = LiquiditySource::from_components(
+            &components,
+            config.lsp.clone(),
+            config.trusted_lsps.clone(),
+            config.network,
+            Duration::from_millis(200),
+        );
+
+        assert!(source.is_trusted_lsp(&megalith()), "configured LSP");
+        assert!(source.is_trusted_lsp(&extra_trusted), "trusted-set member");
+        assert!(!source.is_trusted_lsp(&stranger), "unknown peer");
     }
 
     #[test]

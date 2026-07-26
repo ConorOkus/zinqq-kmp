@@ -157,6 +157,7 @@ impl Node {
         let liquidity_source = Arc::new(LiquiditySource::from_components(
             &components,
             self.config.lsp.clone(),
+            self.config.trusted_lsps.clone(),
             self.config.network,
             LSPS2_REQUEST_TIMEOUT,
         ));
@@ -165,6 +166,18 @@ impl Node {
         let (bp_stop_sender, _) = watch::channel(());
 
         self.spawn_broadcast_task(&runtime, &components, stop_sender.subscribe());
+        // U12/KTD-9: rebroadcast any pending transactions persisted by a
+        // previous run (crash mid-broadcast must not lose a force-close tx);
+        // entries older than 48 h are expired instead. One-shot, failure
+        // tolerant — failed entries stay persisted for the next start.
+        {
+            let chain_source = Arc::clone(&components.chain_source);
+            runtime.spawn(async move {
+                chain_source
+                    .drain_pending_broadcasts(unix_now().as_secs())
+                    .await;
+            });
+        }
         self.spawn_sync_task(
             &runtime,
             &components,
@@ -474,8 +487,13 @@ impl Node {
                         }
                     }
                     _ = fee_interval.tick() => {
-                        if let Err(e) = chain_source.update_fee_rate_estimates().await {
-                            log_error!(logger, "Fee rate update failed: {e}");
+                        // U12/KTD-9: the tick only polls; the 60 s cache TTL
+                        // and 15 s failure backoff decide whether a refresh
+                        // actually runs.
+                        if chain_source.fee_refresh_due() {
+                            if let Err(e) = chain_source.update_fee_rate_estimates().await {
+                                log_error!(logger, "Fee rate update failed: {e}");
+                            }
                         }
                     }
                     _ = rgs_interval.tick() => {
@@ -486,6 +504,16 @@ impl Node {
                 }
             }
         });
+    }
+
+    /// The peers the reconnect loop keeps dialed (U12): today the configured
+    /// static peers; U3's known-peers store plugs in here so the reconnect
+    /// set grows without touching the loop. The configured LSP is part of the
+    /// reconnect set too, but is dialed via
+    /// `LiquiditySource::ensure_lsp_connected` (see the loop body) so its
+    /// dial lock is honored.
+    fn reconnect_targets(&self) -> Vec<crate::config::PeerInfo> {
+        self.config.peers.clone()
     }
 
     fn spawn_peer_reconnect_task(
@@ -500,7 +528,7 @@ impl Node {
         // racing `receive_jit` also takes. Both firing at t=0 otherwise opens
         // two connections and LDK drops one, which can strand an in-flight
         // LSPS2 request on the dropped socket.
-        let peers = self.config.peers.clone();
+        let peers = self.reconnect_targets();
         let peer_manager = Arc::clone(&components.peer_manager);
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(PEER_RECONNECT_INTERVAL);

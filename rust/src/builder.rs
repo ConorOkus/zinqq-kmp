@@ -47,7 +47,7 @@ use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
 use lightning_liquidity::LiquidityClientConfig;
 use lightning_persister::fs_store::FilesystemStore;
 
-use crate::chain::{Broadcaster, ChainSource, GossipSource};
+use crate::chain::{Broadcaster, ChainError, ChainSource, GossipSource, PendingBroadcasts};
 use crate::config::{default_user_config, Config};
 use crate::fees::CachedFeeEstimator;
 use crate::keys::{derive_wallet_keys, read_or_generate_mnemonic, KeysError};
@@ -99,6 +99,11 @@ pub enum BuildError {
     /// Chain sync failed while channel monitors exist; starting without a
     /// synced view of monitored channels is not fund-safe.
     ChainSyncFailed,
+    /// The Esplora backend answered the startup genesis-hash probe with a
+    /// non-mainnet hash: it serves the wrong chain (U12/KTD-12). Always a
+    /// hard error — an unreachable backend degraded-starts instead, but a
+    /// wrong-chain view is never fund-safe.
+    WrongNetworkBackend,
     /// The Esplora client could not be constructed from the configured URL.
     InvalidEsploraConfig,
     /// The system clock is set before the UNIX epoch.
@@ -128,6 +133,9 @@ impl fmt::Display for BuildError {
             BuildError::InvalidMonitorData => "persisted channel monitor data is unreadable",
             BuildError::WatchChannelFailed => "failed to watch a restored channel monitor",
             BuildError::ChainSyncFailed => "chain sync failed with channel monitors present",
+            BuildError::WrongNetworkBackend => {
+                "the esplora backend serves a different network than mainnet"
+            }
             BuildError::InvalidEsploraConfig => "invalid esplora configuration",
             BuildError::InvalidSystemTime => "system time is before the UNIX epoch",
             BuildError::RuntimeSetupFailed => "failed to create the tokio runtime",
@@ -206,13 +214,21 @@ pub(crate) fn build(
 
     let kv_store = Arc::new(FilesystemStore::new(storage_dir.join(KV_STORE_SUBDIR)));
 
-    let broadcaster = Arc::new(Broadcaster::new(Arc::clone(&logger)));
+    let pending_broadcasts = Arc::new(PendingBroadcasts::new(
+        Arc::clone(&kv_store),
+        Arc::clone(&logger),
+    ));
+    let broadcaster = Arc::new(Broadcaster::new(
+        Arc::clone(&pending_broadcasts),
+        Arc::clone(&logger),
+    ));
     let fee_estimator = Arc::new(CachedFeeEstimator::new());
     let chain_source = Arc::new(
         ChainSource::new(
             &config.esplora_url,
             config.network,
             Arc::clone(&fee_estimator),
+            Arc::clone(&pending_broadcasts),
             Arc::clone(&logger),
         )
         .map_err(|e| {
@@ -220,6 +236,29 @@ pub(crate) fn build(
             BuildError::InvalidEsploraConfig
         })?,
     );
+
+    // U12/KTD-12: genesis-hash network check. A backend that ANSWERS with a
+    // non-mainnet genesis fails the start hard; an unreachable one only
+    // logs — the fresh-node degraded start (and the monitors-present hard
+    // failure below) keep their existing semantics.
+    match runtime
+        .block_on(chain_source.check_genesis_hash(crate::config::mainnet::genesis_block_hash()))
+    {
+        Ok(()) => {}
+        Err(ChainError::WrongNetworkBackend { got }) => {
+            log_error!(
+                logger,
+                "Esplora backend serves the wrong network (genesis {got}); refusing to start"
+            );
+            return Err(BuildError::WrongNetworkBackend);
+        }
+        Err(e) => {
+            log_error!(
+                logger,
+                "Genesis-hash probe failed (not a network mismatch), continuing: {e}"
+            );
+        }
+    }
 
     // BDK wallet FIRST (KTD-4 ordering): eager, no network — the custom
     // signer below resolves destination scripts during LDK deserialization.
@@ -563,6 +602,78 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal HTTP stub answering every request with `body` (Connection:
+    /// close so each request is a fresh socket). Returns the base URL; the
+    /// accept loop lives on a detached thread for the life of the test
+    /// process.
+    fn spawn_http_stub(body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// U12/KTD-12: an Esplora endpoint that ANSWERS `/block-height/0` with a
+    /// non-mainnet genesis hash must fail the start with the typed
+    /// wrong-network error — never degraded-start against the wrong chain.
+    #[test]
+    fn wrong_genesis_hash_fails_start_with_typed_error() {
+        // Testnet3's genesis hash: a reachable, answering, wrong-network backend.
+        let url =
+            spawn_http_stub("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::new(dir.path().to_str().unwrap().to_string());
+        config.esplora_url = url;
+        config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+
+        let rt = test_runtime();
+        let result = build(&config, &rt);
+        assert!(
+            matches!(result, Err(BuildError::WrongNetworkBackend)),
+            "wrong genesis must fail the build with the typed error"
+        );
+    }
+
+    /// U12/KTD-12 counterpart: a backend that answers with the RIGHT genesis
+    /// hash passes the check (and a fresh zero-monitor node still tolerates
+    /// the rest of the sync failing — degraded start preserved).
+    #[test]
+    fn correct_genesis_hash_passes_the_network_check() {
+        let url =
+            spawn_http_stub("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::new(dir.path().to_str().unwrap().to_string());
+        config.esplora_url = url;
+        config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+
+        let rt = test_runtime();
+        let components = build(&config, &rt).expect("matching genesis must not block the build");
+        // The stub serves garbage for every other endpoint, so this is the
+        // degraded-start path, not a synced one.
+        assert!(!components.chain_synced_at_start);
+    }
 
     #[test]
     fn keys_errors_map_to_distinct_typed_build_errors() {
