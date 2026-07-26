@@ -1,0 +1,51 @@
+[package]
+name = "wallet-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "wallet_core"
+# "lib" (rlib) is required for the integration tests in tests/; Gobley
+# packages the cdylib (Android/JNI) and staticlib (iOS) as before.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# Exact pin: Gobley 0.3.7 pairs with uniffi 0.29.4 (KTD-2); a semver-open
+# requirement drifts to 0.29.5+.
+uniffi = "=0.29.4"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net", "macros"] }
+
+# KTD-1: ldk-node 0.7.0-parity pin set. Declared in full so the walking
+# skeleton compiles and links the real dependency graph (secp256k1 C build,
+# rustls/HTTP stack) before any Lightning code lands in U2.
+lightning = "0.2.4"
+lightning-liquidity = "0.2.3"
+lightning-transaction-sync = { version = "0.2.1", features = ["esplora-async-https"] }
+lightning-background-processor = "0.2.3"
+lightning-net-tokio = "0.2.0"
+lightning-persister = "0.2.3"
+lightning-invoice = "0.34.1"
+lightning-rapid-gossip-sync = "0.2.3"
+bdk_wallet = "2.4.0"
+bdk_esplora = { version = "0.22", default-features = false, features = ["async-https-rustls", "tokio"] }
+bitcoin = "0.32"
+esplora-client = { version = "0.12", default-features = false, features = ["tokio", "async-https-rustls"] }
+# RGS snapshot download (KTD-6); reqwest is already in the graph via the
+# esplora async client, so this adds no new TLS stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# bdk_wallet's ChangeSet is serde-serializable; we persist it as one JSON blob.
+serde_json = "1"
+# The public Event queue is serde-derived and persisted as JSON (KTD-8).
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# NOTE: panic = "abort" is deliberately NOT set — UniFFI relies on unwinding
+# to surface Rust panics as foreign exceptions.

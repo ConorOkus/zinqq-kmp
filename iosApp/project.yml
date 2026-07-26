@@ -1,0 +1,34 @@
+# XcodeGen spec for the iOS shell. iosApp.xcodeproj is generated, not checked in:
+#
+#   brew install xcodegen   # once
+#   cd iosApp && xcodegen generate
+#
+# The pre-build script phase builds the shared KMP framework (Gobley statically
+# links the Rust staticlib into it) and copies it where Xcode expects it.
+name: iosApp
+options:
+  bundleIdPrefix: zinqq.spike
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  iosApp:
+    type: application
+    platform: iOS
+    sources:
+      - iosApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: zinqq.spike.ios
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Zinqq Spike
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)
+        OTHER_LDFLAGS: $(inherited) -framework Shared
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    preBuildScripts:
+      - name: Build Shared KMP Framework
+        script: |
+          cd "$SRCROOT/.."
+          ./gradlew :shared:embedAndSignAppleFrameworkForXcode
+        basedOnDependencyAnalysis: false
