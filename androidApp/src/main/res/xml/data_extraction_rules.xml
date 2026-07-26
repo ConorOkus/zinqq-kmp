@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  R6: the "wallet" dir under filesDir holds the seed and channel monitors.
+  A restored stale channel-monitor set is a force-close/penalty hazard, so it
+  is excluded from BOTH cloud backup and device-to-device transfer, belt and
+  braces on top of android:allowBackup="false".
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="wallet/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="wallet/" />
+    </device-transfer>
+</data-extraction-rules>
