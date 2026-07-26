@@ -118,7 +118,7 @@ fn unacked_events_are_redelivered_by_a_rebuilt_wallet() {
 }
 
 #[test]
-fn stubbed_operations_return_typed_errors_while_stopped() {
+fn wired_operations_return_typed_errors_while_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let wallet = test_wallet(dir.path());
 
@@ -128,11 +128,74 @@ fn stubbed_operations_return_typed_errors_while_stopped() {
         wallet.receive_jit(100_000),
         Err(WalletError::NotRunning)
     ));
-    // send ships in U5 — still a typed NotImplemented stub.
+    // send is wired (U5): on a stopped wallet it fails typed BEFORE any
+    // parsing (the garbage string is never looked at).
     assert!(matches!(
-        wallet.send("lnbc1exampleinvoice".to_string()),
-        Err(WalletError::NotImplemented { .. })
+        wallet.send("definitely not an invoice".to_string()),
+        Err(WalletError::NotRunning)
     ));
+}
+
+/// Builds and signs a fresh fixed-amount mainnet invoice for the send tests.
+fn signed_mainnet_invoice() -> String {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning::types::payment::PaymentSecret;
+    use lightning_invoice::{Currency, InvoiceBuilder};
+
+    let secret = SecretKey::from_slice(&[0x4d; 32]).unwrap();
+    InvoiceBuilder::new(Currency::Bitcoin)
+        .description("u5 ffi send test".to_string())
+        .payment_hash(sha256::Hash::from_byte_array([0x55; 32]))
+        .payment_secret(PaymentSecret([0x66; 32]))
+        .duration_since_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap(),
+        )
+        .min_final_cltv_expiry_delta(144)
+        .expiry_time(Duration::from_secs(3_600))
+        .amount_milli_satoshis(50_000_000)
+        .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &secret))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn send_failures_surface_as_typed_errors_and_payment_failed_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = test_wallet(dir.path());
+    let rt = foreign_executor();
+
+    wallet.start().unwrap();
+    assert_eq!(next_with_timeout(&rt, &wallet, 5), Event::NodeStarted);
+    wallet.event_handled().unwrap();
+    assert_eq!(next_with_timeout(&rt, &wallet, 5), Event::SyncFailed);
+    wallet.event_handled().unwrap();
+
+    // Validation failure: a distinct typed error, and NO event (nothing was
+    // attempted, so there is no payment outcome to report).
+    assert!(matches!(
+        wallet.send("junk".to_string()),
+        Err(WalletError::InvalidInvoice { .. })
+    ));
+
+    // Attempt failure: a valid mainnet invoice on a channel-less node has no
+    // route. The typed error and the queued PaymentFailed carry the SAME
+    // distinct reason (KTD-8: the queue is the durable source of truth).
+    let reason = match wallet.send(signed_mainnet_invoice()) {
+        Err(WalletError::SendFailed { reason }) => reason,
+        other => panic!("expected SendFailed, got {other:?}"),
+    };
+    assert_eq!(
+        next_with_timeout(&rt, &wallet, 5),
+        Event::PaymentFailed { reason }
+    );
+    wallet.event_handled().unwrap();
+
+    // The malformed send queued nothing: the queue is fully drained.
+    assert_eq!(wallet.event_handled(), Err(WalletError::NoPendingEvent));
+    wallet.stop().unwrap();
 }
 
 #[test]

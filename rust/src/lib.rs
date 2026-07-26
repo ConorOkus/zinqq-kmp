@@ -13,6 +13,7 @@ mod fees;
 mod invoice;
 pub mod liquidity;
 pub mod node;
+pub mod payment;
 mod types;
 mod wallet;
 
@@ -22,6 +23,7 @@ pub use config::{Config, LspConfig, PeerInfo};
 pub use events::Event;
 pub use liquidity::Lsps2Error;
 pub use node::Node;
+pub use payment::SendError;
 
 uniffi::setup_scaffolding!();
 

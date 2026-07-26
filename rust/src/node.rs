@@ -25,6 +25,7 @@ use crate::config::{
     PEER_RECONNECT_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use crate::liquidity::{LiquiditySource, Lsps2Error};
+use crate::payment::{describe_failure_reason, send_bolt11, SendError};
 use crate::types::{Logger, Sweeper};
 
 /// Internal core events, mapped into the public FFI `Event` enum by the
@@ -52,6 +53,11 @@ pub(crate) enum CoreEvent {
     ChannelReady,
     /// The LSPS2 flow failed (U4).
     Lsps2Failed { reason: String },
+    /// An outbound payment succeeded (U5): LDK holds the preimage receipt.
+    PaymentSuccessful,
+    /// An outbound payment failed terminally (U5). `reason` is either the
+    /// stringified LDK failure reason or the synchronous attempt failure.
+    PaymentFailed { reason: String },
 }
 
 /// Consumer of [`CoreEvent`]s (U3 seam).
@@ -216,6 +222,40 @@ impl Node {
                 self.event_sink.emit(CoreEvent::Lsps2Failed {
                     reason: error.to_string(),
                 });
+                Err(error)
+            }
+        }
+    }
+
+    /// Pays a mainnet BOLT11 invoice (U5). Blocking (route computation): call
+    /// from a background dispatcher. Idempotent across restarts: the
+    /// `PaymentId` is derived from the payment hash, so LDK rejects a re-send
+    /// of an in-flight invoice as a duplicate instead of paying twice.
+    ///
+    /// The payment outcome arrives via the event queue (`PaymentSuccessful` /
+    /// `PaymentFailed`). Failures of the initial attempt (e.g. no route) are
+    /// abandoned synchronously by LDK without an event, so they are pushed as
+    /// `PaymentFailed` here AND returned as a typed error. Validation
+    /// failures and duplicates only return the typed error: nothing was
+    /// attempted (or the original attempt still owns the outcome).
+    pub fn send_payment(&self, bolt11: &str) -> Result<(), SendError> {
+        let channel_manager = {
+            let state_lock = self.state.lock().unwrap();
+            let state = state_lock.as_ref().ok_or(SendError::NotRunning)?;
+            Arc::clone(&state.components.channel_manager)
+        };
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time before UNIX epoch");
+
+        match send_bolt11(&*channel_manager, bolt11, self.config.network, now) {
+            Ok(_payment_id) => Ok(()),
+            Err(error) => {
+                if error.is_attempt_failure() {
+                    self.event_sink.emit(CoreEvent::PaymentFailed {
+                        reason: error.to_string(),
+                    });
+                }
                 Err(error)
             }
         }
@@ -498,8 +538,9 @@ impl Node {
 
 /// Handles LDK events: durable `SpendableOutputs` (U2 fund safety), the U4
 /// JIT-receive cluster (0-conf channel acceptance, claimable→claim_funds,
-/// claimed→PaymentReceived, channel pending/ready), and log-and-ack for the
-/// rest (U5 extends this with the send-payment outcomes).
+/// claimed→PaymentReceived, channel pending/ready), the U5 send outcomes
+/// (PaymentSent/PaymentFailed → the public payment events), and log-and-ack
+/// for the rest.
 fn handle_ldk_event(
     event: Event,
     sweeper: &Sweeper,
@@ -568,6 +609,44 @@ fn handle_ldk_event(
         }
         Event::ChannelReady { .. } => {
             event_sink.emit(CoreEvent::ChannelReady);
+            Ok(())
+        }
+        // The durable success signal for a send (U5).
+        Event::PaymentSent {
+            payment_hash,
+            fee_paid_msat,
+            ..
+        } => {
+            log_info!(
+                logger,
+                "Outbound payment {payment_hash:?} succeeded (fee paid: {fee_paid_msat:?} msat)"
+            );
+            event_sink.emit(CoreEvent::PaymentSuccessful);
+            Ok(())
+        }
+        // The terminal failure signal for a send (U5): all retries exhausted
+        // or the payment was abandoned.
+        Event::PaymentFailed {
+            payment_hash,
+            reason,
+            ..
+        } => {
+            let reason = describe_failure_reason(reason);
+            log_error!(logger, "Outbound payment {payment_hash:?} failed: {reason}");
+            event_sink.emit(CoreEvent::PaymentFailed { reason });
+            Ok(())
+        }
+        // Per-path telemetry: the background processor already feeds these to
+        // the scorer; the terminal outcome arrives as PaymentSent/Failed.
+        Event::PaymentPathSuccessful { payment_hash, .. } => {
+            log_info!(logger, "A payment path for {payment_hash:?} succeeded");
+            Ok(())
+        }
+        Event::PaymentPathFailed { payment_hash, .. } => {
+            log_info!(
+                logger,
+                "A payment path for {payment_hash:?} failed; LDK may retry other paths"
+            );
             Ok(())
         }
         other => {

@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::events::{Event, EventQueue};
 use crate::liquidity::Lsps2Error;
 use crate::node::Node;
+use crate::payment::SendError;
 use crate::types::Logger;
 
 /// FFI-facing configuration. Network is fixed to mainnet and there is no
@@ -51,8 +52,22 @@ pub enum WalletError {
     /// The LSPS2 JIT flow failed; `reason` is the same distinct reason the
     /// corresponding [`Event::Lsps2Failed`] carries.
     Lsps2 { reason: String },
-    /// The operation's unit ships later in the plan (U5).
-    NotImplemented { operation: String },
+    /// `send()` with a bolt11 string that failed to parse or verify.
+    InvalidInvoice { message: String },
+    /// `send()` with an invoice that is already expired.
+    InvoiceExpired,
+    /// `send()` with an invoice for a different network (this wallet pays
+    /// mainnet invoices only); `network` names the invoice's network.
+    WrongNetwork { network: String },
+    /// `send()` with an amountless invoice — the spike sends fixed-amount
+    /// invoices only, and there is no amount argument to supply one.
+    AmountlessInvoice,
+    /// `send()` of an invoice whose payment is already pending — paying again
+    /// would risk paying twice, so the original attempt owns the outcome.
+    DuplicatePayment,
+    /// The send attempt failed (e.g. no route); `reason` is the same distinct
+    /// reason the corresponding [`Event::PaymentFailed`] carries.
+    SendFailed { reason: String },
 }
 
 impl std::fmt::Display for WalletError {
@@ -63,9 +78,23 @@ impl std::fmt::Display for WalletError {
             WalletError::Startup { message } => write!(f, "failed to start the node: {message}"),
             WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
             WalletError::Lsps2 { reason } => write!(f, "LSPS2 request failed: {reason}"),
-            WalletError::NotImplemented { operation } => {
-                write!(f, "{operation} is not implemented yet")
+            WalletError::InvalidInvoice { message } => {
+                write!(f, "invalid bolt11 invoice: {message}")
             }
+            WalletError::InvoiceExpired => write!(f, "the invoice is expired"),
+            WalletError::WrongNetwork { network } => write!(
+                f,
+                "the invoice is for the {network} network, this wallet only pays bitcoin \
+                 (mainnet) invoices"
+            ),
+            WalletError::AmountlessInvoice => write!(
+                f,
+                "the invoice has no amount; amountless invoices are not supported"
+            ),
+            WalletError::DuplicatePayment => {
+                write!(f, "a payment for this invoice is already pending")
+            }
+            WalletError::SendFailed { reason } => write!(f, "sending failed: {reason}"),
         }
     }
 }
@@ -80,6 +109,28 @@ impl From<BuildError> for WalletError {
             other => WalletError::Startup {
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<SendError> for WalletError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::NotRunning => WalletError::NotRunning,
+            SendError::InvalidInvoice(message) => WalletError::InvalidInvoice { message },
+            SendError::InvoiceExpired => WalletError::InvoiceExpired,
+            SendError::WrongNetwork { found, .. } => WalletError::WrongNetwork {
+                network: found.to_string(),
+            },
+            SendError::AmountMissing => WalletError::AmountlessInvoice,
+            SendError::DuplicatePayment => WalletError::DuplicatePayment,
+            // Attempt failures: the same reason string the queued
+            // Event::PaymentFailed carries.
+            other @ (SendError::RouteNotFound | SendError::SendFailed(_)) => {
+                WalletError::SendFailed {
+                    reason: other.to_string(),
+                }
+            }
         }
     }
 }
@@ -168,14 +219,17 @@ impl Wallet {
             })
     }
 
-    /// Pays a BOLT11 invoice; the outcome arrives as
-    /// [`Event::PaymentSuccessful`] / [`Event::PaymentFailed`]. Wired in U5 —
-    /// signature is final.
+    /// Pays a mainnet BOLT11 invoice; the outcome arrives as
+    /// [`Event::PaymentSuccessful`] / [`Event::PaymentFailed`]. Blocking
+    /// (route computation): call from a background dispatcher.
+    ///
+    /// Idempotent across restarts (U5): the payment id is derived from the
+    /// invoice's payment hash, so re-sending an in-flight invoice fails with
+    /// [`WalletError::DuplicatePayment`] instead of paying twice. Invalid
+    /// invoices (malformed / expired / wrong network / amountless) each fail
+    /// with a distinct typed error before anything is attempted.
     pub fn send(&self, bolt11: String) -> Result<(), WalletError> {
-        let _ = bolt11;
-        Err(WalletError::NotImplemented {
-            operation: "send".to_string(),
-        })
+        self.node.send_payment(&bolt11).map_err(WalletError::from)
     }
 
     /// Awaits the front event WITHOUT removing it (Kotlin `suspend`). The

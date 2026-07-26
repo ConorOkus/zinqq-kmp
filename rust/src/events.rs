@@ -199,6 +199,8 @@ impl EventSink for EventQueue {
             CoreEvent::ChannelPending => Event::ChannelPending,
             CoreEvent::ChannelReady => Event::ChannelReady,
             CoreEvent::Lsps2Failed { reason } => Event::Lsps2Failed { reason },
+            CoreEvent::PaymentSuccessful => Event::PaymentSuccessful,
+            CoreEvent::PaymentFailed { reason } => Event::PaymentFailed { reason },
         };
         self.push(event);
     }
@@ -337,6 +339,10 @@ mod tests {
         queue.emit(CoreEvent::Lsps2Failed {
             reason: "all LSP-offered opening fee params are expired".to_string(),
         });
+        queue.emit(CoreEvent::PaymentSuccessful);
+        queue.emit(CoreEvent::PaymentFailed {
+            reason: "no route to the recipient was found".to_string(),
+        });
 
         assert_eq!(queue.ack(), Some(Event::SyncFailed));
         assert_eq!(queue.ack(), Some(Event::SyncCompleted));
@@ -360,6 +366,13 @@ mod tests {
             queue.ack(),
             Some(Event::Lsps2Failed {
                 reason: "all LSP-offered opening fee params are expired".to_string(),
+            })
+        );
+        assert_eq!(queue.ack(), Some(Event::PaymentSuccessful));
+        assert_eq!(
+            queue.ack(),
+            Some(Event::PaymentFailed {
+                reason: "no route to the recipient was found".to_string(),
             })
         );
     }
