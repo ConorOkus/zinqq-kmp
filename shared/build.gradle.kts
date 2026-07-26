@@ -1,3 +1,5 @@
+import gobley.gradle.GobleyHost
+import gobley.gradle.cargo.dsl.CargoJvmBuild
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -11,6 +13,13 @@ plugins {
 cargo {
     // The wallet-core crate lives at the repository root, not inside this module.
     packageDirectory = layout.projectDirectory.dir("../rust")
+    // The JVM target exists only for host-side binding tests. Without this,
+    // Gobley builds cargo for every publishable JVM triple (including Linux)
+    // and needs cross-compilers this repo does not ship.
+    publishJvmArtifacts = false
+    builds.withType<CargoJvmBuild<*>>().configureEach {
+        embedRustLibrary = rustTarget == GobleyHost.current.rustTarget
+    }
 }
 
 uniffi {

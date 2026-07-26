@@ -18,3 +18,6 @@ iosApp/iosApp.xcodeproj/
 xcuserdata/
 DerivedData/
 *.xcworkspace
+
+# Local SDK location (machine-specific)
+local.properties

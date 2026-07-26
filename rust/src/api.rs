@@ -46,14 +46,14 @@ pub enum WalletError {
     /// An operation that needs a running node while stopped.
     NotRunning,
     /// The node failed to start (restore/persistence/config problem).
-    Startup { message: String },
+    Startup { detail: String },
     /// `event_handled()` with no event pending — an ack without a handle.
     NoPendingEvent,
     /// The LSPS2 JIT flow failed; `reason` is the same distinct reason the
     /// corresponding [`Event::Lsps2Failed`] carries.
     Lsps2 { reason: String },
     /// `send()` with a bolt11 string that failed to parse or verify.
-    InvalidInvoice { message: String },
+    InvalidInvoice { detail: String },
     /// `send()` with an invoice that is already expired.
     InvoiceExpired,
     /// `send()` with an invoice for a different network (this wallet pays
@@ -75,11 +75,11 @@ impl std::fmt::Display for WalletError {
         match self {
             WalletError::AlreadyRunning => write!(f, "the node is already running"),
             WalletError::NotRunning => write!(f, "the node is not running"),
-            WalletError::Startup { message } => write!(f, "failed to start the node: {message}"),
+            WalletError::Startup { detail } => write!(f, "failed to start the node: {detail}"),
             WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
             WalletError::Lsps2 { reason } => write!(f, "LSPS2 request failed: {reason}"),
-            WalletError::InvalidInvoice { message } => {
-                write!(f, "invalid bolt11 invoice: {message}")
+            WalletError::InvalidInvoice { detail } => {
+                write!(f, "invalid bolt11 invoice: {detail}")
             }
             WalletError::InvoiceExpired => write!(f, "the invoice is expired"),
             WalletError::WrongNetwork { network } => write!(
@@ -107,7 +107,7 @@ impl From<BuildError> for WalletError {
             BuildError::AlreadyRunning => WalletError::AlreadyRunning,
             BuildError::NotRunning => WalletError::NotRunning,
             other => WalletError::Startup {
-                message: other.to_string(),
+                detail: other.to_string(),
             },
         }
     }
@@ -117,7 +117,7 @@ impl From<SendError> for WalletError {
     fn from(error: SendError) -> Self {
         match error {
             SendError::NotRunning => WalletError::NotRunning,
-            SendError::InvalidInvoice(message) => WalletError::InvalidInvoice { message },
+            SendError::InvalidInvoice(message) => WalletError::InvalidInvoice { detail: message },
             SendError::InvoiceExpired => WalletError::InvoiceExpired,
             SendError::WrongNetwork { found, .. } => WalletError::WrongNetwork {
                 network: found.to_string(),
