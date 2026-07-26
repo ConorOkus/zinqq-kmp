@@ -22,7 +22,7 @@ use crate::types::Logger;
 pub struct WalletConfig {
     /// App-private data directory holding the seed and all persisted state.
     pub storage_dir: String,
-    /// Esplora REST endpoint override (defaults to KTD-5's mempool.space).
+    /// Esplora REST endpoint override (defaults to KTD-5's Zinqq proxy).
     pub esplora_url: Option<String>,
     /// Rapid Gossip Sync snapshot server override (defaults to KTD-6's LDK
     /// public server).

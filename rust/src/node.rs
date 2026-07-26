@@ -22,7 +22,7 @@ use tokio::sync::watch;
 
 use crate::builder::{build, persist_channel_manager, BuildError, NodeComponents};
 use crate::config::{
-    Config, PeerInfo, FEE_UPDATE_INTERVAL, LIGHTNING_SYNC_INTERVAL, LSPS2_REQUEST_TIMEOUT,
+    Config, FEE_UPDATE_INTERVAL, LIGHTNING_SYNC_INTERVAL, LSPS2_REQUEST_TIMEOUT,
     ONCHAIN_SYNC_INTERVAL, PEER_RECONNECT_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use crate::liquidity::{LiquiditySource, Lsps2Error};
@@ -159,7 +159,12 @@ impl Node {
             stop_sender.subscribe(),
             Arc::clone(&chain_synced),
         );
-        self.spawn_peer_reconnect_task(&runtime, &components, stop_sender.subscribe());
+        self.spawn_peer_reconnect_task(
+            &runtime,
+            &components,
+            Arc::clone(&liquidity_source),
+            stop_sender.subscribe(),
+        );
         self.spawn_liquidity_event_task(
             &runtime,
             &components,
@@ -474,15 +479,15 @@ impl Node {
         &self,
         runtime: &Runtime,
         components: &NodeComponents,
+        liquidity_source: Arc<LiquiditySource>,
         mut stop_receiver: watch::Receiver<()>,
     ) {
-        // The LSP peer is always kept connected (U4); LSPS2 requests
-        // additionally connect on demand if this loop hasn't run yet.
-        let mut peers = self.config.peers.clone();
-        peers.push(PeerInfo {
-            node_id: self.config.lsp.node_id,
-            address: self.config.lsp.address,
-        });
+        // Ordinary peers are dialed here; the LSP goes through
+        // `LiquiditySource::ensure_lsp_connected`, which holds the dial lock a
+        // racing `receive_jit` also takes. Both firing at t=0 otherwise opens
+        // two connections and LDK drops one, which can strand an in-flight
+        // LSPS2 request on the dropped socket.
+        let peers = self.config.peers.clone();
         let peer_manager = Arc::clone(&components.peer_manager);
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(PEER_RECONNECT_INTERVAL);
@@ -508,6 +513,12 @@ impl Node {
                                     tokio::spawn(connection);
                                 }
                             }
+                        }
+                        if let Err(error) = liquidity_source.ensure_lsp_connected().await {
+                            log_error!(
+                                liquidity_source.logger(),
+                                "LSP reconnect attempt failed: {error}"
+                            );
                         }
                     }
                 }

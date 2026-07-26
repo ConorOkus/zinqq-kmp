@@ -10,12 +10,20 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
 use lightning::util::config::UserConfig;
 
-/// Default Esplora endpoint (KTD-5). Keyless, esplora-compatible, actively
-/// maintained. To fall back, swap in [`ESPLORA_FALLBACK_URL`].
-pub const DEFAULT_ESPLORA_URL: &str = "https://mempool.space/api";
+/// Default Esplora endpoint (KTD-5): the Zinqq PWA's own proxy, which fronts
+/// Blockstream Enterprise staging and holds the credentials server-side, so the
+/// spike shares the production client's chain infrastructure without embedding
+/// a key. Measured at ~0.2-0.7s per request where the public mempool.space
+/// endpoint throttled a single request to 75s under this repo's own test
+/// volume, which stalled every sync pass. Swap in a fallback below if needed.
+pub const DEFAULT_ESPLORA_URL: &str = "https://zinqq.app/api/esplora";
 
-/// One-line fallback Esplora endpoint per KTD-5.
+/// Public fallbacks per KTD-5, in preference order. Blockstream's open endpoint
+/// is the faster of the two in practice; mempool.space throttles aggressively.
 pub const ESPLORA_FALLBACK_URL: &str = "https://blockstream.info/api";
+
+/// Second fallback: keyless, esplora-compatible, but rate-limits hard.
+pub const ESPLORA_PUBLIC_FALLBACK_URL: &str = "https://mempool.space/api";
 
 /// LDK's public Rapid Gossip Sync server (KTD-6).
 pub const DEFAULT_RGS_URL: &str = "https://rapidsync.lightningdevkit.org/snapshot";

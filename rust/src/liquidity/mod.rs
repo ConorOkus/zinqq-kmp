@@ -79,6 +79,10 @@ pub(crate) struct LiquiditySource {
     pending_fee_requests: Mutex<HashMap<LSPSRequestId, oneshot::Sender<FeeResult>>>,
     pending_buy_requests: Mutex<HashMap<LSPSRequestId, oneshot::Sender<BuyResult>>>,
     claims: ClaimTracker,
+    /// Serializes LSP dials so the node's reconnect loop and a `receive_jit`
+    /// racing it cannot both open a connection (LDK drops the duplicate, and
+    /// an in-flight request can be left on the dropped socket).
+    connect_lock: tokio::sync::Mutex<()>,
     logger: Arc<Logger>,
 }
 
@@ -100,6 +104,7 @@ impl LiquiditySource {
             pending_fee_requests: Mutex::new(HashMap::new()),
             pending_buy_requests: Mutex::new(HashMap::new()),
             claims: ClaimTracker::default(),
+            connect_lock: tokio::sync::Mutex::new(()),
             logger: Arc::clone(&components.logger),
         }
     }
@@ -445,6 +450,12 @@ impl LiquiditySource {
         if self.is_lsp_connected() {
             return Ok(());
         }
+        // One dial at a time: whoever loses the race re-checks and returns
+        // instead of opening a duplicate connection.
+        let _dialing = self.connect_lock.lock().await;
+        if self.is_lsp_connected() {
+            return Ok(());
+        }
         match lightning_net_tokio::connect_outbound(
             Arc::clone(&self.peer_manager),
             self.lsp.node_id,
@@ -467,6 +478,10 @@ impl LiquiditySource {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Err(Lsps2Error::ConnectFailed)
+    }
+
+    pub(crate) fn logger(&self) -> &Arc<Logger> {
+        &self.logger
     }
 
     fn is_lsp_connected(&self) -> bool {

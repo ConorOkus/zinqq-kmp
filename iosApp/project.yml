@@ -19,6 +19,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: zinqq.spike.ios
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Zinqq Spike
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)
         OTHER_LDFLAGS: $(inherited) -framework Shared
         ENABLE_USER_SCRIPT_SANDBOXING: NO
