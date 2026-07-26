@@ -15,6 +15,7 @@ pub mod liquidity;
 pub mod node;
 pub mod payment;
 mod types;
+mod util;
 mod wallet;
 
 pub use api::{Balances, Wallet, WalletConfig, WalletError};

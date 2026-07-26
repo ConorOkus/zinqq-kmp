@@ -100,9 +100,10 @@ private fun WalletScreen(viewModel: WalletViewModel = viewModel()) {
                 singleLine = true,
                 modifier = Modifier.weight(1f),
             )
+            val parsedAmount = remember(receiveAmount) { receiveAmount.toULongOrNull() }
             Button(
-                onClick = { receiveAmount.toULongOrNull()?.let(viewModel::requestInvoice) },
-                enabled = state.nodeRunning && receiveAmount.toULongOrNull() != null,
+                onClick = { parsedAmount?.let(viewModel::requestInvoice) },
+                enabled = state.nodeRunning && parsedAmount != null,
             ) { Text("Invoice") }
         }
         state.currentInvoice?.let { InvoiceDisplay(it) }

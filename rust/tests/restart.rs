@@ -16,6 +16,7 @@ use lightning::util::persist::{
     SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning_persister::fs_store::FilesystemStore;
+use wallet_core::builder::KV_STORE_SUBDIR;
 use wallet_core::{BuildError, Config, Node};
 
 /// A local port nothing listens on: connection refused, instantly, offline.
@@ -30,7 +31,7 @@ fn test_config(storage_dir: &Path) -> Config {
 }
 
 fn kv_store(storage_dir: &Path) -> FilesystemStore {
-    FilesystemStore::new(storage_dir.join("store"))
+    FilesystemStore::new(storage_dir.join(KV_STORE_SUBDIR))
 }
 
 #[test]

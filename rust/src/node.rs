@@ -5,9 +5,10 @@
 //! RGS refresh, broadcast draining, and peer reconnects run as runtime tasks
 //! stopped through watch channels.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
 use lightning::chain::Confirm;
@@ -21,12 +22,13 @@ use tokio::sync::watch;
 
 use crate::builder::{build, persist_channel_manager, BuildError, NodeComponents};
 use crate::config::{
-    Config, PeerInfo, FEE_UPDATE_INTERVAL, LIGHTNING_SYNC_INTERVAL, ONCHAIN_SYNC_INTERVAL,
-    PEER_RECONNECT_INTERVAL, RGS_SYNC_INTERVAL,
+    Config, PeerInfo, FEE_UPDATE_INTERVAL, LIGHTNING_SYNC_INTERVAL, LSPS2_REQUEST_TIMEOUT,
+    ONCHAIN_SYNC_INTERVAL, PEER_RECONNECT_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use crate::liquidity::{LiquiditySource, Lsps2Error};
 use crate::payment::{describe_failure_reason, send_bolt11, SendError};
 use crate::types::{Logger, Sweeper};
+use crate::util::unix_now;
 
 /// Internal core events, mapped into the public FFI `Event` enum by the
 /// persisted event queue (the [`EventSink`] seam).
@@ -144,6 +146,7 @@ impl Node {
             &components,
             self.config.lsp.clone(),
             self.config.network,
+            LSPS2_REQUEST_TIMEOUT,
         ));
 
         let (stop_sender, _) = watch::channel(());
@@ -244,9 +247,7 @@ impl Node {
             let state = state_lock.as_ref().ok_or(SendError::NotRunning)?;
             Arc::clone(&state.components.channel_manager)
         };
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("system time before UNIX epoch");
+        let now = unix_now();
 
         match send_bolt11(&*channel_manager, bolt11, self.config.network, now) {
             Ok(_payment_id) => Ok(()),
@@ -490,12 +491,13 @@ impl Node {
                 tokio::select! {
                     _ = stop_receiver.changed() => return,
                     _ = interval.tick() => {
+                        let connected: HashSet<PublicKey> = peer_manager
+                            .list_peers()
+                            .iter()
+                            .map(|details| details.counterparty_node_id)
+                            .collect();
                         for peer in &peers {
-                            let connected = peer_manager
-                                .list_peers()
-                                .iter()
-                                .any(|details| details.counterparty_node_id == peer.node_id);
-                            if !connected {
+                            if !connected.contains(&peer.node_id) {
                                 if let Some(connection) = lightning_net_tokio::connect_outbound(
                                     Arc::clone(&peer_manager),
                                     peer.node_id,
@@ -714,13 +716,7 @@ fn spawn_background_processor(
             sleeper,
             // KTD-3: mobile platform, interruptible sleeps.
             true,
-            || {
-                Some(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .expect("system time before UNIX epoch"),
-                )
-            },
+            || Some(unix_now()),
         )
         .await;
         if let Err(e) = res {

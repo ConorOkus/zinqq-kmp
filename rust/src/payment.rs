@@ -223,7 +223,6 @@ pub(crate) fn describe_failure_reason(reason: Option<PaymentFailureReason>) -> S
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use std::time::SystemTime;
 
     use bitcoin::hashes::sha256;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
@@ -237,10 +236,7 @@ mod tests {
     const NOW: u64 = 1_753_000_000;
 
     fn unix_now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
+        crate::util::unix_now().as_secs()
     }
 
     /// Builds and signs a minimal test invoice.

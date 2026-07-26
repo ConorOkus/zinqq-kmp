@@ -6,7 +6,7 @@
 //! that split (MPP) still work — the zero-amount variant forbids MPP.
 //! KTD-9: `min_final_cltv_expiry_delta` is bumped +2 over LDK's default.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use bitcoin::hashes::sha256;
 use bitcoin::hashes::Hash;
@@ -71,11 +71,7 @@ pub(crate) fn build_jit_invoice(
         // ldk-node uses `current_timestamp()`; that helper is behind
         // lightning-invoice's non-default `std` feature, so set the same
         // value explicitly.
-        .duration_since_epoch(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .expect("system time before UNIX epoch"),
-        )
+        .duration_since_epoch(crate::util::unix_now())
         .min_final_cltv_expiry_delta(JIT_MIN_FINAL_CLTV_EXPIRY_DELTA as u64)
         .expiry_time(Duration::from_secs(params.expiry_secs as u64))
         .private_route(route_hint)

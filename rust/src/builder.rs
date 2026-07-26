@@ -60,8 +60,10 @@ use crate::wallet::OnchainWallet;
 pub(crate) const SEED_FILE_NAME: &str = "keys_seed";
 pub(crate) const SEED_LEN: usize = 64;
 
-/// Subdirectory of the storage dir backing the `FilesystemStore`.
-pub(crate) const KV_STORE_SUBDIR: &str = "store";
+/// Subdirectory of the storage dir backing the `FilesystemStore`. Public as
+/// test-support API surface: integration tests open the store at this path to
+/// inspect persisted state.
+pub const KV_STORE_SUBDIR: &str = "store";
 
 /// Typed startup failures. Restore/persistence problems fail `start()` hard;
 /// an unreachable Esplora on a fresh (zero-monitor) node is *not* an error —

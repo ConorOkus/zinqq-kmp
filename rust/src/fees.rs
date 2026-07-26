@@ -10,21 +10,45 @@ use lightning::chain::chaininterface::{
     ConfirmationTarget, FeeEstimator, FEERATE_FLOOR_SATS_PER_KW,
 };
 
-/// Every `ConfirmationTarget` variant, for cache refreshes and tests. If LDK
-/// adds a variant, the exhaustive `match`es below fail to compile, which is
-/// the point.
-pub(crate) const ALL_CONFIRMATION_TARGETS: [ConfirmationTarget; 8] = [
-    ConfirmationTarget::MaximumFeeEstimate,
-    ConfirmationTarget::UrgentOnChainSweep,
-    ConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
-    ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
-    ConfirmationTarget::AnchorChannelFee,
-    ConfirmationTarget::NonAnchorChannelFee,
-    ConfirmationTarget::ChannelCloseMinimum,
-    ConfirmationTarget::OutputSpendingFee,
+/// One row per `ConfirmationTarget` variant, in cache-slot order:
+/// `(target, num_blocks, fallback_sat_per_kw)`. The block target each variant
+/// is estimated at and the static fallback used until the first successful
+/// refresh both mirror ldk-node. [`target_index`] stays an exhaustive `match`,
+/// so a new LDK variant still breaks the build, which is the point.
+const TARGET_TABLE: [(ConfirmationTarget, usize, u32); 8] = [
+    (ConfirmationTarget::MaximumFeeEstimate, 1, 8000),
+    (ConfirmationTarget::UrgentOnChainSweep, 6, 5000),
+    (
+        ConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
+        1008,
+        FEERATE_FLOOR_SATS_PER_KW,
+    ),
+    (
+        ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee,
+        144,
+        FEERATE_FLOOR_SATS_PER_KW,
+    ),
+    (ConfirmationTarget::AnchorChannelFee, 1008, 500),
+    (ConfirmationTarget::NonAnchorChannelFee, 12, 1000),
+    (ConfirmationTarget::ChannelCloseMinimum, 144, 500),
+    (ConfirmationTarget::OutputSpendingFee, 12, 1000),
 ];
 
-/// Stable index for each target so the cache is a plain array.
+/// Every `ConfirmationTarget` variant, for tests (cache refreshes iterate
+/// [`TARGET_TABLE`] directly).
+#[cfg(test)]
+pub(crate) const ALL_CONFIRMATION_TARGETS: [ConfirmationTarget; 8] = {
+    let mut targets = [TARGET_TABLE[0].0; 8];
+    let mut i = 0;
+    while i < targets.len() {
+        targets[i] = TARGET_TABLE[i].0;
+        i += 1;
+    }
+    targets
+};
+
+/// Stable index for each target ([`TARGET_TABLE`] row and cache slot). The
+/// exhaustive `match` fails to compile when LDK adds a variant.
 fn target_index(target: ConfirmationTarget) -> usize {
     match target {
         ConfirmationTarget::MaximumFeeEstimate => 0,
@@ -38,33 +62,10 @@ fn target_index(target: ConfirmationTarget) -> usize {
     }
 }
 
-/// The block target each variant is estimated at (mirrors ldk-node).
-fn num_blocks_for_target(target: ConfirmationTarget) -> usize {
-    match target {
-        ConfirmationTarget::MaximumFeeEstimate => 1,
-        ConfirmationTarget::UrgentOnChainSweep => 6,
-        ConfirmationTarget::MinAllowedAnchorChannelRemoteFee => 1008,
-        ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee => 144,
-        ConfirmationTarget::AnchorChannelFee => 1008,
-        ConfirmationTarget::NonAnchorChannelFee => 12,
-        ConfirmationTarget::ChannelCloseMinimum => 144,
-        ConfirmationTarget::OutputSpendingFee => 12,
-    }
-}
-
 /// Static fallback (sat/kw) used until the first successful refresh, so an
-/// offline start still answers sanely (mirrors ldk-node's table).
+/// offline start still answers sanely.
 fn fallback_sat_per_kw(target: ConfirmationTarget) -> u32 {
-    match target {
-        ConfirmationTarget::MaximumFeeEstimate => 8000,
-        ConfirmationTarget::UrgentOnChainSweep => 5000,
-        ConfirmationTarget::MinAllowedAnchorChannelRemoteFee => FEERATE_FLOOR_SATS_PER_KW,
-        ConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee => FEERATE_FLOOR_SATS_PER_KW,
-        ConfirmationTarget::AnchorChannelFee => 500,
-        ConfirmationTarget::NonAnchorChannelFee => 1000,
-        ConfirmationTarget::ChannelCloseMinimum => 500,
-        ConfirmationTarget::OutputSpendingFee => 1000,
-    }
+    TARGET_TABLE[target_index(target)].2
 }
 
 /// Post-estimation adjustments LDK's `ConfirmationTarget` semantics require
@@ -86,16 +87,24 @@ fn apply_post_estimation_adjustments(target: ConfirmationTarget, sat_per_kw: u64
 /// into a per-target cache in sat/kw. Kept free of I/O so the floor and
 /// mapping are unit-testable offline.
 pub(crate) fn cache_from_esplora_estimates(estimates: &HashMap<u16, f64>) -> [u32; 8] {
+    // Sort once and answer every target from the sorted view; picking the
+    // largest block count at or below the target replicates
+    // `esplora_client::convert_fee_rate` (including no-match -> None).
+    let mut sorted: Vec<(u16, f64)> = estimates.iter().map(|(k, v)| (*k, *v)).collect();
+    sorted.sort_unstable_by_key(|(blocks, _)| *blocks);
+
     let mut cache = [0u32; 8];
-    for target in ALL_CONFIRMATION_TARGETS {
-        let num_blocks = num_blocks_for_target(target);
+    for (index, (target, num_blocks, _)) in TARGET_TABLE.into_iter().enumerate() {
+        let split = sorted.partition_point(|(blocks, _)| (*blocks as usize) <= num_blocks);
         // Fall back to 1 sat/vB if the endpoint returned nothing usable for
         // this target; the floor below keeps the result relay-viable.
-        let sat_per_vb = esplora_client::convert_fee_rate(num_blocks, estimates.clone())
+        let sat_per_vb = split
+            .checked_sub(1)
+            .map(|i| sorted[i].1 as f32)
             .map_or(1.0, |rate| rate.max(1.0));
         let sat_per_kw = (sat_per_vb as f64 * 250.0) as u64;
         let adjusted = apply_post_estimation_adjustments(target, sat_per_kw);
-        cache[target_index(target)] =
+        cache[index] =
             u32::try_from(adjusted.max(FEERATE_FLOOR_SATS_PER_KW as u64)).unwrap_or(u32::MAX);
     }
     cache
