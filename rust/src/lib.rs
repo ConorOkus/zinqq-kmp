@@ -4,6 +4,18 @@ use std::time::Duration;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use tokio::runtime::{Builder, Runtime};
 
+pub mod builder;
+mod chain;
+pub mod config;
+mod fees;
+pub mod node;
+mod types;
+mod wallet;
+
+pub use builder::BuildError;
+pub use config::{Config, PeerInfo};
+pub use node::Node;
+
 uniffi::setup_scaffolding!();
 
 /// The core-owned tokio runtime (KTD-3): multi-threaded, 2 workers, lazily

@@ -6,13 +6,15 @@ publish = false
 
 [lib]
 name = "wallet_core"
-crate-type = ["cdylib", "staticlib"]
+# "lib" (rlib) is required for the integration tests in tests/; Gobley
+# packages the cdylib (Android/JNI) and staticlib (iOS) as before.
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 # Exact pin: Gobley 0.3.7 pairs with uniffi 0.29.4 (KTD-2); a semver-open
 # requirement drifts to 0.29.5+.
 uniffi = "=0.29.4"
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net", "macros"] }
 
 # KTD-1: ldk-node 0.7.0-parity pin set. Declared in full so the walking
 # skeleton compiles and links the real dependency graph (secp256k1 C build,
@@ -24,10 +26,19 @@ lightning-background-processor = "0.2.3"
 lightning-net-tokio = "0.2.0"
 lightning-persister = "0.2.3"
 lightning-invoice = "0.34.1"
+lightning-rapid-gossip-sync = "0.2.3"
 bdk_wallet = "2.4.0"
-bdk_esplora = "0.22"
+bdk_esplora = { version = "0.22", default-features = false, features = ["async-https-rustls", "tokio"] }
 bitcoin = "0.32"
-esplora-client = "0.12"
+esplora-client = { version = "0.12", default-features = false, features = ["tokio", "async-https-rustls"] }
+# RGS snapshot download (KTD-6); reqwest is already in the graph via the
+# esplora async client, so this adds no new TLS stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# bdk_wallet's ChangeSet is serde-serializable; we persist it as one JSON blob.
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = "z"
