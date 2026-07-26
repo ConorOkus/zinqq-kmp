@@ -73,7 +73,10 @@ class WalletHolder(context: Context) : DefaultLifecycleObserver {
                 return@launch
             }
             _state.update {
-                it.copy(balanceMsat = balances.lightningMsat, onchainSats = balances.onchainSats)
+                it.copy(
+                    balanceMsat = balances.lightningMsat,
+                    onchainSats = balances.onchainTotalSats,
+                )
             }
         }
     }

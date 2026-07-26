@@ -50,4 +50,8 @@ fun reduce(state: UiState, event: Event): UiState =
                 currentInvoice = null,
                 lastOutcome = "Invoice request failed: ${event.reason}",
             )
+        // KTD-5: the Event enum grows ahead of the shells (U5 added backup /
+        // fence / sweep / recovery / restore variants fired by later units);
+        // reducers ignore unrecognized variants defensively.
+        else -> state
     }

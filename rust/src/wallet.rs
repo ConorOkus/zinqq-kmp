@@ -201,6 +201,38 @@ impl OnchainWallet {
         self.inner.lock().unwrap().wallet.balance()
     }
 
+    /// All wallet transactions with net amounts and confirmation status, for
+    /// the unified activity merge (U5, KTD-7). Timestamps follow the PWA:
+    /// confirmation time, else first-seen-in-mempool, else none.
+    pub(crate) fn list_transactions(&self) -> Vec<crate::history::OnchainTxSummary> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .wallet
+            .transactions()
+            .map(|wallet_tx| {
+                let (sent, received) = inner.wallet.sent_and_received(&wallet_tx.tx_node.tx);
+                let (confirmed, confirmation_time_secs, first_seen_secs) =
+                    match wallet_tx.chain_position {
+                        bdk_wallet::chain::ChainPosition::Confirmed { anchor, .. } => {
+                            (true, Some(anchor.confirmation_time), None)
+                        }
+                        bdk_wallet::chain::ChainPosition::Unconfirmed {
+                            first_seen,
+                            last_seen,
+                        } => (false, None, first_seen.or(last_seen)),
+                    };
+                crate::history::OnchainTxSummary {
+                    txid: wallet_tx.tx_node.txid.to_string(),
+                    sent_sats: sent.to_sat(),
+                    received_sats: received.to_sat(),
+                    confirmed,
+                    confirmation_time_secs,
+                    first_seen_secs,
+                }
+            })
+            .collect()
+    }
+
     /// Deterministic external script at `index` for the signer's
     /// `get_destination_script` (KTD-4): peek the address, then
     /// `reveal_addresses_to` so bdk tracks it for syncing, and persist the

@@ -559,9 +559,10 @@ mod tests {
         assert_eq!(
             events,
             vec![CoreEvent::PaymentFailed {
+                payment_hash: Some("11".repeat(32)),
                 reason: SendError::RouteNotFound.to_string(),
             }],
-            "exactly one PaymentFailed with the route-not-found reason"
+            "exactly one PaymentFailed with the invoice's hash and the route-not-found reason"
         );
 
         // Idempotency edge, honest offline shape: the first attempt failed

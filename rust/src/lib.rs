@@ -10,6 +10,7 @@ mod chain;
 pub mod config;
 pub mod events;
 mod fees;
+pub mod history;
 mod invoice;
 pub mod keys;
 pub mod liquidity;
@@ -25,6 +26,10 @@ pub use api::{Balances, Wallet, WalletConfig, WalletError};
 pub use builder::BuildError;
 pub use config::{Config, LspConfig, PeerInfo};
 pub use events::Event;
+pub use history::{
+    ActivityDirection, ActivityKind, ActivityRow, ActivityStatus, CloseRecordSummary,
+    CloseStatusLabel, HistoryError, PaymentDirection, PaymentStatus, PersistedPayment,
+};
 pub use liquidity::Lsps2Error;
 pub use node::Node;
 pub use payment::SendError;

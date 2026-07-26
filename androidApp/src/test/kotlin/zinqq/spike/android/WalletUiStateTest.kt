@@ -32,7 +32,11 @@ class WalletUiStateTest {
 
         val state = reduce(
             displaying,
-            Event.PaymentReceived(amountMsat = 250_000uL, skimmedFeeMsat = 12_000uL),
+            Event.PaymentReceived(
+                paymentHash = PAYMENT_HASH,
+                amountMsat = 250_000uL,
+                skimmedFeeMsat = 12_000uL,
+            ),
         )
 
         assertEquals(255_000uL, state.balanceMsat)
@@ -44,7 +48,7 @@ class WalletUiStateTest {
     fun paymentFailedShowsTheFailureReason() {
         val state = reduce(
             UiState(nodeRunning = true),
-            Event.PaymentFailed(reason = "no route found"),
+            Event.PaymentFailed(paymentHash = PAYMENT_HASH, reason = "no route found"),
         )
 
         assertEquals("Payment failed: no route found", state.lastOutcome)
@@ -68,5 +72,6 @@ class WalletUiStateTest {
     private companion object {
         // Opaque display data to the shell (R4); never parsed by Android code.
         const val BOLT11 = "lnbc2500u1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypq"
+        val PAYMENT_HASH = "11".repeat(32)
     }
 }

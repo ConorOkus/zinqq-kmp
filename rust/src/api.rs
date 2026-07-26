@@ -1,7 +1,10 @@
-//! The exported FFI surface (U3). Deliberately tiny — exactly the six wallet
+//! The exported FFI surface (U3, expanded by U5/KTD-5): the wallet
 //! operations (`start`, `stop`, `receive_jit`, `send`, `next_event` +
-//! `event_handled`, `balances`) plus the two demo fns in `lib.rs` and the
-//! AE1 `derive_debug_info` helper (U1); Gobley risk shrinks with API size.
+//! `event_handled`) and the U5 queries (`balances`, `node_id`,
+//! `list_activity`, `payment_detail`) plus the two demo fns in `lib.rs` and
+//! the AE1 `derive_debug_info` helper (U1). One object, all business logic in
+//! Rust (R14): queries are cheap and non-blocking; history stays readable
+//! while the node is stopped.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,6 +14,7 @@ use lightning_persister::fs_store::FilesystemStore;
 use crate::builder::{BuildError, KV_STORE_SUBDIR};
 use crate::config::Config;
 use crate::events::{Event, EventQueue};
+use crate::history::{ActivityRow, PersistedPayment};
 use crate::keys::{self, KeysError};
 use crate::liquidity::Lsps2Error;
 use crate::node::Node;
@@ -60,13 +64,21 @@ pub struct WalletConfig {
     pub trusted_lsp_node_ids: Vec<String>,
 }
 
-/// Wallet balances, from U2's bdk wallet and channel monitors.
+/// Wallet balances, from U2's bdk wallet and channel monitors, split per U5:
+/// spendable is bdk's trusted spendable (confirmed + trusted pending);
+/// total additionally includes untrusted pending (unconfirmed external
+/// receives).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct Balances {
     /// Sum of all claimable lightning channel balances, in msat.
     pub lightning_msat: u64,
-    /// Total on-chain balance (confirmed + pending), in sats.
-    pub onchain_sats: u64,
+    /// Total on-chain balance (confirmed + all pending), in sats.
+    pub onchain_total_sats: u64,
+    /// Trusted-spendable on-chain balance (confirmed + trusted pending), in
+    /// sats.
+    pub onchain_spendable_sats: u64,
+    /// Unconfirmed sats received from external wallets (untrusted pending).
+    pub onchain_untrusted_pending_sats: u64,
 }
 
 /// Typed FFI errors (Kotlin `WalletException`).
@@ -386,14 +398,40 @@ impl Wallet {
             .node
             .lightning_balance_msat()
             .ok_or(WalletError::NotRunning)?;
-        let onchain_sats = self
+        let onchain = self
             .node
-            .onchain_balance_sats()
+            .onchain_balances()
             .ok_or(WalletError::NotRunning)?;
         Ok(Balances {
             lightning_msat,
-            onchain_sats,
+            onchain_total_sats: onchain.total_sats,
+            onchain_spendable_sats: onchain.spendable_sats,
+            onchain_untrusted_pending_sats: onchain.untrusted_pending_sats,
         })
+    }
+
+    /// This node's public key (66-char hex); requires a running node.
+    pub fn node_id(&self) -> Result<String, WalletError> {
+        self.node
+            .node_id()
+            .map(|node_id| node_id.to_string())
+            .ok_or(WalletError::NotRunning)
+    }
+
+    /// The unified activity feed (U5, KTD-7), merged and sorted in core
+    /// (R14: shells never merge): Lightning rows with failed hidden,
+    /// on-chain transactions as net amounts with close-absorbed txids
+    /// skipped, one row per close record, descending by time. Requires a
+    /// running node (the on-chain arm reads the bdk wallet).
+    pub fn list_activity(&self) -> Result<Vec<ActivityRow>, WalletError> {
+        self.node.list_activity().ok_or(WalletError::NotRunning)
+    }
+
+    /// One persisted payment row by payment id (U5) — e.g. an activity row's
+    /// `payment_hash`. Includes FAILED payments the feed hides. Readable
+    /// while the node is stopped.
+    pub fn payment_detail(&self, payment_id: String) -> Option<PersistedPayment> {
+        self.node.payment_detail(&payment_id)
     }
 }
 
