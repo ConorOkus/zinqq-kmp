@@ -72,8 +72,10 @@ _Not yet run._
 
 ### Verified live (2026-07-26)
 
-The client half of the JIT receive flow is proven against mainnet Megalith, so only
-the external payment remains manual:
+The client half of the JIT receive flow is proven against mainnet Megalith on the
+Android emulator through the real UI — typing an amount and tapping **Invoice**
+produced a payable `lnbc60u...` invoice with a QR and expiry countdown. Only the
+external payment itself remains manual. Headless equivalents:
 
 ```bash
 cd rust
@@ -84,3 +86,16 @@ cargo test --lib -- --ignored live_megalith_receive_jit   # get_info + buy + inv
 The LSP identity in `rust/src/config.rs` comes from the Zinqq PWA's own working
 configuration, not from public explorer listings — the explorer-listed node
 completes a handshake but never answers `lsps2.get_info`.
+
+Also verified on the emulator run: every packaged `.so` (including
+`libwallet_core.so`) has 16 KB-aligned `LOAD` segments, satisfying the Android 15+
+page-size requirement that NDK r28 provides by default:
+
+```bash
+unzip -o androidApp/build/outputs/apk/debug/androidApp-debug.apk 'lib/*' -d /tmp/apk
+"$ANDROID_HOME"/ndk/*/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf \
+  -l /tmp/apk/lib/arm64-v8a/libwallet_core.so | grep LOAD   # expect 0x4000
+```
+
+The debug APK is large (~650 MB) because the Rust staticlib carries full debug
+symbols; a release build strips them.
