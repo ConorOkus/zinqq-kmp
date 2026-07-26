@@ -12,6 +12,7 @@ pub mod events;
 mod fees;
 mod invoice;
 pub mod liquidity;
+mod lock;
 pub mod node;
 pub mod payment;
 mod types;

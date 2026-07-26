@@ -26,6 +26,7 @@ use crate::config::{
     ONCHAIN_SYNC_INTERVAL, PEER_RECONNECT_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use crate::liquidity::{LiquiditySource, Lsps2Error};
+use crate::lock::DataDirLock;
 use crate::payment::{describe_failure_reason, send_bolt11, SendError};
 use crate::types::{Logger, Sweeper};
 use crate::util::unix_now;
@@ -78,6 +79,11 @@ impl EventSink for LoggingEventSink {
 }
 
 struct RunningState {
+    /// Exclusive lock on the storage directory, held for the node's whole
+    /// running life and released on `stop()` (or process death). Keeps a second
+    /// node — another `Wallet`, another activity, another process — from
+    /// diverging channel state on the same seed.
+    _data_dir_lock: DataDirLock,
     runtime: Runtime,
     components: NodeComponents,
     liquidity_source: Arc<LiquiditySource>,
@@ -133,6 +139,12 @@ impl Node {
             return Err(BuildError::AlreadyRunning);
         }
 
+        // Before building anything: refuse to start if another node already owns
+        // this storage directory. Acquired first so a rejected start touches no
+        // persisted state.
+        std::fs::create_dir_all(&self.config.storage_dir).map_err(|_| BuildError::WriteFailed)?;
+        let data_dir_lock = DataDirLock::acquire(std::path::Path::new(&self.config.storage_dir))?;
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("wallet-core-node")
@@ -180,6 +192,7 @@ impl Node {
         );
 
         *state_lock = Some(RunningState {
+            _data_dir_lock: data_dir_lock,
             runtime,
             components,
             liquidity_source,

@@ -11,7 +11,7 @@ import kotlin.test.assertTrue
  * Pure [reduce] tests: no Android framework, no wallet instance. They compile
  * against the `uniffi.wallet_core` bindings Gobley generates at build time.
  */
-class WalletViewModelTest {
+class WalletUiStateTest {
     @Test
     fun invoiceReadyExposesQrPayloadAndExpiry() {
         val state = reduce(

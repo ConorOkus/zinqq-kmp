@@ -11,6 +11,7 @@ name = "wallet_core"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Exact pin: Gobley 0.3.7 pairs with uniffi 0.29.4 (KTD-2); a semver-open
 # requirement drifts to 0.29.5+.
 uniffi = "=0.29.4"

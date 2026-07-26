@@ -36,7 +36,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
@@ -45,10 +44,13 @@ import kotlinx.coroutines.delay
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The holder is process-scoped, so this activity only reads it — it
+        // neither creates nor stops the node (see WalletHolder).
+        val holder = (application as SpikeApplication).walletHolder
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    WalletScreen()
+                    WalletScreen(holder)
                 }
             }
         }
@@ -56,8 +58,8 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun WalletScreen(viewModel: WalletViewModel = viewModel()) {
-    val state by viewModel.state.collectAsState()
+private fun WalletScreen(holder: WalletHolder) {
+    val state by holder.state.collectAsState()
     var receiveAmount by remember { mutableStateOf("") }
     var sendBolt11 by remember { mutableStateOf("") }
 
@@ -80,7 +82,7 @@ private fun WalletScreen(viewModel: WalletViewModel = viewModel()) {
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            TextButton(onClick = viewModel::refreshBalances) { Text("Refresh") }
+            TextButton(onClick = holder::refreshBalances) { Text("Refresh") }
         }
         state.syncBanner?.let {
             Text(text = it, color = MaterialTheme.colorScheme.error)
@@ -102,7 +104,7 @@ private fun WalletScreen(viewModel: WalletViewModel = viewModel()) {
             )
             val parsedAmount = remember(receiveAmount) { receiveAmount.toULongOrNull() }
             Button(
-                onClick = { parsedAmount?.let(viewModel::requestInvoice) },
+                onClick = { parsedAmount?.let(holder::requestInvoice) },
                 enabled = state.nodeRunning && parsedAmount != null,
             ) { Text("Invoice") }
         }
@@ -117,7 +119,7 @@ private fun WalletScreen(viewModel: WalletViewModel = viewModel()) {
             modifier = Modifier.fillMaxWidth(),
         )
         Button(
-            onClick = { viewModel.sendPayment(sendBolt11) },
+            onClick = { holder.sendPayment(sendBolt11) },
             enabled = state.nodeRunning && sendBolt11.isNotBlank(),
         ) { Text("Pay") }
 
