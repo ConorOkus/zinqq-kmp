@@ -1,0 +1,200 @@
+//! The exported FFI surface (U3). Deliberately tiny — exactly the six wallet
+//! operations (`start`, `stop`, `receive_jit`, `send`, `next_event` +
+//! `event_handled`, `balances`) plus U1's two demo fns in `lib.rs`; Gobley
+//! risk shrinks with API size.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use lightning_persister::fs_store::FilesystemStore;
+
+use crate::builder::{BuildError, KV_STORE_SUBDIR};
+use crate::config::Config;
+use crate::events::{Event, EventQueue};
+use crate::node::Node;
+use crate::types::Logger;
+
+/// FFI-facing configuration. Network is fixed to mainnet and there is no
+/// seed/mnemonic input (AE2); the URL overrides exist for tests and fallback.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct WalletConfig {
+    /// App-private data directory holding the seed and all persisted state.
+    pub storage_dir: String,
+    /// Esplora REST endpoint override (defaults to KTD-5's mempool.space).
+    pub esplora_url: Option<String>,
+    /// Rapid Gossip Sync snapshot server override (defaults to KTD-6's LDK
+    /// public server).
+    pub rgs_url: Option<String>,
+}
+
+/// Wallet balances, from U2's bdk wallet and channel monitors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct Balances {
+    /// Sum of all claimable lightning channel balances, in msat.
+    pub lightning_msat: u64,
+    /// Total on-chain balance (confirmed + pending), in sats.
+    pub onchain_sats: u64,
+}
+
+/// Typed FFI errors (Kotlin `WalletException`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
+pub enum WalletError {
+    /// `start()` while already running.
+    AlreadyRunning,
+    /// An operation that needs a running node while stopped.
+    NotRunning,
+    /// The node failed to start (restore/persistence/config problem).
+    Startup { message: String },
+    /// `event_handled()` with no event pending — an ack without a handle.
+    NoPendingEvent,
+    /// The operation's unit ships later in the plan (U4/U5).
+    NotImplemented { operation: String },
+}
+
+impl std::fmt::Display for WalletError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalletError::AlreadyRunning => write!(f, "the node is already running"),
+            WalletError::NotRunning => write!(f, "the node is not running"),
+            WalletError::Startup { message } => write!(f, "failed to start the node: {message}"),
+            WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
+            WalletError::NotImplemented { operation } => {
+                write!(f, "{operation} is not implemented yet")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WalletError {}
+
+impl From<BuildError> for WalletError {
+    fn from(error: BuildError) -> Self {
+        match error {
+            BuildError::AlreadyRunning => WalletError::AlreadyRunning,
+            BuildError::NotRunning => WalletError::NotRunning,
+            other => WalletError::Startup {
+                message: other.to_string(),
+            },
+        }
+    }
+}
+
+/// The one FFI object: a node handle plus the persisted event queue.
+///
+/// The queue owns its own `FilesystemStore` handle over the same store
+/// directory the node uses, created at wallet construction — so events can be
+/// pushed, persisted, and CONSUMED while the node (and its runtime) is
+/// stopped. That independence is what makes the KTD-8 lifecycle contract
+/// hold: `stop()` pushes a terminal [`Event::NodeStopped`] whose wake-up
+/// travels through the queue's `Notify`, not through any runtime IO, so a
+/// pending `next_event` — polled by the foreign executor via UniFFI —
+/// completes promptly even though the node's runtime is gone.
+#[derive(uniffi::Object)]
+pub struct Wallet {
+    node: Node,
+    events: Arc<EventQueue>,
+}
+
+#[uniffi::export]
+impl Wallet {
+    /// Creates a stopped wallet over the given config, reloading any
+    /// previously persisted (unacked) events from the storage dir.
+    #[uniffi::constructor]
+    pub fn new(config: WalletConfig) -> Self {
+        let mut core_config = Config::new(config.storage_dir);
+        if let Some(esplora_url) = config.esplora_url {
+            core_config.esplora_url = esplora_url;
+        }
+        if let Some(rgs_url) = config.rgs_url {
+            core_config.rgs_url = rgs_url;
+        }
+
+        let kv_store = Arc::new(FilesystemStore::new(
+            PathBuf::from(&core_config.storage_dir).join(KV_STORE_SUBDIR),
+        ));
+        let events = Arc::new(EventQueue::new(kv_store, Arc::new(Logger)));
+        let node = Node::with_event_sink(core_config, Arc::clone(&events) as _);
+        Self { node, events }
+    }
+
+    /// Starts the node. Blocking (initial restore + sync attempt): call from
+    /// a background dispatcher.
+    ///
+    /// `NodeStarted` is queued as soon as the node is up, WITHOUT waiting for
+    /// chain sync to reach the tip — a degraded offline start emits
+    /// `NodeStarted` then `SyncFailed`, so the queue is observable with no
+    /// network (KTD-8).
+    pub fn start(&self) -> Result<(), WalletError> {
+        self.node.start()?;
+        self.events.push(Event::NodeStarted);
+        if !self.node.is_chain_synced() {
+            self.events.push(Event::SyncFailed);
+        }
+        Ok(())
+    }
+
+    /// Stops the node and pushes the terminal `NodeStopped` event, completing
+    /// any pending `next_event` await (KTD-8 lifecycle contract).
+    pub fn stop(&self) -> Result<(), WalletError> {
+        let result = self.node.stop();
+        // NodeStopped is pushed whenever the node actually transitioned to
+        // stopped — including a stop whose final persistence write failed —
+        // so a pending next_event never hangs. Only a no-op stop() (not
+        // running) skips it.
+        if !matches!(result, Err(BuildError::NotRunning)) {
+            self.events.push(Event::NodeStopped);
+        }
+        result.map_err(WalletError::from)
+    }
+
+    /// Requests a Megalith JIT invoice for `amount_msat`; the invoice arrives
+    /// as [`Event::InvoiceReady`]. Wired in U4 — signature is final.
+    pub fn receive_jit(&self, amount_msat: u64) -> Result<(), WalletError> {
+        let _ = amount_msat;
+        Err(WalletError::NotImplemented {
+            operation: "receive_jit".to_string(),
+        })
+    }
+
+    /// Pays a BOLT11 invoice; the outcome arrives as
+    /// [`Event::PaymentSuccessful`] / [`Event::PaymentFailed`]. Wired in U5 —
+    /// signature is final.
+    pub fn send(&self, bolt11: String) -> Result<(), WalletError> {
+        let _ = bolt11;
+        Err(WalletError::NotImplemented {
+            operation: "send".to_string(),
+        })
+    }
+
+    /// Awaits the front event WITHOUT removing it (Kotlin `suspend`). The
+    /// same event is returned until `event_handled` acks it. This future is
+    /// polled by the foreign executor and never touches the node's runtime,
+    /// so it stays valid across `stop()`.
+    pub async fn next_event(&self) -> Event {
+        self.events.next().await
+    }
+
+    /// Acks (pops) the front event — the second half of handle-then-ack.
+    pub fn event_handled(&self) -> Result<(), WalletError> {
+        self.events
+            .ack()
+            .map(|_| ())
+            .ok_or(WalletError::NoPendingEvent)
+    }
+
+    /// Current balances; requires a running node.
+    pub fn balances(&self) -> Result<Balances, WalletError> {
+        let lightning_msat = self
+            .node
+            .lightning_balance_msat()
+            .ok_or(WalletError::NotRunning)?;
+        let onchain_sats = self
+            .node
+            .onchain_balance_sats()
+            .ok_or(WalletError::NotRunning)?;
+        Ok(Balances {
+            lightning_msat,
+            onchain_sats,
+        })
+    }
+}

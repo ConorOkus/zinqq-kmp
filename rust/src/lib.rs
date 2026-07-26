@@ -4,16 +4,20 @@ use std::time::Duration;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use tokio::runtime::{Builder, Runtime};
 
+pub mod api;
 pub mod builder;
 mod chain;
 pub mod config;
+pub mod events;
 mod fees;
 pub mod node;
 mod types;
 mod wallet;
 
+pub use api::{Balances, Wallet, WalletConfig, WalletError};
 pub use builder::BuildError;
 pub use config::{Config, PeerInfo};
+pub use events::Event;
 pub use node::Node;
 
 uniffi::setup_scaffolding!();

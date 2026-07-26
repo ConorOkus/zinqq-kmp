@@ -77,11 +77,19 @@ pub struct Node {
 }
 
 impl Node {
-    /// Creates a stopped node handle for the given config.
+    /// Creates a stopped node handle for the given config, with core events
+    /// going to the log only. The FFI surface uses [`Node::with_event_sink`]
+    /// to route them into the persisted public event queue instead.
     pub fn new(config: Config) -> Self {
         let event_sink = Arc::new(LoggingEventSink {
             logger: Arc::new(Logger),
         });
+        Self::with_event_sink(config, event_sink)
+    }
+
+    /// Creates a stopped node handle whose [`CoreEvent`]s go to `event_sink`
+    /// (the U3 event-queue seam).
+    pub(crate) fn with_event_sink(config: Config, event_sink: Arc<dyn EventSink>) -> Self {
         Self {
             config,
             state: Mutex::new(None),
@@ -207,6 +215,20 @@ impl Node {
             .unwrap()
             .as_ref()
             .map(|state| state.components.onchain_wallet.balance().total().to_sat())
+    }
+
+    /// Total lightning balance in msat — the sum of every claimable channel
+    /// balance across all monitors — once running.
+    pub fn lightning_balance_msat(&self) -> Option<u64> {
+        self.state.lock().unwrap().as_ref().map(|state| {
+            state
+                .components
+                .chain_monitor
+                .get_claimable_balances(&[])
+                .iter()
+                .map(|balance| balance.claimable_amount_satoshis() * 1_000)
+                .sum()
+        })
     }
 
     fn spawn_broadcast_task(

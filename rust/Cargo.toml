@@ -36,6 +36,8 @@ esplora-client = { version = "0.12", default-features = false, features = ["toki
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # bdk_wallet's ChangeSet is serde-serializable; we persist it as one JSON blob.
 serde_json = "1"
+# The public Event queue is serde-derived and persisted as JSON (KTD-8).
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

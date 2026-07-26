@@ -2,7 +2,13 @@ package zinqq.spike
 
 // The uniffi.wallet_core package is generated at build time by the Gobley
 // uniffi plugin (library mode) from the wallet-core cdylib; UniFFI lower-camels
-// the exported Rust fn names (core_version -> coreVersion).
+// the exported Rust fn names (core_version -> coreVersion) and maps the
+// exported Wallet object / Event enum / WalletConfig record to Kotlin types.
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import uniffi.wallet_core.Event
+import uniffi.wallet_core.Wallet
+import uniffi.wallet_core.WalletConfig
 import uniffi.wallet_core.coreVersion as coreVersionBinding
 import uniffi.wallet_core.pingAsync as pingAsyncBinding
 
@@ -16,4 +22,45 @@ object WalletCore {
 
     /** Round-trips the core-owned tokio runtime through a suspend binding. */
     suspend fun pingAsync(): String = pingAsyncBinding()
+
+    /**
+     * Creates a stopped wallet over an app-private storage directory,
+     * reloading any persisted (unacked) events. Mainnet only; no seed input
+     * (AE2). The URL overrides exist for tests and fallback.
+     */
+    fun create(
+        storageDir: String,
+        esploraUrl: String? = null,
+        rgsUrl: String? = null,
+    ): Wallet =
+        Wallet(
+            WalletConfig(
+                storageDir = storageDir,
+                esploraUrl = esploraUrl,
+                rgsUrl = rgsUrl,
+            ),
+        )
+
+    /**
+     * Handle-then-ack event loop (KTD-8). Each event is passed to [onEvent]
+     * BEFORE it is acked, so a crash between handling and acking redelivers
+     * the same event on the next loop or restart — handlers must be
+     * idempotent. Runs on [Dispatchers.IO] and returns after handling and
+     * acking the terminal [Event.NodeStopped] (which `stop()` pushes to
+     * complete a pending `nextEvent`); restart the loop after the next
+     * `start()` on foreground (KTD-10).
+     */
+    suspend fun runEventLoop(
+        wallet: Wallet,
+        onEvent: suspend (Event) -> Unit,
+    ) {
+        withContext(Dispatchers.IO) {
+            while (true) {
+                val event = wallet.nextEvent()
+                onEvent(event)
+                wallet.eventHandled()
+                if (event is Event.NodeStopped) return@withContext
+            }
+        }
+    }
 }

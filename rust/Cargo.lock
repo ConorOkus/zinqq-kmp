@@ -1920,6 +1920,7 @@ dependencies = [
  "lightning-rapid-gossip-sync",
  "lightning-transaction-sync",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
