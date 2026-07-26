@@ -60,12 +60,13 @@ struct ContentView: View {
                 TextField("Amount (sats)", text: $amountSats)
                     .keyboardType(.numberPad)
                     .textFieldStyle(.roundedBorder)
+                let parsedSats = UInt64(amountSats)
                 Button("Request invoice") {
-                    guard let sats = UInt64(amountSats), sats > 0 else { return }
+                    guard let sats = parsedSats, sats > 0 else { return }
                     model.requestInvoice(amountSats: sats)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(!model.running || UInt64(amountSats) == nil)
+                .disabled(!model.running || model.busy || parsedSats == nil)
             }
             if let invoice = model.currentInvoice {
                 invoiceView(invoice)
@@ -75,7 +76,7 @@ struct ContentView: View {
 
     private func invoiceView(_ invoice: WalletModel.Invoice) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let qr = Self.qrImage(for: invoice.bolt11) {
+            if let qr = QrCache.image(for: invoice.bolt11) {
                 Image(uiImage: qr)
                     .interpolation(.none)
                     .resizable()
@@ -119,7 +120,7 @@ struct ContentView: View {
                 model.sendPayment(bolt11: bolt11Input)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!model.running || bolt11Input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(!model.running || model.busy || bolt11Input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 
@@ -134,14 +135,27 @@ struct ContentView: View {
         }
     }
 
-    // MARK: QR (CoreImage, no dependency)
+}
 
-    private static func qrImage(for text: String) -> UIImage? {
+// MARK: QR (CoreImage, no dependency)
+
+/// Memoizes the last generated QR so unrelated observable changes (balance,
+/// outcome, sync banner) don't re-rasterize an unchanged invoice, and shares
+/// one CIContext, which is expensive to construct.
+@MainActor
+private enum QrCache {
+    private static let context = CIContext()
+    private static var last: (text: String, image: UIImage)?
+
+    static func image(for text: String) -> UIImage? {
+        if let last, last.text == text { return last.image }
         let filter = CIFilter.qrCodeGenerator()
         filter.message = Data(text.utf8)
         guard let output = filter.outputImage else { return nil }
         let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        guard let cgImage = CIContext().createCGImage(scaled, from: scaled.extent) else { return nil }
-        return UIImage(cgImage: cgImage)
+        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+        let image = UIImage(cgImage: cgImage)
+        last = (text, image)
+        return image
     }
 }

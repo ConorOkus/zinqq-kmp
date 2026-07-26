@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import Shared
+import UIKit
 
 // MARK: - Event adapter
 
@@ -77,10 +78,30 @@ final class WalletModel: ObservableObject {
     @Published private(set) var currentInvoice: Invoice?
     @Published private(set) var lastOutcome: String?
     @Published private(set) var syncBanner: String?
+    /// True while a receiveJit/send FFI call is in flight; the view disables
+    /// the Request Invoice / Pay buttons on it (R8: one coarse flag is fine).
+    @Published private(set) var busy = false
 
     private var wallet: Wallet?
     private var eventLoop: Task<Void, Never>?
     private var startRequested = false
+
+    // MARK: Blocking FFI dispatch
+
+    /// Runs a blocking Wallet FFI call off the MainActor — rust/src/api.rs
+    /// documents start/receive_jit/send as blocking and stop() as blocking up
+    /// to ~20s — mirroring the Android shell's Dispatchers.IO wrapping.
+    /// Callers hop back to the MainActor (their own isolation) to publish
+    /// state. Caveat (same unverified-bindings pattern as WalletEvent.from):
+    /// the generated Wallet type must be confirmed thread-safe for calls off
+    /// the main thread at the first Xcode build.
+    private static func runBlockingFFI<T>(
+        _ body: @escaping () throws -> T
+    ) async throws -> T {
+        try await Task.detached(priority: .userInitiated) {
+            try body()
+        }.value
+    }
 
     // MARK: Lifecycle (KTD-10: foreground-only node)
 
@@ -88,33 +109,54 @@ final class WalletModel: ObservableObject {
     /// loop; peer reconnect after a suspend is the core's job.
     func start() {
         guard !startRequested else { return }
-        do {
-            let wallet = try ensureWallet()
-            try wallet.start()
-            startRequested = true
-            // The previous loop (if any) exited on NodeStopped, or is still
-            // parked on a stale nextEvent — cancel it and start fresh.
-            // Cancellation can only land while awaiting nextEvent, before an
-            // event is handled, so no event is lost (unacked events redeliver).
-            eventLoop?.cancel()
-            eventLoop = Task { [weak self] in
-                await self?.runEventLoop(wallet)
+        startRequested = true
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let wallet = try self.ensureWallet()
+                // start() is a blocking FFI call — run it off the MainActor.
+                try await Self.runBlockingFFI { try wallet.start() }
+                // The previous loop (if any) exited on NodeStopped, or is still
+                // parked on a stale nextEvent — cancel it and start fresh.
+                // Cancellation can only land while awaiting nextEvent, before an
+                // event is handled, so no event is lost (unacked events redeliver).
+                self.eventLoop?.cancel()
+                self.eventLoop = Task { [weak self] in
+                    await self?.runEventLoop(wallet)
+                }
+            } catch {
+                self.startRequested = false
+                self.lastOutcome = "Start failed: \(error.localizedDescription)"
             }
-        } catch {
-            lastOutcome = "Start failed: \(error.localizedDescription)"
         }
     }
 
     /// Called on scenePhase .background. `stop()` pushes the terminal
     /// NodeStopped event, which completes a pending nextEvent and lets the
-    /// loop exit cleanly.
+    /// loop exit cleanly. It can block ~20s while the channel manager
+    /// persists, so it runs off the MainActor under a UIApplication background
+    /// task assertion — otherwise iOS could suspend the process mid-persist.
     func stop() {
         guard startRequested, let wallet else { return }
         startRequested = false
-        do {
-            try wallet.stop()
-        } catch {
-            lastOutcome = "Stop failed: \(error.localizedDescription)"
+        var assertion = UIBackgroundTaskIdentifier.invalid
+        func endAssertion() {
+            guard assertion != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(assertion)
+            assertion = .invalid
+        }
+        assertion = UIApplication.shared.beginBackgroundTask(withName: "wallet-stop") {
+            // Expiration: iOS reclaims the assertion; nothing to cancel —
+            // stop() is not interruptible — just release the token.
+            endAssertion()
+        }
+        Task { [weak self] in
+            do {
+                try await Self.runBlockingFFI { try wallet.stop() }
+            } catch {
+                self?.lastOutcome = "Stop failed: \(error.localizedDescription)"
+            }
+            endAssertion()
         }
     }
 
@@ -124,35 +166,59 @@ final class WalletModel: ObservableObject {
     /// InvoiceReady (or Lsps2Failed). Sats→msat is unit scaling only, not fee
     /// math (R4).
     func requestInvoice(amountSats: UInt64) {
-        guard let wallet else { return }
-        do {
-            try wallet.receiveJit(amountMsat: amountSats * 1_000)
-            lastOutcome = nil
-        } catch {
-            lastOutcome = "Invoice request failed: \(error.localizedDescription)"
+        guard let wallet, !busy else { return }
+        // Bound before scaling: `* 1_000` on an unchecked UInt64 would trap
+        // on absurd amounts. Reject instead of crashing.
+        guard amountSats > 0, amountSats <= UInt64.max / 1_000 else {
+            lastOutcome = "Amount out of range"
+            return
+        }
+        busy = true
+        lastOutcome = nil
+        Task { [weak self] in
+            do {
+                // receiveJit is a blocking FFI call — run off the MainActor.
+                try await Self.runBlockingFFI {
+                    try wallet.receiveJit(amountMsat: amountSats * 1_000)
+                }
+            } catch {
+                self?.lastOutcome = "Invoice request failed: \(error.localizedDescription)"
+            }
+            self?.busy = false
         }
     }
 
     /// Passes the BOLT11 string straight to the core, which parses and
     /// validates it (R4: no invoice parsing in Swift).
     func sendPayment(bolt11: String) {
-        guard let wallet else { return }
+        guard let wallet, !busy else { return }
         let trimmed = bolt11.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        do {
-            try wallet.send(bolt11: trimmed)
-            lastOutcome = "Sending…"
-        } catch {
-            lastOutcome = "Send failed: \(error.localizedDescription)"
+        busy = true
+        lastOutcome = "Sending…"
+        Task { [weak self] in
+            do {
+                // send is a blocking FFI call — run off the MainActor.
+                try await Self.runBlockingFFI { try wallet.send(bolt11: trimmed) }
+            } catch {
+                self?.lastOutcome = "Send failed: \(error.localizedDescription)"
+            }
+            self?.busy = false
         }
     }
 
     func refreshBalances() {
         guard let wallet else { return }
-        do {
-            balanceMsat = try wallet.balances().lightningMsat
-        } catch {
-            lastOutcome = "Balance refresh failed: \(error.localizedDescription)"
+        Task { [weak self] in
+            do {
+                // balances() crosses the blocking FFI — run off the MainActor.
+                let msat = try await Self.runBlockingFFI {
+                    try wallet.balances().lightningMsat
+                }
+                self?.balanceMsat = msat
+            } catch {
+                self?.lastOutcome = "Balance refresh failed: \(error.localizedDescription)"
+            }
         }
     }
 

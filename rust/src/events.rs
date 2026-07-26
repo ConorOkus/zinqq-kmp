@@ -145,6 +145,21 @@ impl EventQueue {
         }
     }
 
+    /// Keeps only the events matching the predicate, re-persisting when
+    /// anything was removed. Used by `start()` to purge a stale `NodeStopped`
+    /// persisted by a previous process: that terminal event only has meaning
+    /// for completing a pending `next_event` in the process that pushed it —
+    /// redelivered on a later launch it would exit the consumer's event loop
+    /// while the node runs.
+    pub(crate) fn retain(&self, predicate: impl FnMut(&Event) -> bool) {
+        let mut queue = self.queue.lock().unwrap();
+        let len_before = queue.len();
+        queue.retain(predicate);
+        if queue.len() != len_before {
+            self.persist(&queue);
+        }
+    }
+
     /// Pops the front event (the ack half of handle-then-ack) and re-persists.
     pub(crate) fn ack(&self) -> Option<Event> {
         let mut queue = self.queue.lock().unwrap();

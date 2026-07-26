@@ -182,6 +182,13 @@ impl Wallet {
     /// network (KTD-8).
     pub fn start(&self) -> Result<(), WalletError> {
         self.node.start()?;
+        // Purge any stale NodeStopped a previous process persisted but never
+        // acked: it is terminal for the shells' event loops, so redelivering
+        // it now would exit the loop while the node runs. It only ever had
+        // meaning for completing a pending next_event in the process that
+        // pushed it.
+        self.events
+            .retain(|event| !matches!(event, Event::NodeStopped));
         self.events.push(Event::NodeStarted);
         if !self.node.is_chain_synced() {
             self.events.push(Event::SyncFailed);

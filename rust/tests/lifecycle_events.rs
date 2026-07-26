@@ -118,6 +118,50 @@ fn unacked_events_are_redelivered_by_a_rebuilt_wallet() {
 }
 
 #[test]
+fn restart_purges_a_stale_node_stopped_so_the_new_event_loop_does_not_exit() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Start + stop with NOTHING consumed: [NodeStarted, SyncFailed,
+    // NodeStopped] persists unacked — the same on-disk state as a process
+    // dying between stop()'s push and the consumer's ack.
+    let wallet = test_wallet(dir.path());
+    wallet.start().unwrap();
+    wallet.stop().unwrap();
+    drop(wallet);
+
+    // Next launch starts the node again. The shells' event loops exit on ANY
+    // NodeStopped, so the stale one (only meaningful to the process that
+    // pushed it) must be purged by start(): the head of the queue is the
+    // stale-but-harmless startup pair, then THIS run's startup pair, with no
+    // NodeStopped anywhere before the new NodeStarted.
+    let rebuilt = test_wallet(dir.path());
+    rebuilt.start().unwrap();
+    let rt = foreign_executor();
+    for expected in [
+        Event::NodeStarted,
+        Event::SyncFailed,
+        Event::NodeStarted,
+        Event::SyncFailed,
+    ] {
+        let event = next_with_timeout(&rt, &rebuilt, 5);
+        assert_ne!(
+            event,
+            Event::NodeStopped,
+            "a stale NodeStopped from a previous run must not be redelivered \
+             to a running node's event loop"
+        );
+        assert_eq!(event, expected);
+        rebuilt.event_handled().unwrap();
+    }
+
+    // stop() still delivers a fresh NodeStopped for THIS run.
+    rebuilt.stop().unwrap();
+    assert_eq!(next_with_timeout(&rt, &rebuilt, 5), Event::NodeStopped);
+    rebuilt.event_handled().unwrap();
+    assert_eq!(rebuilt.event_handled(), Err(WalletError::NoPendingEvent));
+}
+
+#[test]
 fn wired_operations_return_typed_errors_while_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let wallet = test_wallet(dir.path());
