@@ -159,9 +159,10 @@ impl Config {
 /// is accepted (see `LiquiditySource::on_open_channel_request`), copying
 /// ldk-node's `Event::OpenChannelRequest` handling.
 pub(crate) fn default_user_config() -> UserConfig {
-    let mut user_config = UserConfig::default();
-    user_config.manually_accept_inbound_channels = true;
-    user_config
+    UserConfig {
+        manually_accept_inbound_channels: true,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

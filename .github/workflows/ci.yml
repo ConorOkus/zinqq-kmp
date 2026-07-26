@@ -1,0 +1,177 @@
+name: CI
+
+# The gates here are the ones that caught real defects during the spike's first
+# device runs: four of the eight bugs recorded in
+# docs/solutions/best-practices/kmp-rust-ffi-build-early-on-every-target.md were
+# only reachable by building for a real target, so the platform jobs are the
+# point of this workflow, not decoration around `cargo test`.
+#
+# The two live-network tests (live_megalith_get_info, live_megalith_receive_jit)
+# are #[ignore]d and therefore skipped here on purpose: they talk to mainnet
+# Megalith, and a CI job is not a place to depend on a third party's LSP.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Matches shared/build.gradle.kts and androidApp/build.gradle.kts. NDK r28+ is
+  # what makes packaged .so files 16 KB-aligned by default (Android 15+).
+  NDK_VERSION: 28.1.13356709
+
+jobs:
+  rust:
+    name: Rust core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Format
+        working-directory: rust
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Excludes the #[ignore]d live-network tests by default.
+      - name: Test
+        working-directory: rust
+        run: cargo test
+
+  android:
+    name: Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          # JDK 21: JDK 26 aborts the Android Gradle Plugin with a bare
+          # "* What went wrong: 26.0.1" and no further explanation.
+          java-version: '21'
+          distribution: temurin
+
+      - name: Install Rust Android targets
+        run: rustup target add aarch64-linux-android x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: android
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
+
+      # Boots the real LDK node through the Gobley-generated bindings, which is
+      # what surfaced the Throwable.message collision and the Linux
+      # cross-compile demand.
+      - name: Bindings smoke test
+        run: ./gradlew :shared:jvmTest --stacktrace
+
+      - name: Assemble debug APK
+        run: ./gradlew :androidApp:assembleDebug --stacktrace
+
+      # Android 15+ requires 16 KB-aligned LOAD segments. NDK r28 provides this
+      # by default, so this gate catches an accidental NDK downgrade.
+      - name: Verify 16 KB page alignment
+        run: |
+          set -euo pipefail
+          apk=$(find androidApp/build/outputs/apk/debug -name '*.apk' | head -1)
+          unzip -o -q "$apk" 'lib/*' -d "$RUNNER_TEMP/apk"
+          readelf=$(find "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt" \
+            -name llvm-readelf | head -1)
+          status=0
+          while IFS= read -r so; do
+            echo "== $so"
+            aligns=$("$readelf" -l "$so" | awk '$1 == "LOAD" { print $NF }')
+            if [ -z "$aligns" ]; then
+              echo "  no LOAD segments found"; status=1; continue
+            fi
+            while IFS= read -r align; do
+              if [ "$align" != "0x4000" ]; then
+                echo "  NOT 16 KB aligned: $align"; status=1
+              else
+                echo "  ok: $align"
+              fi
+            done <<< "$aligns"
+          done < <(find "$RUNNER_TEMP/apk/lib" -name '*.so')
+          exit "$status"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: androidApp-debug
+          path: androidApp/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  ios:
+    name: iOS
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - name: Install Rust iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ios
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # Cross-compiles the Rust core to aarch64-apple-ios-sim and statically
+      # links it into the Kotlin/Native framework. This is the gate that caught
+      # Dispatchers.IO being unavailable in commonMain on Kotlin/Native.
+      - name: Build shared framework
+        run: ./gradlew :shared:linkDebugFrameworkIosSimulatorArm64 --stacktrace
+
+      - name: Generate Xcode project
+        working-directory: iosApp
+        run: xcodegen generate
+
+      # Compiles the SwiftUI shell against the generated framework, which is
+      # what caught Option<u64> exporting as a nullable KotlinULong?.
+      - name: Build app for simulator
+        working-directory: iosApp
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            build
