@@ -57,6 +57,14 @@ struct SendLightningReview: Equatable {
     let amountMsat: UInt64
     let recipient: String
     var returnTo: SendAmountStep? = nil
+
+    /// The payment hash this review's dispatch will settle on (F1), taken
+    /// straight from the core's classification — set for every BOLT11 target
+    /// (LNURL-fetched invoices included, since the fetch re-classifies the
+    /// invoice), and nil for a BOLT12 offer, which has no payment hash until
+    /// the invoice request produces an invoice. The dispatching step does not
+    /// need to carry it: the confirm task holds the review for its whole life.
+    var awaitedPaymentHash: String? { target.paymentHash }
 }
 
 /// `oc-review`: Amount / Network fee / Total rows plus the drift banner.
@@ -419,7 +427,8 @@ func refreshedExactReview(
 
 // MARK: - Outcome events (F1)
 
-/// The events that settle a dispatched Lightning payment (F1).
+/// The events that settle SOME dispatched Lightning payment (F1) — whether
+/// they settle OURS is `isOurPaymentOutcome`'s question.
 func isPaymentOutcome(_ event: WalletEvent) -> Bool {
     switch event {
     case .paymentSuccessful, .paymentFailed:
@@ -429,18 +438,57 @@ func isPaymentOutcome(_ event: WalletEvent) -> Bool {
     }
 }
 
+/// Whether an outcome event belongs to the dispatch awaiting it.
+///
+/// The core's 5-minute outcome cap (`sendOutcomeTimeoutMs`) deliberately
+/// leaves the capped payment IN FLIGHT — so settling on whichever outcome
+/// arrives first lets a previous payment's result land on this send's screen
+/// (a user told their payment failed when it succeeded, or the reverse). The
+/// core's `ClassifiedView.payment_hash` closes that: when we know our hash,
+/// only that hash settles us and every other outcome is ignored.
+///
+/// BOLT12 keeps first-outcome matching: an offer has no payment hash until the
+/// invoice request produces an invoice, so `awaitedPaymentHash` is nil there
+/// (as it is for a `nil`-hash `PaymentFailed`, which is only ever a BOLT12
+/// pre-invoice failure) and any outcome settles the dispatch.
+func isOurPaymentOutcome(awaitedPaymentHash: String?, event: WalletEvent) -> Bool {
+    switch event {
+    case let .paymentSuccessful(paymentHash):
+        return outcomeHashMatches(awaited: awaitedPaymentHash, outcome: paymentHash)
+    case let .paymentFailed(paymentHash, _):
+        return outcomeHashMatches(awaited: awaitedPaymentHash, outcome: paymentHash)
+    default:
+        return false
+    }
+}
+
+/// Hashes are lowercase hex from the core on both sides; compared
+/// case-insensitively anyway so a re-cased hash can never silently mismatch.
+private func outcomeHashMatches(awaited: String?, outcome: String?) -> Bool {
+    guard let awaited else { return true }
+    guard let outcome else { return false }
+    return awaited.lowercased() == outcome.lowercased()
+}
+
 /// Settle the dispatch step from an outcome event; `nil` for events that are
-/// not this payment's outcome. The core exposes no FFI to derive our
-/// dispatch's payment hash in the shell, so the first outcome after dispatch
-/// is taken as ours (one send is in flight per screen).
-func applyOutcome(amountMsat: UInt64, event: WalletEvent) -> SendStep? {
+/// not this payment's outcome — an unrelated event, or an outcome carrying a
+/// FOREIGN payment hash, in which case the caller keeps waiting. Mirrors the
+/// receive flow's `applyPaymentReceived` hash match.
+func applyOutcome(
+    awaitedPaymentHash: String?,
+    amountMsat: UInt64,
+    event: WalletEvent
+) -> SendStep? {
+    guard isOurPaymentOutcome(awaitedPaymentHash: awaitedPaymentHash, event: event) else {
+        return nil
+    }
     switch event {
     case .paymentSuccessful:
         return .success(
             amountSats: UInt64(FormatKt.msatToSatCeil(msat: Int64(bitPattern: amountMsat))),
             txid: nil
         )
-    case let .paymentFailed(reason):
+    case let .paymentFailed(_, reason):
         return .failure(message: reason, retry: nil)
     default:
         return nil

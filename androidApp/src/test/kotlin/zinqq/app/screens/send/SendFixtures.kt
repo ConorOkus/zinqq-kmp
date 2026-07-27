@@ -14,6 +14,8 @@ import uniffi.wallet_core.MaxSendEstimate
 fun classifiedView(
     kind: ClassifiedKind = ClassifiedKind.INVALID,
     bolt11: String? = null,
+    /** Lowercase hex; the core populates it for BOLT11 targets only (F1). */
+    paymentHash: String? = null,
     offer: String? = null,
     amountMsat: ULong? = null,
     description: String? = null,
@@ -27,6 +29,7 @@ fun classifiedView(
 ): ClassifiedView = ClassifiedView(
     kind = kind,
     bolt11 = bolt11,
+    paymentHash = paymentHash,
     offer = offer,
     amountMsat = amountMsat,
     description = description,
@@ -79,6 +82,12 @@ fun maxSendEstimate(
     feeRateSatPerVb = feeRateSatPerVb,
     reserveSats = reserveSats,
 )
+
+/** The hash [TEST_BOLT11] classifies to (lowercase hex, 32 bytes). */
+val TEST_PAYMENT_HASH = "aa".repeat(32)
+
+/** Another payment's hash — a previous send still in flight past its cap. */
+val OTHER_PAYMENT_HASH = "bb".repeat(32)
 
 const val TEST_ADDRESS = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 const val TEST_BOLT11 = "lnbc500n1p3xyzzyfakeinvoicefortestsq3sdwj"

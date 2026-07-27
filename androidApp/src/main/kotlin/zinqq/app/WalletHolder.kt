@@ -70,20 +70,48 @@ import zinqq.spike.WalletCore
  * [state] and call intent methods; classification, fee math, and protocol
  * work stay in the Rust core.
  */
-class WalletHolder(
-    context: Context,
+class WalletHolder internal constructor(
     private val settings: SettingsRepository,
+    /**
+     * Whether the process is foregrounded. Injected because the restore exit
+     * restart is gated on it (see [restartAfterRestore]) and
+     * `ProcessLifecycleOwner` is not constructible in a JVM unit test.
+     */
+    private val isForegrounded: () -> Boolean,
+    /**
+     * Builds the node on first lifecycle use. Deliberately lazy: process
+     * start must not open the storage lock before the first foreground start.
+     */
+    nodeFactory: () -> WalletNode,
 ) : DefaultLifecycleObserver, SendPort, ReceivePort, SettingsPort {
-    // App-private filesDir (NOT cache, which the OS may purge): holds the seed,
-    // channel monitors, and the storage lock, and is the directory
-    // data_extraction_rules.xml excludes from backup and device transfer (R6).
-    private val storageDir = File(context.filesDir, "wallet").absolutePath
+
+    constructor(context: Context, settings: SettingsRepository) : this(
+        settings = settings,
+        isForegrounded = {
+            ProcessLifecycleOwner.get()
+                .lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        },
+        nodeFactory = {
+            // App-private filesDir (NOT cache, which the OS may purge): holds
+            // the seed, channel monitors, and the storage lock, and is the
+            // directory data_extraction_rules.xml excludes from backup and
+            // device transfer (R6).
+            NativeWalletNode(
+                WalletCore.create(File(context.filesDir, "wallet").absolutePath),
+            )
+        },
+    )
 
     // Outlives every activity, unlike viewModelScope. SupervisorJob so one
     // failed intent cannot tear down the event loop.
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val wallet: Wallet by lazy { WalletCore.create(storageDir) }
+    private val node: WalletNode by lazy(nodeFactory)
+
+    // The native handle for everything outside the node lifecycle: the
+    // per-screen Port passthroughs are thin FFI calls (R14).
+    private val wallet: Wallet
+        get() = requireNotNull(node.wallet) { "this WalletNode has no native handle" }
 
     // The synchronous read is deliberate (KTD-11): the persisted appearance
     // mode must be in the very first emitted state so no frame renders in the
@@ -105,13 +133,48 @@ class WalletHolder(
 
     private var loopJob: Job? = null
 
-    // Serializes the foreground start/stop lifecycle (KTD-10): startNode()
-    // and stopNode() each chain onto the previous lifecycle job, so a rapid
-    // background/foreground flip can never run a stale stop() after a fresh
-    // start() — transitions apply strictly in the order the process
-    // lifecycle emitted them. Only mutated from the main thread
-    // (ProcessLifecycleOwner callbacks).
+    // Serializes EVERY transition that starts or stops the node (KTD-10): the
+    // foreground start, the background stop, and the whole restore sequence
+    // (stop → restore → restart) each chain onto the previous link, so
+    // transitions apply strictly in the order they were requested and none is
+    // dropped. Without the chain a rapid background/foreground flip could run
+    // a stale stop() after a fresh start(); with the restore left off the
+    // chain, an ON_STOP could interleave with the restore's own restart and
+    // leave the node running while backgrounded — or stopped while
+    // foregrounded, with no further UI trigger to restart it.
+    //
+    // Only mutated from the main thread: the ProcessLifecycleOwner callbacks
+    // and [startRestore] (the Restore screen's CTA).
     private var lifecycleJob: Job? = null
+
+    /**
+     * Enqueue a node-lifecycle transition behind everything already queued.
+     *
+     * Capturing the previous job in a local BEFORE reassigning matters:
+     * joining [lifecycleJob] from inside the new job would self-join forever.
+     * Transitions are queued, never dropped — dropping one is how a stop went
+     * missing and left a headless node running in a cached process.
+     */
+    private fun enqueueLifecycle(transition: suspend () -> Unit) {
+        val previous = lifecycleJob
+        lifecycleJob = scope.launch {
+            previous?.join()
+            transition()
+        }
+    }
+
+    /**
+     * Test seam (KTD-10): suspends until every lifecycle transition queued so
+     * far has finished, so a test can assert the settled node state.
+     */
+    internal suspend fun awaitLifecycleIdle() {
+        lifecycleJob?.join()
+    }
+
+    /** Test seam: suspends until the current event-loop run has exited. */
+    internal suspend fun awaitEventLoopIdle() {
+        loopJob?.join()
+    }
 
     init {
         // Keep the state's appearance mode mirroring the persisted selection.
@@ -154,7 +217,7 @@ class WalletHolder(
     fun dismissRecoveryBanner() {
         _state.update { it.copy(recoveryBannerDismissed = true) }
         scope.launch {
-            runCatching { wallet?.dismissRecovery() }
+            runCatching { node.wallet?.dismissRecovery() }
             refreshWalletData()
         }
     }
@@ -168,6 +231,9 @@ class WalletHolder(
      */
     fun refreshWalletData() {
         scope.launch {
+            // Every snapshot below is a native FFI read; a node seam with no
+            // handle behind it (a lifecycle-only fake) has nothing to snapshot.
+            val wallet = node.wallet ?: return@launch
             // Balances/activity need a running node; keep the previous
             // snapshots when the query fails (e.g. refresh while stopped).
             val balances = try {
@@ -350,17 +416,15 @@ class WalletHolder(
         withContext(Dispatchers.IO) { wallet.closeChannel(channelId, force) }
 
     private fun startNode() {
-        // A running restore owns the node lifecycle (stop → restore →
-        // restart); a foreground start racing it would make the core's
-        // stopped-only restore() fail with AlreadyRunning.
-        if (_state.value.restore is RestoreUi.InProgress) return
-        // Capture the previous job in a local BEFORE reassigning: joining
-        // `lifecycleJob` from inside the new job would self-join forever.
-        val previous = lifecycleJob
-        lifecycleJob = scope.launch {
-            previous?.join()
-            if (_state.value.restore is RestoreUi.InProgress) return@launch
-            if (!startCore()) return@launch
+        enqueueLifecycle {
+            // A restore owns the node lifecycle (stop → restore → restart), and
+            // the core's restore() is valid only from a stopped node, so
+            // starting under one would fail with AlreadyRunning. The chain
+            // already keeps this link out of a *running* restore; this catches
+            // the restore that was requested after this start was queued —
+            // its own foreground-gated restart covers the start we skip here.
+            if (_state.value.restore is RestoreUi.InProgress) return@enqueueLifecycle
+            if (!startCore()) return@enqueueLifecycle
             ensureEventLoop()
             refreshWalletData()
         }
@@ -373,7 +437,7 @@ class WalletHolder(
      */
     private suspend fun startCore(): Boolean = withContext(Dispatchers.IO) {
         try {
-            wallet.start()
+            node.start()
             _state.update { it.copy(startError = null) }
             true
         } catch (e: WalletException.AlreadyRunning) {
@@ -408,9 +472,9 @@ class WalletHolder(
     private fun ensureEventLoop() {
         if (loopJob?.isActive == true) return
         loopJob = scope.launch {
-            // Handle-then-ack inside WalletCore; returns after acking the
+            // Handle-then-ack inside the node seam; returns after acking the
             // terminal NodeStopped pushed by stop() (KTD-8).
-            WalletCore.runEventLoop(wallet) { event ->
+            node.runEventLoop { event ->
                 _state.update { reduce(it, event) }
                 // Rebroadcast AFTER the reduce so subscribers (the send
                 // flow's outcome await, U15) observe state and event in order.
@@ -428,18 +492,23 @@ class WalletHolder(
      * [UiState.restore]) → blocking restore → restart → refresh. Runs in the
      * process scope: leaving the screen mid-restore cannot orphan a stopped
      * node, and the screen re-attaches to whatever phase is current.
+     *
+     * The sequence stops and restarts the node, so it takes its turn in the
+     * same [lifecycleJob] chain as the foreground start/stop: an ON_START or
+     * ON_STOP either side of it applies strictly before or strictly after the
+     * whole sequence, never in the middle of it.
      */
     fun startRestore(mnemonic: String) {
         if (_state.value.restore is RestoreUi.InProgress) return
         _state.update { it.copy(restore = RestoreUi.InProgress(RESTORE_INITIAL_STEP)) }
-        scope.launch {
+        enqueueLifecycle {
             // Any stop that actually transitioned pushes the terminal
             // NodeStopped, which lets the current loop drain and exit —
             // join it before starting the drain loop so exactly one consumer
             // ever holds the queue. A NotRunning stop pushes nothing (the
             // loop, if any, is already parked or gone).
             val pushedStop = try {
-                wallet.stop()
+                node.stop()
                 true
             } catch (_: WalletException.NotRunning) {
                 false
@@ -452,14 +521,14 @@ class WalletHolder(
             // Drain RestoreProgress events live while restore() blocks.
             ensureEventLoop()
             try {
-                wallet.restore(mnemonic)
+                node.restore(mnemonic)
             } catch (e: Exception) {
                 // The typed failures leave local state untouched — restart
                 // the existing wallet so the app stays usable behind the
                 // error screen (a still-fenced wallet re-fences here).
                 restartAfterRestore()
                 _state.update { it.copy(restore = RestoreUi.Failed(restoreErrorMessage(e))) }
-                return@launch
+                return@enqueueLifecycle
             }
             // The restored wallet replaced the old one — any fence fell with
             // it (a start failure still surfaces through startError on Home),
@@ -474,11 +543,18 @@ class WalletHolder(
      * Restore's exit restart, foreground-gated (KTD-10): a restore that
      * finishes while the app is backgrounded must not leave a headless node
      * running past its missed ON_STOP — the next foreground start covers it.
+     *
+     * Runs inside the restore's own link in the [lifecycleJob] chain rather
+     * than opening a link of its own: it is already serialized against every
+     * other transition, and enqueueing here would join either the link it is
+     * running inside or a stop already queued behind that link — a deadlock
+     * either way. So the foreground read happens with no join between it and
+     * [startCore], and cannot go stale across one; a lifecycle event that
+     * lands after the read is queued behind this link and corrects the node
+     * state when it runs.
      */
     private suspend fun restartAfterRestore() {
-        val foregrounded = ProcessLifecycleOwner.get()
-            .lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        if (!foregrounded) return
+        if (!isForegrounded()) return
         startCore()
         refreshWalletData()
     }
@@ -493,11 +569,16 @@ class WalletHolder(
     private fun stopNode() {
         // Runs on the process-scoped scope, so it survives the activity teardown
         // that races this call on a back-press exit.
-        val previous = lifecycleJob
-        lifecycleJob = scope.launch {
-            previous?.join()
+        enqueueLifecycle {
+            // Symmetric to [startNode]: a restore requested after this stop was
+            // queued owns the lifecycle, and it stops the node itself and only
+            // restarts it while the process is still foregrounded — so there is
+            // nothing here to stop. Chaining (rather than dropping) is what
+            // makes that safe: a stop requested *during* a restore is queued
+            // behind it and runs once the restore's own restart has settled.
+            if (_state.value.restore is RestoreUi.InProgress) return@enqueueLifecycle
             try {
-                wallet.stop()
+                node.stop()
             } catch (_: Exception) {
                 // NotRunning: nothing to stop.
             }
@@ -511,7 +592,7 @@ class WalletHolder(
      */
     fun stopBlocking() {
         try {
-            wallet.stop()
+            node.stop()
         } catch (_: Exception) {
             // NotRunning: nothing to stop.
         }

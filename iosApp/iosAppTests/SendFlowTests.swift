@@ -400,19 +400,129 @@ final class SendFlowTests: XCTestCase {
     // MARK: outcome events + timeout
 
     func testPaymentSuccessfulSettlesToSuccessWithCeilSats() {
-        let settled = applyOutcome(amountMsat: 1_001, event: .paymentSuccessful)
+        let settled = applyOutcome(
+            awaitedPaymentHash: ourPaymentHash,
+            amountMsat: 1_001,
+            event: .paymentSuccessful(paymentHash: ourPaymentHash)
+        )
         XCTAssertEqual(.success(amountSats: 2, txid: nil), settled)
     }
 
     func testPaymentFailedSettlesToFailureWithReason() {
-        let settled = applyOutcome(amountMsat: 1_000, event: .paymentFailed(reason: "no route"))
+        let settled = applyOutcome(
+            awaitedPaymentHash: ourPaymentHash,
+            amountMsat: 1_000,
+            event: .paymentFailed(paymentHash: ourPaymentHash, reason: "no route")
+        )
         XCTAssertEqual(.failure(message: "no route", retry: nil), settled)
     }
 
     func testUnrelatedEventsDoNotSettleTheDispatch() {
-        XCTAssertNil(applyOutcome(amountMsat: 1_000, event: .syncCompleted))
-        XCTAssertTrue(isPaymentOutcome(.paymentFailed(reason: "x")))
+        XCTAssertNil(
+            applyOutcome(awaitedPaymentHash: nil, amountMsat: 1_000, event: .syncCompleted)
+        )
+        XCTAssertTrue(isPaymentOutcome(.paymentFailed(paymentHash: nil, reason: "x")))
         XCTAssertFalse(isPaymentOutcome(.nodeStarted))
+    }
+
+    // MARK: outcome hash matching (F1: no inheriting a previous send's result)
+
+    /// The P1 defect: the core's 5-minute cap leaves the capped payment in
+    /// flight, so its outcome can land while a LATER send is dispatching.
+    /// A foreign hash must never settle our dispatch.
+    func testForeignOutcomeHashDoesNotSettleABolt11Dispatch() {
+        XCTAssertNil(
+            applyOutcome(
+                awaitedPaymentHash: ourPaymentHash,
+                amountMsat: 1_000,
+                event: .paymentSuccessful(paymentHash: foreignPaymentHash)
+            )
+        )
+        XCTAssertNil(
+            applyOutcome(
+                awaitedPaymentHash: ourPaymentHash,
+                amountMsat: 1_000,
+                event: .paymentFailed(paymentHash: foreignPaymentHash, reason: "no route")
+            )
+        )
+        XCTAssertFalse(
+            isOurPaymentOutcome(
+                awaitedPaymentHash: ourPaymentHash,
+                event: .paymentSuccessful(paymentHash: foreignPaymentHash)
+            )
+        )
+    }
+
+    /// A hashless failure is only ever a BOLT12 pre-invoice failure, so it
+    /// cannot be the outcome of a BOLT11 dispatch whose hash we know.
+    func testHashlessFailureDoesNotSettleABolt11Dispatch() {
+        XCTAssertNil(
+            applyOutcome(
+                awaitedPaymentHash: ourPaymentHash,
+                amountMsat: 1_000,
+                event: .paymentFailed(paymentHash: nil, reason: "no route")
+            )
+        )
+    }
+
+    /// Both sides are lowercase hex from the core; a re-cased hash still
+    /// matches rather than silently stranding the dispatch.
+    func testOutcomeHashMatchIsCaseInsensitive() {
+        XCTAssertTrue(
+            isOurPaymentOutcome(
+                awaitedPaymentHash: ourPaymentHash.uppercased(),
+                event: .paymentSuccessful(paymentHash: ourPaymentHash)
+            )
+        )
+    }
+
+    /// A BOLT12 offer has no payment hash until the invoice request produces
+    /// an invoice, so that path keeps first-outcome matching by design.
+    func testBolt12DispatchKeepsFirstOutcomeMatching() {
+        let review = SendLightningReview(
+            target: classifiedView(kind: .bolt12, offer: testOffer, amountMsat: 21_000),
+            amountMsat: 21_000,
+            recipient: "an offer"
+        )
+        XCTAssertNil(review.awaitedPaymentHash)
+        XCTAssertEqual(
+            .success(amountSats: 21, txid: nil),
+            applyOutcome(
+                awaitedPaymentHash: review.awaitedPaymentHash,
+                amountMsat: review.amountMsat,
+                event: .paymentSuccessful(paymentHash: foreignPaymentHash)
+            )
+        )
+    }
+
+    /// A BOLT11 review carries the core's classified hash through to the
+    /// dispatch — including an LNURL-fetched invoice, which the core
+    /// re-classifies (so its hash arrives the same way).
+    func testBolt11ReviewCarriesTheClassifiedPaymentHash() {
+        let review = SendLightningReview(
+            target: classifiedView(
+                kind: .bolt11,
+                bolt11: testBolt11,
+                paymentHash: ourPaymentHash,
+                amountMsat: 21_000
+            ),
+            amountMsat: 21_000,
+            recipient: "satoshi"
+        )
+        XCTAssertEqual(ourPaymentHash, review.awaitedPaymentHash)
+
+        let lnurlReview = lnurlInvoiceReview(
+            invoice: classifiedView(
+                kind: .bolt11,
+                bolt11: testBolt11,
+                paymentHash: ourPaymentHash,
+                amountMsat: 21_000
+            ),
+            requestedMsat: 21_000,
+            rawInput: "satoshi@zinqq.app",
+            returnTo: nil
+        )
+        XCTAssertEqual(ourPaymentHash, lnurlReview.awaitedPaymentHash)
     }
 
     func testOutcomeTimeoutIsANeutralTerminalState() {

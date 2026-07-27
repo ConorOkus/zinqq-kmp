@@ -38,7 +38,7 @@ use lightning::offers::offer::{Amount as OfferAmount, Offer};
 use lightning::onion_message::dns_resolution::HumanReadableName;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 
-use crate::util::unix_now;
+use crate::util::{hex_str, unix_now};
 
 /// The PWA's input cap (`Send.tsx:613` / `maxLength={2000}`).
 pub const MAX_INPUT_CHARS: usize = 2000;
@@ -107,6 +107,10 @@ pub enum Classified {
         raw: String,
         amount_msat: Option<u64>,
         description: Option<String>,
+        /// The invoice's payment hash as lowercase hex, taken from the parse
+        /// the classifier already did. The shells need it to match a
+        /// `PaymentSuccessful`/`PaymentFailed` event to their own dispatch.
+        payment_hash: String,
     },
     /// A validated (mainnet, unexpired) BOLT12 offer. `amount_msat` is
     /// `None` for amountless and fiat-denominated offers (PWA parity).
@@ -300,6 +304,8 @@ fn parse_bolt11(raw: &str, now: Duration) -> Classified {
         raw: raw.to_string(),
         amount_msat: invoice.amount_milli_satoshis(),
         description,
+        // Read off the invoice already parsed above — never re-decoded.
+        payment_hash: hex_str(invoice.payment_hash().as_byte_array()),
     }
 }
 
@@ -1203,6 +1209,7 @@ mod tests {
                 raw: bolt11,
                 amount_msat: Some(50_000_000),
                 description: Some("Test invoice".to_string()),
+                payment_hash: "11".repeat(32),
             }
         );
     }
@@ -1410,6 +1417,9 @@ mod tests {
                 raw: bolt11,
                 amount_msat: Some(50_000_000),
                 description: Some("Test invoice".to_string()),
+                // The test invoice's payment hash, exposed for the shells'
+                // event matching (U6/FFI `ClassifiedView.payment_hash`).
+                payment_hash: "11".repeat(32),
             }
         );
     }

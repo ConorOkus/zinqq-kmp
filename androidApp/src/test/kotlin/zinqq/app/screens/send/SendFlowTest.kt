@@ -435,10 +435,11 @@ class SendFlowTest {
 
     @Test
     fun paymentSuccessfulSettlesToSuccessWithCeilSats() {
-        val dispatching = SendStep.Dispatching(amountMsat = 1_001uL)
+        val dispatching =
+            SendStep.Dispatching(amountMsat = 1_001uL, paymentHash = TEST_PAYMENT_HASH)
         val settled = applyOutcome(
             dispatching,
-            Event.PaymentSuccessful(paymentHash = "aa", feePaidMsat = null),
+            Event.PaymentSuccessful(paymentHash = TEST_PAYMENT_HASH, feePaidMsat = null),
         )
         assertEquals(SendStep.Success(amountSats = 2uL), settled)
     }
@@ -446,8 +447,8 @@ class SendFlowTest {
     @Test
     fun paymentFailedSettlesToFailureWithReason() {
         val settled = applyOutcome(
-            SendStep.Dispatching(1_000uL),
-            Event.PaymentFailed(paymentHash = null, reason = "no route"),
+            SendStep.Dispatching(1_000uL, TEST_PAYMENT_HASH),
+            Event.PaymentFailed(paymentHash = TEST_PAYMENT_HASH, reason = "no route"),
         )
         assertEquals(SendStep.Failure(message = "no route"), settled)
     }
@@ -455,8 +456,92 @@ class SendFlowTest {
     @Test
     fun unrelatedEventsDoNotSettleTheDispatch() {
         assertNull(applyOutcome(SendStep.Dispatching(1_000uL), Event.SyncCompleted))
-        assertTrue(isPaymentOutcome(Event.PaymentFailed(null, "x")))
-        assertTrue(!isPaymentOutcome(Event.NodeStarted))
+        assertTrue(isPaymentOutcome(Event.PaymentFailed(null, "x"), null))
+        assertTrue(!isPaymentOutcome(Event.NodeStarted, null))
+    }
+
+    // --- F1: an outcome only settles the dispatch whose hash it carries ---
+
+    @Test
+    fun anotherPaymentsOutcomeNeverSettlesOurDispatch() {
+        val dispatching = SendStep.Dispatching(1_000uL, TEST_PAYMENT_HASH)
+        // A previous send that outlived the 5-minute cap is still in flight;
+        // its success must not tell this user their payment went through.
+        assertNull(
+            applyOutcome(
+                dispatching,
+                Event.PaymentSuccessful(paymentHash = OTHER_PAYMENT_HASH, feePaidMsat = 1uL),
+            ),
+        )
+        assertNull(
+            applyOutcome(
+                dispatching,
+                Event.PaymentFailed(paymentHash = OTHER_PAYMENT_HASH, reason = "no route"),
+            ),
+        )
+        // And the controller's await predicate keeps waiting on both.
+        assertTrue(
+            !isPaymentOutcome(
+                Event.PaymentSuccessful(OTHER_PAYMENT_HASH, null),
+                TEST_PAYMENT_HASH,
+            ),
+        )
+        assertTrue(
+            !isPaymentOutcome(Event.PaymentFailed(OTHER_PAYMENT_HASH, "x"), TEST_PAYMENT_HASH),
+        )
+        // A hashless failure belongs to a BOLT12 request, never to our BOLT11.
+        assertTrue(!isPaymentOutcome(Event.PaymentFailed(null, "x"), TEST_PAYMENT_HASH))
+    }
+
+    @Test
+    fun bolt12DispatchKeepsFirstOutcomeMatching() {
+        // No hash exists before the invoice request, so any outcome settles.
+        val dispatching = SendStep.Dispatching(2_000uL, paymentHash = null)
+        assertTrue(isPaymentOutcome(Event.PaymentSuccessful(OTHER_PAYMENT_HASH, null), null))
+        assertEquals(
+            SendStep.Success(amountSats = 2uL),
+            applyOutcome(dispatching, Event.PaymentSuccessful(OTHER_PAYMENT_HASH, null)),
+        )
+        assertEquals(
+            SendStep.Failure(message = "no route"),
+            applyOutcome(dispatching, Event.PaymentFailed(null, "no route")),
+        )
+    }
+
+    @Test
+    fun bolt11ReviewCarriesTheCoresPaymentHashAndBolt12DoesNot() {
+        val bolt11 = classifiedView(
+            kind = ClassifiedKind.BOLT11,
+            bolt11 = TEST_BOLT11,
+            paymentHash = TEST_PAYMENT_HASH,
+            amountMsat = 50_000uL,
+        )
+        val review = assertIs<SendStep.ReviewLightning>(
+            assertIs<SendDecision.Step>(route(TEST_BOLT11, bolt11)).step,
+        )
+        assertEquals(TEST_PAYMENT_HASH, review.paymentHash)
+
+        val offer = classifiedView(
+            kind = ClassifiedKind.BOLT12,
+            offer = TEST_OFFER,
+            amountMsat = 50_000uL,
+        )
+        val offerReview = assertIs<SendStep.ReviewLightning>(
+            assertIs<SendDecision.Step>(route(TEST_OFFER, offer)).step,
+        )
+        assertNull(offerReview.paymentHash)
+    }
+
+    @Test
+    fun lnurlFetchedInvoiceCarriesTheFetchedInvoicesHash() {
+        val fetched = classifiedView(
+            kind = ClassifiedKind.BOLT11,
+            bolt11 = TEST_BOLT11,
+            paymentHash = TEST_PAYMENT_HASH,
+            amountMsat = 21_000uL,
+        )
+        val review = lnurlInvoiceReview(fetched, 21_000uL, "satoshi@zinqq.app", returnTo = null)
+        assertEquals(TEST_PAYMENT_HASH, review.paymentHash)
     }
 
     @Test

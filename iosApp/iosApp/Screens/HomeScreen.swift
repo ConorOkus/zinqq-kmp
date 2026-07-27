@@ -1,11 +1,11 @@
 import SwiftUI
 
 /// The PWA's Home (U19, R12; `Home.tsx`), mirroring Android's `HomeScreen`:
-/// field screen with a refresh icon (re-queries wallet data — no page-reload
-/// concept natively; the PWA install button is omitted on native), the
-/// unified BalanceDisplay, RecoveryBanner / PendingSweepBanner, and the two
-/// 88pt CTAs. A fatal start failure replaces the content with "Something went
-/// wrong" (`Home.tsx:29-42`). Every derivation comes from the pure helpers in
+/// the unified BalanceDisplay, RecoveryBanner / PendingSweepBanner, and the
+/// two 88pt CTAs. The PWA's install button and its manual refresh are both
+/// omitted natively — wallet data re-queries itself from core events. A fatal
+/// start failure replaces the content with "Something went wrong"
+/// (`Home.tsx:29-42`). Every derivation comes from the pure helpers in
 /// `WalletPresentation.swift` (R14) — this view only places results.
 struct HomeScreen: View {
     @ObservedObject var model: WalletModel
@@ -41,22 +41,6 @@ struct HomeScreen: View {
 
     private var content: some View {
         VStack(spacing: 0) {
-            // Top bar: install slot omitted on native (left spacer keeps the
-            // refresh pinned right, like the PWA's placeholder div).
-            HStack {
-                Spacer()
-                Button(action: { model.refreshWalletData() }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundColor(colors.onField)
-                        .frame(
-                            width: ZinqqDimens.minTouchTarget,
-                            height: ZinqqDimens.minTouchTarget
-                        )
-                }
-                .accessibilityLabel("Refresh")
-            }
-
             // Balance centered in the flexible middle, like the PWA's
             // justify-between column.
             HStack {

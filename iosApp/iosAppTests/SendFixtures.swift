@@ -9,6 +9,9 @@ import Shared
 func classifiedView(
     kind: ClassifiedKind = .invalid,
     bolt11: String? = nil,
+    /// Lowercase hex, BOLT11 only (nil for offers/on-chain/BIP353/invalid) —
+    /// the hash a send dispatch settles on (F1).
+    paymentHash: String? = nil,
     offer: String? = nil,
     amountMsat: UInt64? = nil,
     description: String? = nil,
@@ -23,6 +26,7 @@ func classifiedView(
     ClassifiedView(
         kind: kind,
         bolt11: bolt11,
+        paymentHash: paymentHash,
         offer: offer,
         amountMsat: amountMsat.map { KotlinULong(unsignedLongLong: $0) },
         description: description,
@@ -82,6 +86,13 @@ func maxSendEstimate(
         reserveSats: reserveSats
     )
 }
+
+/// The dispatched invoice's payment hash (lowercase hex, as the core emits it).
+let ourPaymentHash = String(repeating: "aa", count: 32)
+
+/// Some OTHER payment's hash — e.g. one an earlier send's 5-minute outcome cap
+/// abandoned in flight, whose outcome can still land mid-dispatch (F1).
+let foreignPaymentHash = String(repeating: "bb", count: 32)
 
 let testAddress = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 let testBolt11 = "lnbc500n1p3xyzzyfakeinvoicefortestsq3sdwj"

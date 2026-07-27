@@ -74,7 +74,15 @@ sealed interface SendStep {
         val amountMsat: ULong,
         val recipient: String,
         val returnTo: Amount? = null,
-    ) : SendStep
+    ) : SendStep {
+        /**
+         * The hash this send's outcome will carry, when the core knows it
+         * before dispatch: every BOLT11 target, LNURL-fetched invoices
+         * included. `null` for BOLT12 offers, which have no payment hash
+         * until the invoice request yields an invoice — see [applyOutcome].
+         */
+        val paymentHash: String? get() = target.paymentHash
+    }
 
     /** `oc-review`: Amount / Network fee / Total rows plus the drift banner. */
     data class ReviewOnchain(
@@ -91,8 +99,16 @@ sealed interface SendStep {
         val totalSats: ULong get() = amountSats + feeSats
     }
 
-    /** `ln-sending`: dispatched, awaiting the outcome event. */
-    data class Dispatching(val amountMsat: ULong) : SendStep
+    /**
+     * `ln-sending`: dispatched, awaiting the outcome event. [paymentHash] is
+     * the dispatch's own hash when the core knew it before dispatch — the
+     * filter that stops another payment's outcome settling this send. `null`
+     * on the BOLT12 path only (see [applyOutcome]).
+     */
+    data class Dispatching(
+        val amountMsat: ULong,
+        val paymentHash: String? = null,
+    ) : SendStep
 
     /** `oc-success` / `ln-success`: [txid] only for on-chain broadcasts. */
     data class Success(val amountSats: ULong, val txid: String? = null) : SendStep
@@ -399,20 +415,41 @@ fun refreshedExactReview(
     broadcasting = false,
 )
 
-/** The events that settle a dispatched Lightning payment (F1). */
-fun isPaymentOutcome(event: Event): Boolean =
-    event is Event.PaymentSuccessful || event is Event.PaymentFailed
+/**
+ * Whether an outcome event belongs to the dispatch identified by
+ * [dispatchPaymentHash] (F1).
+ *
+ * When the core gave us the dispatch's hash — [ClassifiedView.paymentHash],
+ * populated for every BOLT11 target including LNURL-fetched invoices — only
+ * that hash settles the send. The core's 5-minute cap
+ * ([SEND_OUTCOME_TIMEOUT_MS]) deliberately leaves a timed-out payment in
+ * flight, so without the filter the *next* send inherits the previous
+ * payment's outcome: "sent" for a payment that failed, or the reverse.
+ *
+ * A `null` [dispatchPaymentHash] means the core could not name the hash
+ * before dispatch, which today is the BOLT12 path only — an offer has no
+ * payment hash until the invoice request produces an invoice. Those keep
+ * first-outcome matching (one send is in flight per screen); the alternative
+ * is an offer payment that can never settle.
+ */
+fun isPaymentOutcome(event: Event, dispatchPaymentHash: String?): Boolean = when (event) {
+    is Event.PaymentSuccessful ->
+        dispatchPaymentHash == null || dispatchPaymentHash == event.paymentHash
+    is Event.PaymentFailed ->
+        dispatchPaymentHash == null || dispatchPaymentHash == event.paymentHash
+    else -> false
+}
 
 /**
- * Settle the dispatch step from an outcome event; `null` for events that
- * are not this payment's outcome. The core exposes no FFI to derive our
- * dispatch's payment hash in the shell, so the first outcome after dispatch
- * is taken as ours (one send is in flight per screen).
+ * Settle the dispatch step from an outcome event; `null` for events that are
+ * not this payment's outcome — including an outcome for a *different* payment
+ * hash, which leaves the await waiting (see [isPaymentOutcome]).
  */
-fun applyOutcome(step: SendStep.Dispatching, event: Event): SendStep? = when (event) {
-    is Event.PaymentSuccessful ->
+fun applyOutcome(step: SendStep.Dispatching, event: Event): SendStep? = when {
+    !isPaymentOutcome(event, step.paymentHash) -> null
+    event is Event.PaymentSuccessful ->
         SendStep.Success(amountSats = msatToSatCeil(step.amountMsat.toLong()).toULong())
-    is Event.PaymentFailed -> SendStep.Failure(message = event.reason)
+    event is Event.PaymentFailed -> SendStep.Failure(message = event.reason)
     else -> null
 }
 

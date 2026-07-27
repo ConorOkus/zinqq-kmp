@@ -23,7 +23,6 @@ use lightning::log_info;
 use lightning::sign::EntropySource as _;
 use lightning::types::payment::PaymentHash;
 use lightning::util::logger::Logger as _;
-use lightning::util::ser::Writeable as _;
 use lightning_background_processor::{process_events_async_with_kv_store_sync, GossipSync};
 use lightning_persister::fs_store::FilesystemStore;
 use tokio::runtime::Runtime;
@@ -1729,11 +1728,14 @@ impl Node {
                             });
                         }
                         // U3 (KTD-3 CM semantics): a channel-manager write
-                        // whose bounded VSS attempt failed left a dirty flag;
-                        // this tick retries it without ever blocking the
-                        // background processor.
+                        // whose bounded VSS attempt failed stashed its exact
+                        // bytes; this tick resends THOSE bytes (never a fresh
+                        // encode — a byte-stable retry is what lets a lost
+                        // acknowledgement's 409 be recognised as our own write
+                        // instead of fencing the wallet), without ever blocking
+                        // the background processor.
                         if dual_kv_store.cm_dirty() {
-                            dual_kv_store.retry_cm(channel_manager.encode()).await;
+                            dual_kv_store.retry_cm_pending().await;
                         }
                         // U10: chain-truth reconcile for close records rides
                         // the sync tick (the PWA's onSynced extension point).

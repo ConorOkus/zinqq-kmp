@@ -39,7 +39,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -362,10 +361,23 @@ struct Inner {
     /// `true` once fenced. Watch so the node can halt on the transition.
     fenced: watch::Sender<bool>,
     fenced_flag_path: PathBuf,
-    /// Set when the bounded CM attempt failed; the node's timer tick retries.
-    /// While set, further CM writes skip the remote attempt entirely so the
-    /// background processor is never stalled twice by one outage.
-    cm_dirty: AtomicBool,
+    /// The EXACT bytes whose bounded CM attempt failed; the node's timer tick
+    /// resends this buffer verbatim. While set, further CM writes skip the
+    /// remote attempt entirely so the background processor is never stalled
+    /// twice by one outage.
+    ///
+    /// Stashing the bytes (rather than a "dirty" flag plus a fresh encode at
+    /// retry time) is what keeps the fence honest: a lost acknowledgement — the
+    /// server applied the put but the response died on a mobile connection —
+    /// makes the retry a 409, and only a BYTE-IDENTICAL resend lets the
+    /// content-compare recognise our own write instead of reading a
+    /// meanwhile-advanced manager as another client's divergence. Resending an
+    /// older buffer can leave the remote channel manager behind local, which is
+    /// explicitly benign in this design (monitors are authoritative and LDK
+    /// replays a stale manager against them; the next ordinary CM persist
+    /// pushes newer state) — strictly better than a false fence, which bricks
+    /// the wallet until a restore.
+    cm_pending: Mutex<Option<Vec<u8>>>,
     /// Whether `listKeyVersions` returned empty this session — the only state
     /// in which version-0 first writes of fund-critical fixed keys are
     /// expected (KTD-3). Recorded for diagnostics; the write path itself is
@@ -667,10 +679,22 @@ impl Inner {
         }
     }
 
+    /// Records `bytes` as the buffer the timer tick must resend VERBATIM (see
+    /// [`Inner::cm_pending`] — byte-stable retries are what make the 409
+    /// content-compare able to recognise our own committed write).
+    fn stash_cm_pending(&self, bytes: &[u8]) {
+        *self.cm_pending.lock().unwrap() = Some(bytes.to_vec());
+    }
+
+    fn clear_cm_pending(&self) {
+        *self.cm_pending.lock().unwrap() = None;
+    }
+
     /// Bounded single CM attempt (KTD-3 channel-manager semantics): one put
-    /// within `cm_attempt_timeout`; failure sets the dirty flag for the timer
-    /// tick; 409 gets the content-compare fence treatment (CM is
-    /// fund-critical).
+    /// within `cm_attempt_timeout`; failure stashes these exact bytes for the
+    /// timer tick to resend; 409 gets the content-compare fence treatment (CM
+    /// is fund-critical) — except when the remote content IS what we were
+    /// putting, which means our own put landed and only the response was lost.
     async fn cm_remote_attempt(&self, bytes: &[u8]) {
         let Some(remote) = self.remote.as_ref() else {
             return;
@@ -685,14 +709,17 @@ impl Inner {
         {
             Ok(Ok(new_version)) => {
                 self.record_version(CHANNEL_MANAGER_VSS_KEY, new_version);
-                self.cm_dirty.store(false, Ordering::Release);
+                self.clear_cm_pending();
             }
             Ok(Err(VssError::Conflict { .. })) => {
                 match tokio::time::timeout(timeout, remote.get(CHANNEL_MANAGER_VSS_KEY)).await {
                     Ok(Ok(Some((remote_bytes, remote_version)))) => {
                         self.record_version(CHANNEL_MANAGER_VSS_KEY, remote_version);
                         if remote_bytes == bytes {
-                            self.cm_dirty.store(false, Ordering::Release);
+                            // Our own write landed (a first attempt racing
+                            // itself, or a lost acknowledgement whose retry
+                            // resent the SAME bytes): nothing diverged.
+                            self.clear_cm_pending();
                             log_info!(
                                 self.logger,
                                 "channel_manager 409 resolved: identical content at server \
@@ -707,32 +734,32 @@ impl Inner {
                     }
                     Ok(Ok(None)) => {
                         self.record_version(CHANNEL_MANAGER_VSS_KEY, 0);
-                        self.cm_dirty.store(true, Ordering::Release);
+                        self.stash_cm_pending(bytes);
                     }
                     other => {
-                        self.cm_dirty.store(true, Ordering::Release);
+                        self.stash_cm_pending(bytes);
                         log_error!(
                             self.logger,
-                            "channel_manager 409 refetch failed ({other:?}); marked dirty for \
-                             the tick retry"
+                            "channel_manager 409 refetch failed ({other:?}); these bytes stay \
+                             pending for the tick retry"
                         );
                     }
                 }
             }
             Ok(Err(e)) => {
-                self.cm_dirty.store(true, Ordering::Release);
+                self.stash_cm_pending(bytes);
                 log_error!(
                     self.logger,
-                    "Bounded channel_manager VSS attempt failed: {e}; marked dirty for the tick \
-                     retry (local write proceeds)"
+                    "Bounded channel_manager VSS attempt failed: {e}; these bytes stay pending \
+                     for the tick retry (local write proceeds)"
                 );
             }
             Err(_elapsed) => {
-                self.cm_dirty.store(true, Ordering::Release);
+                self.stash_cm_pending(bytes);
                 log_error!(
                     self.logger,
-                    "Bounded channel_manager VSS attempt timed out after {timeout:?}; marked \
-                     dirty for the tick retry (local write proceeds)"
+                    "Bounded channel_manager VSS attempt timed out after {timeout:?}; these bytes \
+                     stay pending for the tick retry (local write proceeds)"
                 );
             }
         }
@@ -855,7 +882,7 @@ impl VssBackedStore {
                 completion: OnceLock::new(),
                 fenced,
                 fenced_flag_path,
-                cm_dirty: AtomicBool::new(false),
+                cm_pending: Mutex::new(None),
                 probe_empty,
             }),
         }
@@ -904,9 +931,9 @@ impl VssBackedStore {
         self.inner.probe_empty
     }
 
-    /// Whether a bounded CM attempt failed and awaits the tick retry.
+    /// Whether a bounded CM attempt failed and its bytes await the tick retry.
     pub(crate) fn cm_dirty(&self) -> bool {
-        self.inner.cm_dirty.load(Ordering::Acquire)
+        self.inner.cm_pending.lock().unwrap().is_some()
     }
 
     /// The current cached version for `key` (test/diagnostic surface).
@@ -981,7 +1008,7 @@ impl VssBackedStore {
         if self.inner.remote.is_none() || self.inner.is_fenced() {
             return;
         }
-        if self.inner.cm_dirty.load(Ordering::Acquire) {
+        if self.cm_dirty() {
             return;
         }
         let inner = Arc::clone(&self.inner);
@@ -991,9 +1018,13 @@ impl VssBackedStore {
         });
     }
 
-    /// Async CM attempt for the timer tick's dirty retry.
-    pub(crate) async fn cm_remote_write_async(&self, bytes: &[u8]) {
-        self.inner.cm_remote_attempt(bytes).await;
+    /// The timer tick's retry: re-attempts the STASHED buffer verbatim (see
+    /// [`Inner::cm_pending`]). No-op when nothing is pending.
+    pub(crate) async fn cm_retry_pending(&self) {
+        let Some(bytes) = self.inner.cm_pending.lock().unwrap().clone() else {
+            return;
+        };
+        self.inner.cm_remote_attempt(&bytes).await;
     }
 
     /// Whole-blob LWW write (serialized per key, spawned): `_known_peers`
@@ -1221,26 +1252,23 @@ impl DualWriteKvStore {
         Self { vss, local }
     }
 
-    /// Whether a CM write failed remotely and awaits the tick retry.
+    /// Whether a CM write failed remotely and its bytes await the tick retry.
     pub(crate) fn cm_dirty(&self) -> bool {
         self.vss.cm_dirty()
     }
 
-    /// The timer tick's dirty retry: remote attempt then local refresh, both
-    /// bounded, never blocking the event loop beyond one attempt.
-    pub(crate) async fn retry_cm(&self, bytes: Vec<u8>) {
-        self.vss.cm_remote_write_async(&bytes).await;
-        if let Err(e) = self.local.write(
-            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-            CHANNEL_MANAGER_PERSISTENCE_KEY,
-            bytes,
-        ) {
-            log_error!(
-                Logger,
-                "Local channel_manager write on tick retry failed: {e}"
-            );
-        }
+    /// The timer tick's retry: one bounded remote attempt with the buffer whose
+    /// put failed, resent VERBATIM so a lost acknowledgement's 409
+    /// content-compare recognises our own write instead of fencing (see
+    /// [`VssBackedStore::cm_retry_pending`]). Never blocks the event loop
+    /// beyond that one attempt.
+    ///
+    /// The local store needs no refresh here: [`KVStoreSync::write`] always
+    /// persists the channel manager locally (VSS failures never gate it), so
+    /// LOCAL already holds state at least as new as the pending buffer — and
+    /// writing the older pending bytes back would roll it BACKWARDS.
+    pub(crate) async fn retry_cm_pending(&self) {
+        self.vss.cm_retry_pending().await;
     }
 }
 
@@ -1298,6 +1326,8 @@ impl KVStoreSync for DualWriteKvStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::vss::test_support::MockTransport;
 
@@ -1780,19 +1810,124 @@ mod tests {
             .unwrap();
         assert_eq!(h.transport.put_attempt_count(), attempts);
 
-        // The tick retry converges once VSS recovers.
+        // The tick retry converges once VSS recovers: it resends the STASHED
+        // buffer (cm-v1), which can leave the remote manager behind local —
+        // benign by design (monitors are authoritative; LDK replays a stale
+        // manager) and strictly better than risking a false fence.
         h.transport.fail_puts.store(false, Ordering::SeqCst);
-        h.rt.block_on(dual.retry_cm(b"cm-v3".to_vec()));
+        h.rt.block_on(dual.retry_cm_pending());
         assert!(!dual.cm_dirty());
         assert_eq!(
             h.transport.value(CHANNEL_MANAGER_VSS_KEY).unwrap().0,
-            b"cm-v3".to_vec()
+            b"cm-v1".to_vec(),
+            "the retry resends the exact bytes whose put failed"
         );
         assert_eq!(
             h.local
                 .read("", "", CHANNEL_MANAGER_PERSISTENCE_KEY)
                 .unwrap(),
+            b"cm-v2".to_vec(),
+            "the tick retry never rolls the LOCAL manager back"
+        );
+
+        // And the next ordinary CM persist pushes the newer state remotely.
+        dual.write("", "", CHANNEL_MANAGER_PERSISTENCE_KEY, b"cm-v3".to_vec())
+            .unwrap();
+        assert_eq!(
+            h.transport.value(CHANNEL_MANAGER_VSS_KEY).unwrap().0,
             b"cm-v3".to_vec()
+        );
+    }
+
+    /// The lost-acknowledgement seam: the server APPLIES the CM put but the
+    /// response never reaches us, the CM advances locally, and the tick retry
+    /// then hits a 409. The retry must resend the bytes whose put failed — so
+    /// the content-compare recognises OUR OWN write and short-circuits —
+    /// instead of a fresh encode, which would look divergent and fence a
+    /// wallet no second client ever touched.
+    #[test]
+    fn cm_lost_acknowledgement_retry_recognises_our_own_write_and_never_fences() {
+        let h = harness();
+        let dual = DualWriteKvStore::new(Arc::clone(&h.store), Arc::clone(&h.local));
+
+        // The put lands server-side; the client sees a dropped connection.
+        h.transport
+            .commit_then_fail_for(CHANNEL_MANAGER_VSS_KEY, true);
+        dual.write("", "", CHANNEL_MANAGER_PERSISTENCE_KEY, b"cm-v1".to_vec())
+            .unwrap();
+        assert!(dual.cm_dirty(), "the lost ack leaves the CM pending");
+        assert_eq!(
+            h.transport.value(CHANNEL_MANAGER_VSS_KEY).unwrap(),
+            (b"cm-v1".to_vec(), 1),
+            "the mock models a COMMITTED put with a lost response"
+        );
+
+        // The channel manager advances while pending (the remote attempt is
+        // skipped, so nothing tells the server about cm-v2).
+        dual.write("", "", CHANNEL_MANAGER_PERSISTENCE_KEY, b"cm-v2".to_vec())
+            .unwrap();
+
+        // Connectivity returns and the sync tick retries.
+        h.transport
+            .commit_then_fail_for(CHANNEL_MANAGER_VSS_KEY, false);
+        let attempts_before_retry = h.transport.put_attempts_for(CHANNEL_MANAGER_VSS_KEY);
+        h.rt.block_on(dual.retry_cm_pending());
+
+        assert!(
+            !h.store.is_fenced(),
+            "a lost acknowledgement must NEVER fence: no second client wrote"
+        );
+        assert_eq!(h.sink.fenced_count(), 0, "no Fenced event may be emitted");
+        assert!(
+            !h.storage_dir.join(FENCED_FLAG_FILE_NAME).exists(),
+            "no durable fenced flag may be written"
+        );
+        assert!(
+            !dual.cm_dirty(),
+            "the pending buffer clears on the 409 match"
+        );
+        assert_eq!(
+            h.transport.put_attempts_for(CHANNEL_MANAGER_VSS_KEY),
+            attempts_before_retry + 1,
+            "exactly one put per retry attempt; nothing is written after a 409"
+        );
+        assert_eq!(
+            h.local
+                .read("", "", CHANNEL_MANAGER_PERSISTENCE_KEY)
+                .unwrap(),
+            b"cm-v2".to_vec(),
+            "resending older bytes must never roll the LOCAL manager back"
+        );
+    }
+
+    /// The hardening must not disarm the real protection: when the remote blob
+    /// is neither the current NOR the pending buffer (another client wrote),
+    /// the retry's 409 still fences.
+    #[test]
+    fn cm_conflict_with_a_third_party_blob_still_fences_on_the_pending_retry() {
+        let h = harness();
+        let dual = DualWriteKvStore::new(Arc::clone(&h.store), Arc::clone(&h.local));
+
+        // A transient failure (nothing committed) leaves cm-v1 pending.
+        h.transport.fail_puts_for(CHANNEL_MANAGER_VSS_KEY, true);
+        dual.write("", "", CHANNEL_MANAGER_PERSISTENCE_KEY, b"cm-v1".to_vec())
+            .unwrap();
+        assert!(dual.cm_dirty());
+        h.transport.fail_puts_for(CHANNEL_MANAGER_VSS_KEY, false);
+
+        // Another client writes its own channel manager, and ours advances.
+        h.transport.seed(CHANNEL_MANAGER_VSS_KEY, b"their-cm", 7);
+        dual.write("", "", CHANNEL_MANAGER_PERSISTENCE_KEY, b"cm-v2".to_vec())
+            .unwrap();
+
+        h.rt.block_on(dual.retry_cm_pending());
+
+        assert!(h.store.is_fenced(), "genuine divergence must still fence");
+        assert_eq!(h.sink.fenced_count(), 1);
+        assert_eq!(
+            h.transport.value(CHANNEL_MANAGER_VSS_KEY).unwrap().0,
+            b"their-cm".to_vec(),
+            "the other client's CM is never overwritten"
         );
     }
 

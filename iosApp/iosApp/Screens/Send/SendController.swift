@@ -39,16 +39,26 @@ protocol SendPort: AnyObject {
     func onchainBalanceSats() -> UInt64
 }
 
-/// Race the first payment outcome on `events` against the 5-minute cap;
-/// `nil` means the cap fired first (Android's `withTimeoutOrNull` +
-/// `first { isPaymentOutcome(it) }`).
+/// Race OUR payment's outcome on `events` against the 5-minute cap; `nil`
+/// means the cap fired first (Android's `withTimeoutOrNull` +
+/// `first { isOurPaymentOutcome(...) }`).
+///
+/// `awaitedPaymentHash` is the dispatched invoice's hash when the core knows
+/// one: an outcome for a DIFFERENT payment — e.g. one an earlier send's
+/// 5-minute cap abandoned in flight — is ignored and the await keeps waiting.
+/// A nil hash (BOLT12, which has none before the invoice request) keeps
+/// first-outcome matching.
 func firstPaymentOutcome(
     in events: AsyncStream<WalletEvent>,
+    awaitedPaymentHash: String?,
     timeoutMs: UInt64
 ) async -> WalletEvent? {
     await withTaskGroup(of: WalletEvent?.self) { group in
         group.addTask {
-            for await event in events where isPaymentOutcome(event) { return event }
+            for await event in events
+            where isOurPaymentOutcome(awaitedPaymentHash: awaitedPaymentHash, event: event) {
+                return event
+            }
             return nil
         }
         group.addTask {
@@ -216,7 +226,16 @@ final class SendController: ObservableObject {
             // missed (the stream's sink registers synchronously here).
             let events = self.port.walletEvents
             let timeoutMs = self.outcomeTimeoutMs
-            let outcome = Task { await firstPaymentOutcome(in: events, timeoutMs: timeoutMs) }
+            // Only THIS invoice's outcome settles the dispatch (F1); a BOLT12
+            // offer has no hash yet, so that path keeps first-outcome matching.
+            let awaitedPaymentHash = review.awaitedPaymentHash
+            let outcome = Task {
+                await firstPaymentOutcome(
+                    in: events,
+                    awaitedPaymentHash: awaitedPaymentHash,
+                    timeoutMs: timeoutMs
+                )
+            }
             do {
                 // The amount override is REQUIRED for amountless requests and
                 // REJECTED otherwise (core U6 matrix) — key off the embedded
@@ -242,7 +261,12 @@ final class SendController: ObservableObject {
             }
             let event = await outcome.value
             guard !Task.isCancelled else { return }
-            if let event, let settled = applyOutcome(amountMsat: review.amountMsat, event: event) {
+            if let event,
+               let settled = applyOutcome(
+                   awaitedPaymentHash: awaitedPaymentHash,
+                   amountMsat: review.amountMsat,
+                   event: event
+               ) {
                 self.step = settled
             } else {
                 self.step = outcomeTimedOut(amountMsat: review.amountMsat)

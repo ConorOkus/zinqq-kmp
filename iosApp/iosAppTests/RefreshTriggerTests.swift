@@ -14,7 +14,7 @@ final class RefreshTriggerTests: XCTestCase {
                 .paymentReceived(paymentHash: "hash", amountMsat: 1_000, skimmedFeeMsat: nil)
             )
         )
-        XCTAssertTrue(shouldRefreshWalletData(.paymentSuccessful))
+        XCTAssertTrue(shouldRefreshWalletData(.paymentSuccessful(paymentHash: "hash")))
         XCTAssertTrue(shouldRefreshWalletData(.channelReady))
         XCTAssertTrue(shouldRefreshWalletData(.sweepStateChanged))
         XCTAssertTrue(shouldRefreshWalletData(.recoveryStateChanged))

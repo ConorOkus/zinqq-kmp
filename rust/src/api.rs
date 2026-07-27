@@ -274,6 +274,15 @@ pub struct ClassifiedView {
     pub kind: ClassifiedKind,
     /// The BOLT11 string to hand back to `send_bolt11` (kind = Bolt11).
     pub bolt11: Option<String>,
+    /// The invoice's payment hash as lowercase hex (kind = Bolt11 only), so a
+    /// shell can match `PaymentSuccessful`/`PaymentFailed` to the dispatch it
+    /// is waiting on instead of settling on whichever outcome arrives first —
+    /// which lets a previously timed-out payment steal a later send's result.
+    ///
+    /// `None` for every other kind, BOLT12 included: an offer has no payment
+    /// hash until the invoice request produces an invoice, so BOLT12 sends keep
+    /// first-outcome matching in the shells.
+    pub payment_hash: Option<String>,
     /// The BOLT12 offer string to hand back to `pay_offer` (kind = Bolt12).
     pub offer: Option<String>,
     /// Embedded Lightning amount; `None` means the shells collect one.
@@ -330,6 +339,7 @@ fn empty_view(kind: ClassifiedKind) -> ClassifiedView {
     ClassifiedView {
         kind,
         bolt11: None,
+        payment_hash: None,
         offer: None,
         amount_msat: None,
         description: None,
@@ -361,11 +371,13 @@ fn classified_view(classified: &Classified) -> ClassifiedView {
             raw,
             amount_msat,
             description,
+            payment_hash,
         } => {
             view.kind = ClassifiedKind::Bolt11;
             view.bolt11 = Some(raw.clone());
             view.amount_msat = *amount_msat;
             view.description = description.clone();
+            view.payment_hash = Some(payment_hash.clone());
         }
         Classified::Bolt12 {
             raw,
@@ -1494,6 +1506,7 @@ impl Wallet {
 mod tests {
     use super::*;
     use std::str::FromStr as _;
+    use std::time::Duration;
 
     use crate::config::{
         DEFAULT_ESPLORA_URL, DEFAULT_EXPLORER_URL, DEFAULT_RGS_URL, DEFAULT_VSS_URL,
@@ -1609,6 +1622,125 @@ mod tests {
             view.address.as_deref(),
             Some("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
         );
+    }
+
+    /// A fixed mainnet BOLT11 invoice built at `CLASSIFY_NOW` whose payment
+    /// hash is the sha256 of a known preimage.
+    fn fixed_bolt11() -> String {
+        use bitcoin::hashes::{sha256, Hash as _};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+
+        let secret = SecretKey::from_slice(&[0x3c; 32]).unwrap();
+        InvoiceBuilder::new(Currency::Bitcoin)
+            .description("payment hash pin".to_string())
+            .payment_hash(sha256::Hash::hash(PREIMAGE))
+            .payment_secret(PaymentSecret([0x22; 32]))
+            .duration_since_epoch(Duration::from_secs(CLASSIFY_NOW))
+            .min_final_cltv_expiry_delta(144)
+            .expiry_time(Duration::from_secs(3_600))
+            .amount_milli_satoshis(21_000)
+            .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &secret))
+            .unwrap()
+            .to_string()
+    }
+
+    const PREIMAGE: &[u8] = b"zinqq-kmp classified-view payment hash preimage";
+    const CLASSIFY_NOW: u64 = 1_753_000_000;
+
+    /// The shells need THEIR dispatch's payment hash to match the public
+    /// `PaymentSuccessful`/`PaymentFailed` events to the send they are waiting
+    /// on; the classified view is where they learn it.
+    #[test]
+    fn classified_view_exposes_the_bolt11_payment_hash_as_lowercase_hex() {
+        use bitcoin::hashes::{sha256, Hash as _};
+        use lightning_invoice::Bolt11Invoice;
+
+        let raw = fixed_bolt11();
+        let view = classified_view(&crate::send::classify_at(
+            &raw,
+            Duration::from_secs(CLASSIFY_NOW + 60),
+        ));
+        assert_eq!(view.kind, ClassifiedKind::Bolt11);
+
+        // Independent computation 1: the preimage's sha256.
+        let expected = crate::util::hex_str(sha256::Hash::hash(PREIMAGE).as_byte_array());
+        assert_eq!(view.payment_hash.as_deref(), Some(expected.as_str()));
+        // Independent computation 2: re-decoding the invoice string.
+        assert_eq!(
+            view.payment_hash.as_deref(),
+            Some(
+                crate::util::hex_str(
+                    Bolt11Invoice::from_str(&raw)
+                        .unwrap()
+                        .payment_hash()
+                        .as_byte_array()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            view.payment_hash.as_deref().unwrap(),
+            view.payment_hash.as_deref().unwrap().to_lowercase(),
+            "the hex is lowercase, matching the event payload format"
+        );
+
+        // A BIP321 URI whose preferred arm is the invoice carries it too.
+        let uri_view = classified_view(&crate::send::classify_at(
+            &format!("bitcoin:bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq?lightning={raw}"),
+            Duration::from_secs(CLASSIFY_NOW + 60),
+        ));
+        assert_eq!(uri_view.kind, ClassifiedKind::Bolt11);
+        assert_eq!(uri_view.payment_hash.as_deref(), Some(expected.as_str()));
+    }
+
+    /// Every non-BOLT11 kind leaves `payment_hash` unset — a BOLT12 offer has
+    /// no payment hash before the invoice request, so those sends keep
+    /// first-outcome matching in the shells.
+    #[test]
+    fn classified_view_has_no_payment_hash_for_offers_or_onchain() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use lightning::offers::offer::OfferBuilder;
+
+        let secp = Secp256k1::new();
+        let signing_key =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x3c; 32]).unwrap());
+        let offer = OfferBuilder::new(signing_key)
+            .description("test offer".to_string())
+            .amount_msats(21_000)
+            .build()
+            .unwrap()
+            .to_string();
+        let view = classified_view(&crate::send::classify_at(
+            &offer,
+            Duration::from_secs(CLASSIFY_NOW),
+        ));
+        assert_eq!(view.kind, ClassifiedKind::Bolt12);
+        assert_eq!(
+            view.payment_hash, None,
+            "an offer has no payment hash until the invoice request"
+        );
+
+        let view = classified_view(&crate::send::classify_at(
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+            Duration::from_secs(CLASSIFY_NOW),
+        ));
+        assert_eq!(view.kind, ClassifiedKind::Onchain);
+        assert_eq!(view.payment_hash, None);
+
+        let view = classified_view(&crate::send::classify_at(
+            "alice@example.com",
+            Duration::from_secs(CLASSIFY_NOW),
+        ));
+        assert_eq!(view.kind, ClassifiedKind::Bip353);
+        assert_eq!(view.payment_hash, None);
+
+        let view = classified_view(&crate::send::classify_at(
+            "definitely not a payment",
+            Duration::from_secs(CLASSIFY_NOW),
+        ));
+        assert_eq!(view.kind, ClassifiedKind::Invalid);
+        assert_eq!(view.payment_hash, None);
     }
 
     /// U6: the LNURL view round-trips through the FFI record (hash included)

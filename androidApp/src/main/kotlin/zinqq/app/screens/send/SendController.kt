@@ -193,11 +193,17 @@ class SendController(
         val review = _step.value as? SendStep.ReviewLightning ?: return
         job?.cancel()
         job = scope.launch {
-            _step.value = SendStep.Dispatching(review.amountMsat)
+            // Our dispatch's hash, when the core named it before dispatch
+            // (BOLT11 and LNURL-fetched invoices; null for BOLT12 offers).
+            // Outcomes carrying any other hash are not ours — a previous
+            // send that outlived its 5-minute cap is still in flight and
+            // must not settle this one (F1).
+            val dispatchHash = review.paymentHash
+            _step.value = SendStep.Dispatching(review.amountMsat, dispatchHash)
             // Subscribe BEFORE dispatch so an instant outcome cannot be missed.
             val outcome = async(start = CoroutineStart.UNDISPATCHED) {
                 withTimeoutOrNull(outcomeTimeoutMs) {
-                    port.walletEvents.first { isPaymentOutcome(it) }
+                    port.walletEvents.first { isPaymentOutcome(it, dispatchHash) }
                 }
             }
             try {
@@ -220,7 +226,7 @@ class SendController(
                 return@launch
             }
             val event = outcome.await()
-            val dispatching = SendStep.Dispatching(review.amountMsat)
+            val dispatching = SendStep.Dispatching(review.amountMsat, dispatchHash)
             _step.value = event?.let { applyOutcome(dispatching, it) }
                 ?: outcomeTimedOut(dispatching)
         }

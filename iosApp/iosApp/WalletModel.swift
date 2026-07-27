@@ -22,8 +22,14 @@ enum WalletEvent {
     case invoiceReady(bolt11: String, expiryUnixSecs: UInt64)
     /// `paymentHash` lets the Receive visit settle only on ITS invoice (U21).
     case paymentReceived(paymentHash: String, amountMsat: UInt64, skimmedFeeMsat: UInt64?)
-    case paymentSuccessful
-    case paymentFailed(reason: String)
+    /// `paymentHash` lets the Send dispatch settle only on ITS payment (F1):
+    /// the core's 5-minute outcome cap deliberately leaves a timed-out payment
+    /// in flight, so without the hash the next send inherits the previous
+    /// payment's outcome. Always present for a successful outbound payment.
+    case paymentSuccessful(paymentHash: String)
+    /// `paymentHash` is nil for a BOLT12 payment that failed before an invoice
+    /// arrived (there is no hash yet) — see `Event.PaymentFailed`.
+    case paymentFailed(paymentHash: String?, reason: String)
     case channelPending
     case channelReady
     case lsps2Failed(reason: String)
@@ -61,10 +67,12 @@ enum WalletEvent {
                 amountMsat: e.amountMsat,
                 skimmedFeeMsat: e.skimmedFeeMsat?.uint64Value
             )
-        case is Event.PaymentSuccessful:
-            return .paymentSuccessful
+        case let e as Event.PaymentSuccessful:
+            return .paymentSuccessful(paymentHash: e.paymentHash)
         case let e as Event.PaymentFailed:
-            return .paymentFailed(reason: e.reason)
+            // payment_hash is Option<String> in Rust (nil for a BOLT12
+            // failure before the invoice request produced an invoice).
+            return .paymentFailed(paymentHash: e.paymentHash, reason: e.reason)
         case is Event.ChannelPending:
             return .channelPending
         case is Event.ChannelReady:
@@ -122,6 +130,27 @@ extension Wallet: WalletEventSource {
     func ackEvent() async throws {
         try eventHandled()
     }
+}
+
+// MARK: - Lifecycle seam
+
+/// Minimal seam over the generated Wallet's two blocking lifecycle calls: the
+/// serialized start/stop chain consumes only this protocol, so the ordering
+/// regression test can drive rapid background→foreground flips against a fake
+/// node instead of the real FFI — the same seam discipline as
+/// `WalletEventSource` above.
+protocol WalletLifecycle: AnyObject {
+    /// Blocking `start()`; raises the typed `AlreadyRunning` when the core's
+    /// state mutex finds the node already up.
+    func startNode() throws
+    /// Blocking `stop()` (up to ~20 s while the channel manager persists);
+    /// raises the typed `NotRunning` when the node is already down.
+    func stopNode() throws
+}
+
+extension Wallet: WalletLifecycle {
+    func startNode() throws { try start() }
+    func stopNode() throws { try stop() }
 }
 
 // MARK: - Model
@@ -195,7 +224,22 @@ final class WalletModel: ObservableObject {
     }
 
     private var wallet: Wallet?
+    /// The lifecycle state the SHELL wants, set before each blocking
+    /// transition (never after it) so a transition that interleaves with a
+    /// blocking one observes it instead of being swallowed.
     private var startRequested = false
+    /// Whether the app is backgrounded right now (KTD-10 foreground-only
+    /// node). Injected so the lifecycle-ordering test can drive the
+    /// foreground-only invariant without reaching into UIKit.
+    private let isBackgrounded: () -> Bool
+
+    init(
+        isBackgrounded: @escaping () -> Bool = {
+            UIApplication.shared.applicationState == .background
+        }
+    ) {
+        self.isBackgrounded = isBackgrounded
+    }
 
     // MARK: Live event rebroadcast (U20)
 
@@ -222,6 +266,21 @@ final class WalletModel: ObservableObject {
 
     // MARK: Lifecycle (KTD-10: foreground-only node)
 
+    /// The one serialized lifecycle chain (Android's `lifecycleJob` twin, and
+    /// the same chaining discipline `scheduleEventLoop` uses for the event
+    /// loop). Every start, stop and restore enqueues onto it, so two
+    /// transitions can never reach the core's state mutex out of order: on a
+    /// quick background→foreground flip they serialize instead of racing.
+    ///
+    /// Unordered detached tasks (what this replaced) let a start land while an
+    /// in-flight stop was still draining — the start then saw `AlreadyRunning`
+    /// and the stop finished afterwards, leaving a foregrounded app with a
+    /// stopped node and no further trigger to restart it; the inverse left a
+    /// running node with `startRequested == false`, which made the next
+    /// `stop()` return early and vanish. Internal so the ordering regression
+    /// test can await the chain's completion.
+    private(set) var lifecycleTask: Task<Void, Never>?
+
     /// Called on scenePhase .active. Starts the node and schedules the event
     /// loop; peer reconnect after a suspend is the core's job.
     func start() {
@@ -230,32 +289,31 @@ final class WalletModel: ObservableObject {
         // stopped-only restore() fail with AlreadyRunning (U22, F3).
         if case .inProgress = restore { return }
         guard !startRequested else { return }
+        let wallet: Wallet
+        do {
+            wallet = try ensureWallet()
+        } catch {
+            lastOutcome = "Start failed: \(error.localizedDescription)"
+            startError = error.localizedDescription
+            return
+        }
+        startNode(wallet, eventSource: wallet)
+    }
+
+    /// `start()`'s seam-taking half: enqueue the blocking start on the
+    /// lifecycle chain. Internal so the ordering regression test can drive
+    /// rapid start/stop sequences against a fake node.
+    func startNode(_ lifecycle: WalletLifecycle, eventSource: WalletEventSource) {
+        guard !startRequested else { return }
+        // Requested BEFORE the blocking start, not after it: a `stop()` that
+        // interleaves must be able to SEE a start in flight, otherwise its
+        // `guard startRequested` early-returns and the stop is swallowed —
+        // leaving a headless node running in the background.
         startRequested = true
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let wallet = try self.ensureWallet()
-                // start() is a blocking FFI call — run it off the MainActor.
-                try await Self.runBlockingFFI { try wallet.start() }
-                self.startError = nil
-                self.refreshWalletData()
-                // Single-consumer contract (the U19 P2 fix): the loop is only
-                // ever (re)scheduled after a successful start, and scheduling
-                // chains onto the previous run instead of cancelling it.
-                self.scheduleEventLoop(wallet)
-            } catch {
-                self.startRequested = false
-                if Self.isFencedError(error) {
-                    // The durable fence survives restart (KTD-3): a fenced
-                    // wallet refuses to start, so the shell re-raises the
-                    // fenced screen even though no Event.Fenced will arrive
-                    // on this run (U18).
-                    self.fenced = true
-                } else {
-                    self.lastOutcome = "Start failed: \(error.localizedDescription)"
-                    self.startError = error.localizedDescription
-                }
-            }
+        let previous = lifecycleTask
+        lifecycleTask = Task { [weak self] in
+            await previous?.value
+            await self?.runStart(lifecycle, eventSource: eventSource)
         }
     }
 
@@ -265,10 +323,101 @@ final class WalletModel: ObservableObject {
     /// persists, so it runs off the MainActor under a UIApplication background
     /// task assertion — otherwise iOS could suspend the process mid-persist.
     func stop() {
-        guard startRequested, let wallet else { return }
+        guard let wallet else { return }
+        stopNode(wallet)
+    }
+
+    /// `stop()`'s seam-taking half. Internal for the ordering regression test.
+    func stopNode(_ lifecycle: WalletLifecycle) {
+        guard startRequested else { return }
         startRequested = false
+        // Taken HERE, synchronously on the transition — begun after the
+        // chain's awaits instead, iOS could already have suspended us.
+        let endAssertion = beginStopAssertion()
+        let previous = lifecycleTask
+        lifecycleTask = Task { [weak self] in
+            // Order behind a start still inside its blocking FFI so the core's
+            // state mutex sees the two transitions in the order the scene
+            // phases requested them.
+            await previous?.value
+            await self?.runStop(lifecycle)
+            endAssertion()
+        }
+    }
+
+    /// The serialized start body: the blocking FFI, then a re-read of the
+    /// world it returned into.
+    private func runStart(
+        _ lifecycle: WalletLifecycle,
+        eventSource: WalletEventSource
+    ) async {
+        do {
+            // start() is a blocking FFI call — run it off the MainActor.
+            try await Self.runBlockingFFI { try lifecycle.startNode() }
+        } catch {
+            if Self.isAlreadyRunningError(error) {
+                // A no-op success, exactly like Android's `startCore`: the
+                // node is up, which is all this call wanted. Clearing
+                // `startRequested` on this benign race (a foreground flip that
+                // lands while the previous stop still drains) would strand a
+                // stopped node with no trigger until the next transition.
+            } else {
+                startRequested = false
+                if Self.isFencedError(error) {
+                    // The durable fence survives restart (KTD-3): a fenced
+                    // wallet refuses to start, so the shell re-raises the
+                    // fenced screen even though no Event.Fenced will arrive
+                    // on this run (U18).
+                    fenced = true
+                } else {
+                    lastOutcome = "Start failed: \(error.localizedDescription)"
+                    startError = error.localizedDescription
+                }
+                return
+            }
+        }
+        startError = nil
+        // Single-consumer contract (the U19 P2 fix): the loop is only ever
+        // (re)scheduled after a successful start, and scheduling chains onto
+        // the previous run instead of cancelling it. Scheduled BEFORE the
+        // re-check below so a compensating stop's terminal NodeStopped has a
+        // live consumer to drain it.
+        scheduleEventLoop(eventSource)
+        // The blocking start just held this decision for seconds: if a stop
+        // was requested meanwhile, or the app went to background (a scenePhase
+        // stop that `stop()` dropped because the start had not landed yet),
+        // that wins — otherwise a node keeps running headless against the
+        // foreground-only invariant the persistence design assumes (KTD-10).
+        if !startRequested || isBackgrounded() {
+            startRequested = false
+            let endAssertion = beginStopAssertion()
+            await runStop(lifecycle)
+            endAssertion()
+            return
+        }
+        refreshWalletData()
+    }
+
+    /// The serialized stop body. `NotRunning` is a no-op success: the
+    /// post-start re-check above may already have drained the node, and a
+    /// user-visible "Stop failed" for that would be noise.
+    private func runStop(_ lifecycle: WalletLifecycle) async {
+        do {
+            try await Self.runBlockingFFI { try lifecycle.stopNode() }
+        } catch {
+            guard !(kotlinThrowable(error) is WalletException.NotRunning) else { return }
+            lastOutcome = "Stop failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// A UIApplication background-task assertion held across a blocking stop,
+    /// returning its (idempotent) ender. Must be begun synchronously on the
+    /// transition — the stop itself can block ~20s while the channel manager
+    /// persists, and without the assertion iOS could suspend the process
+    /// mid-persist.
+    private func beginStopAssertion() -> () -> Void {
         var assertion = UIBackgroundTaskIdentifier.invalid
-        func endAssertion() {
+        let endAssertion: () -> Void = {
             guard assertion != .invalid else { return }
             UIApplication.shared.endBackgroundTask(assertion)
             assertion = .invalid
@@ -278,14 +427,7 @@ final class WalletModel: ObservableObject {
             // stop() is not interruptible — just release the token.
             endAssertion()
         }
-        Task { [weak self] in
-            do {
-                try await Self.runBlockingFFI { try wallet.stop() }
-            } catch {
-                self?.lastOutcome = "Stop failed: \(error.localizedDescription)"
-            }
-            endAssertion()
-        }
+        return endAssertion
     }
 
     // MARK: Wallet-data queries (U19)
@@ -446,7 +588,7 @@ final class WalletModel: ObservableObject {
             }
         case .paymentSuccessful:
             lastOutcome = "Payment sent"
-        case let .paymentFailed(reason):
+        case let .paymentFailed(_, reason):
             lastOutcome = "Payment failed: \(reason)"
         case .channelPending:
             lastOutcome = "JIT channel opening"
@@ -482,6 +624,12 @@ final class WalletModel: ObservableObject {
         (error as NSError).userInfo["KotlinException"] is WalletException.Fenced
     }
 
+    /// A start that found the node already up — a no-op success, not a
+    /// failure (Android's `startCore` parity).
+    private static func isAlreadyRunningError(_ error: Error) -> Bool {
+        kotlinThrowable(error) is WalletException.AlreadyRunning
+    }
+
     // MARK: Restore lifecycle (U22, F3)
 
     /// F3: replace the current wallet from 12 validated words, mirroring
@@ -501,78 +649,100 @@ final class WalletModel: ObservableObject {
     ///    (it only exits on the next NodeStopped), exactly like Android's
     ///    idempotent `ensureEventLoop` no-op.
     ///
-    /// Runs in an unscoped task: leaving the screen mid-restore cannot orphan
-    /// a stopped node, and the screen re-attaches to whatever phase is
-    /// current.
+    /// Runs on the lifecycle chain, unscoped from any screen: leaving the
+    /// screen mid-restore cannot orphan a stopped node, the screen re-attaches
+    /// to whatever phase is current, and a scenePhase transition that arrives
+    /// mid-restore orders strictly after the whole sequence instead of racing
+    /// its blocking calls.
     func startRestore(mnemonic: String) {
         if case .inProgress = restore { return }
         restore = .inProgress(step: restoreInitialStep)
-        Task { [weak self] in
-            guard let self else { return }
-            let wallet: Wallet
-            do {
-                wallet = try self.ensureWallet()
-            } catch {
-                self.restore = .failed(message: restoreErrorMessage(error))
-                return
-            }
-            // The restore sequence owns the node lifecycle from here: the
-            // node is (about to be) stopped, so scenePhase stop() must not
-            // race it, and start() is gated on the in-progress restore.
-            self.startRequested = false
-            do {
-                try await Self.runBlockingFFI { try wallet.stop() }
-            } catch {
-                // NotRunning: nothing to stop (pushes nothing). A stop with a
-                // failed final persist still transitioned and still pushed
-                // the terminal NodeStopped (see api.rs stop()).
-            }
-            // Drain RestoreProgress events live while restore() blocks.
-            self.scheduleEventLoop(wallet)
-            do {
-                try await Self.runBlockingFFI { try wallet.restore(mnemonic: mnemonic) }
-            } catch {
-                // The typed failures leave local state untouched — restart
-                // the existing wallet so the app stays usable behind the
-                // error screen (a still-fenced wallet re-fences here).
-                await self.restartAfterRestore(wallet)
-                self.restore = .failed(message: restoreErrorMessage(error))
-                return
-            }
-            // The restored wallet replaced the old one — any fence fell with
-            // it (a start failure still surfaces through startError on Home),
-            // and its node id must be re-fetched.
-            self.fenced = false
-            self.nodeId = nil
-            await self.restartAfterRestore(wallet)
-            self.restore = .succeeded
+        let previous = lifecycleTask
+        lifecycleTask = Task { [weak self] in
+            await previous?.value
+            await self?.runRestore(mnemonic: mnemonic)
         }
+    }
+
+    private func runRestore(mnemonic: String) async {
+        let wallet: Wallet
+        do {
+            wallet = try ensureWallet()
+        } catch {
+            restore = .failed(message: restoreErrorMessage(error))
+            return
+        }
+        // The restore sequence owns the node lifecycle from here: the node is
+        // (about to be) stopped, so scenePhase stop() must not race it, and
+        // start() is gated on the in-progress restore.
+        startRequested = false
+        do {
+            try await Self.runBlockingFFI { try wallet.stop() }
+        } catch {
+            // NotRunning: nothing to stop (pushes nothing). A stop with a
+            // failed final persist still transitioned and still pushed
+            // the terminal NodeStopped (see api.rs stop()).
+        }
+        // Drain RestoreProgress events live while restore() blocks.
+        scheduleEventLoop(wallet)
+        do {
+            try await Self.runBlockingFFI { try wallet.restore(mnemonic: mnemonic) }
+        } catch {
+            // The typed failures leave local state untouched — restart
+            // the existing wallet so the app stays usable behind the
+            // error screen (a still-fenced wallet re-fences here).
+            await restartAfterRestore(wallet)
+            restore = .failed(message: restoreErrorMessage(error))
+            return
+        }
+        // The restored wallet replaced the old one — any fence fell with
+        // it (a start failure still surfaces through startError on Home),
+        // and its node id must be re-fetched.
+        fenced = false
+        nodeId = nil
+        await restartAfterRestore(wallet)
+        restore = .succeeded
     }
 
     /// Restore's exit restart, foreground-gated (KTD-10): a restore that
     /// finishes while the app is backgrounded must not leave a headless node
     /// running past its missed scenePhase stop — the next foreground start
     /// covers it. Deliberately does NOT schedule another event-loop run: the
-    /// restore's chained run is still the single live consumer.
-    private func restartAfterRestore(_ wallet: Wallet) async {
-        guard UIApplication.shared.applicationState != .background else { return }
+    /// restore's chained run is still the single live consumer, so it drains a
+    /// compensating stop's terminal NodeStopped too.
+    private func restartAfterRestore(_ lifecycle: WalletLifecycle) async {
+        guard !isBackgrounded() else { return }
+        // Requested BEFORE the blocking start, not after it: set afterwards, a
+        // scenePhase stop that interleaves hits `guard startRequested` while
+        // the flag is still false and vanishes — leaving the restored node
+        // running headless in the background (KTD-10).
+        startRequested = true
         do {
-            try await Self.runBlockingFFI { try wallet.start() }
-            startRequested = true
-            startError = nil
-            refreshWalletData()
+            try await Self.runBlockingFFI { try lifecycle.startNode() }
         } catch {
-            if kotlinThrowable(error) is WalletException.AlreadyRunning {
+            if Self.isAlreadyRunningError(error) {
                 // A no-op success (Android's startCore parity).
-                startRequested = true
-                startError = nil
-                refreshWalletData()
-            } else if Self.isFencedError(error) {
-                fenced = true
             } else {
-                startError = error.localizedDescription
+                startRequested = false
+                if Self.isFencedError(error) {
+                    fenced = true
+                } else {
+                    startError = error.localizedDescription
+                }
+                return
             }
         }
+        startError = nil
+        // Same post-start re-read as `runStart`: a stop requested while
+        // restore's start blocked, or a background transition we missed, wins.
+        if !startRequested || isBackgrounded() {
+            startRequested = false
+            let endAssertion = beginStopAssertion()
+            await runStop(lifecycle)
+            endAssertion()
+            return
+        }
+        refreshWalletData()
     }
 
     /// The Restore screen's Try-Again/exit ack; a running restore stays owned.

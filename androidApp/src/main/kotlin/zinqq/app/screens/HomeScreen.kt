@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -38,15 +37,14 @@ import zinqq.app.components.BannerIcon
 import zinqq.app.homeBalance
 import zinqq.app.recoveryBanner
 import zinqq.app.sweepBanner
-import zinqq.app.theme.ZinqqDimens
 import zinqq.app.theme.ZinqqTheme
 
 /**
- * The PWA's Home (U14, R12; `Home.tsx`): field screen with a refresh icon
- * (re-queries wallet data — no page-reload concept natively; the PWA
- * install button is omitted on native), the unified BalanceDisplay,
- * RecoveryBanner / PendingSweepBanner, and the two 88dp CTAs. A fatal start
- * failure replaces the content with "Something went wrong" (`Home.tsx:29-42`).
+ * The PWA's Home (U14, R12; `Home.tsx`): the unified BalanceDisplay,
+ * RecoveryBanner / PendingSweepBanner, and the two 88dp CTAs. The PWA's
+ * install button and its manual refresh are both omitted natively — wallet
+ * data re-queries itself from core events. A fatal start failure replaces the
+ * content with "Something went wrong" (`Home.tsx:29-42`).
  */
 @Composable
 fun HomeScreen(
@@ -92,30 +90,6 @@ fun HomeScreen(
             .padding(horizontal = 24.dp)
             .padding(top = 16.dp),
     ) {
-        // Top bar: install slot omitted on native (left spacer keeps the
-        // refresh pinned right, like the PWA's placeholder div).
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Box(modifier = Modifier.size(ZinqqDimens.MinTouchTarget))
-            Box(
-                modifier = Modifier
-                    .size(ZinqqDimens.MinTouchTarget)
-                    .clip(CircleShape)
-                    .clickable(onClick = holder::refreshWalletData)
-                    .semantics { contentDescription = "Refresh" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_refresh),
-                    contentDescription = null,
-                    tint = colors.onField,
-                    modifier = Modifier.size(20.dp),
-                )
-            }
-        }
-
         // Balance centered in the flexible middle, like the PWA's
         // justify-between column.
         Box(

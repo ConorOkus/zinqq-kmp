@@ -58,6 +58,10 @@ pub(crate) mod test_support {
         fail_puts_keys: Mutex<HashSet<String>>,
         /// Keys whose GET fails (scripted recovery failures).
         fail_gets_keys: Mutex<HashSet<String>>,
+        /// Keys whose PUT is applied server-side but still returns an error to
+        /// the client: the lost-acknowledgement seam (request timeout, dropped
+        /// mobile connection after the server committed).
+        commit_then_fail_keys: Mutex<HashSet<String>>,
         put_attempts: Mutex<BatchItems>,
         put_many_calls: Mutex<Vec<BatchItems>>,
         get_calls: Mutex<Vec<String>>,
@@ -120,6 +124,18 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Makes `key`'s put COMMIT and then report failure, modelling a lost
+        /// acknowledgement (the server applied the write; the client never
+        /// learned it).
+        pub(crate) fn commit_then_fail_for(&self, key: &str, fail: bool) {
+            let mut keys = self.commit_then_fail_keys.lock().unwrap();
+            if fail {
+                keys.insert(key.to_string());
+            } else {
+                keys.remove(key);
+            }
+        }
+
         pub(crate) fn fail_gets_for(&self, key: &str, fail: bool) {
             let mut keys = self.fail_gets_keys.lock().unwrap();
             if fail {
@@ -149,6 +165,11 @@ pub(crate) mod test_support {
                 });
             }
             state.insert(key.to_string(), (value.to_vec(), version + 1));
+            if self.commit_then_fail_keys.lock().unwrap().contains(key) {
+                return Err(VssError::Network {
+                    message: "mock: put committed but the acknowledgement was lost".to_string(),
+                });
+            }
             Ok(version + 1)
         }
     }

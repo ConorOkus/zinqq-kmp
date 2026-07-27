@@ -71,7 +71,7 @@ final class EventLoopSingleConsumerTests: XCTestCase {
 
         // Rapid flip #2: same race again, plus a live event for the new run.
         model.scheduleEventLoop(queue)
-        await queue.push(.paymentSuccessful)
+        await queue.push(.paymentSuccessful(paymentHash: "aa"))
         await queue.push(.nodeStopped)
 
         // Terminal NodeStopped for the last scheduled run so the chain ends.
