@@ -94,9 +94,13 @@ pub(crate) const CHANNEL_MANAGER_VSS_KEY: &str = "channel_manager";
 ///    `close_records`, `force_close_recovery`);
 /// 2. [`super::startup`]'s mandatory version seeding, which needs a server
 ///    version for every key a session may put;
-/// 3. U4's [`crate::restore::reconcile_backup_keys`], which aborts a restore
-///    when `listKeyVersions` reports a key that is neither one of these nor a
-///    manifest entry.
+/// 3. U4's restore reconciliation
+///    ([`crate::restore::unexplained_remote_keys`]), which flags every key
+///    `listKeyVersions` reports that is neither one of these nor a manifest
+///    entry. Restore then FETCHES each flagged key to identify it and aborts
+///    only on one it cannot — but a fixed key missing from this list is
+///    guaranteed not to deserialize as a channel monitor, so it still fails
+///    the restore.
 ///
 /// Adding a key in only one of those places is precisely how a restore starts
 /// failing with `BackupInconsistent` on a perfectly healthy backup, so the
@@ -166,6 +170,15 @@ pub(crate) trait VssTransport: Send + Sync {
     /// Fetch + decrypt; `None` when the key does not exist.
     fn get<'a>(&'a self, plaintext_key: &'a str)
         -> BoxFuture<'a, Result<VersionedValue, VssError>>;
+    /// Fetch + decrypt by the key an object is ALREADY STORED UNDER (the
+    /// obfuscated form `listKeyVersions` reports) — see
+    /// [`VssWireClient::get_object_by_stored_key`]. The only caller is U4's
+    /// restore reconciliation, which must identify a listing entry whose
+    /// plaintext key is unknowable.
+    fn get_by_stored_key<'a>(
+        &'a self,
+        stored_key: &'a str,
+    ) -> BoxFuture<'a, Result<VersionedValue, VssError>>;
     /// Versioned put; returns the new version.
     fn put<'a>(
         &'a self,
@@ -197,6 +210,13 @@ impl VssTransport for VssWireClient {
         plaintext_key: &'a str,
     ) -> BoxFuture<'a, Result<VersionedValue, VssError>> {
         Box::pin(self.get_object(plaintext_key))
+    }
+
+    fn get_by_stored_key<'a>(
+        &'a self,
+        stored_key: &'a str,
+    ) -> BoxFuture<'a, Result<VersionedValue, VssError>> {
+        Box::pin(self.get_object_by_stored_key(stored_key))
     }
 
     fn put<'a>(
@@ -1160,7 +1180,10 @@ impl VssBackedStore {
     /// `archive_persisted_channel` (LDK 0.2: name-only): local archive move
     /// (mirroring LDK's blanket impl), manifest removal, and fire-and-forget
     /// remote delete. No retry — orphaned remote keys waste storage but never
-    /// funds (the channel is already closed), exactly the PWA's posture.
+    /// funds (the channel is already closed), exactly the PWA's posture. They
+    /// no longer break restore either: an orphan that still decrypts and
+    /// deserializes is adopted back (`crate::restore::verify_unexplained_keys`),
+    /// and re-restoring a fully-resolved monitor is harmless.
     fn archive_monitor(&self, monitor_name: MonitorName) {
         let name = monitor_name.to_string();
         // Local archive: monitors/{name} → archived_monitors/{name}.
@@ -2195,20 +2218,35 @@ mod tests {
         assert!(parse_monitor_manifest(&serde_json::to_vec(&over_cap).unwrap()).is_err());
     }
 
+    /// CROSS-CLIENT WIRE-FORMAT VECTOR (Fix B): the monitor VSS key is
+    /// `{funding txid RAW byte order}:{vout}`, never the reversed display
+    /// order explorers and `Txid`'s `Display` show.
+    ///
+    /// This is the PWA's format of record: `outpointKey` is
+    /// `` `${bytesToHex(outpoint.get_txid())}:${index}` ``
+    /// (`zinq/src/ldk/traits/persist.ts:17-19`), and `get_txid()` hands JS the
+    /// hash's raw internal bytes — the PWA's display-order helper
+    /// (`txidBytesToHex`, used for explorer links) is deliberately NOT used
+    /// there. If ours ever flipped, restoring a PWA wallet would still work,
+    /// but our next monitor write would create a DUPLICATE remote blob under a
+    /// different key while the PWA's original went stale, and the manifest
+    /// would stop explaining the listing. The genesis-block txid is a vector
+    /// whose two spellings differ maximally.
     #[test]
     fn monitor_vss_key_uses_raw_txid_byte_order() {
         use std::str::FromStr as _;
-        // Display order is the REVERSE of the raw byte order; the PWA key
-        // (and thus cross-client restore) uses the raw order.
-        let txid = bitcoin::Txid::from_str(
-            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-        )
-        .unwrap();
-        let outpoint = lightning::chain::transaction::OutPoint { txid, index: 1 };
+        const DISPLAY_HEX: &str =
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+        const RAW_HEX: &str = "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000";
+        let txid = bitcoin::Txid::from_str(DISPLAY_HEX).unwrap();
         assert_eq!(
-            monitor_vss_key(&outpoint),
-            "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000:1"
+            txid.to_string(),
+            DISPLAY_HEX,
+            "Display is the reversed form"
         );
+        let outpoint = lightning::chain::transaction::OutPoint { txid, index: 1 };
+        assert_eq!(monitor_vss_key(&outpoint), format!("{RAW_HEX}:1"));
+        assert_ne!(monitor_vss_key(&outpoint), format!("{DISPLAY_HEX}:1"));
         assert!(is_valid_monitor_key(&monitor_vss_key(&outpoint)));
     }
 
@@ -2220,8 +2258,10 @@ mod tests {
     /// the network graph, the scorer, the output sweeper and the
     /// liquidity-manager event queue through this one object. Exactly one of
     /// those namespaces may reach VSS — a second one would upload a key
-    /// [`crate::restore::reconcile_backup_keys`] cannot explain and would
-    /// permanently brick restore for that seed.
+    /// [`crate::restore::reconcile_backup_keys`] cannot explain, and since a
+    /// graph/scorer/sweeper blob can never deserialize as a channel monitor,
+    /// restore's identification pass cannot rescue it either: that permanently
+    /// bricks restore for the seed.
     ///
     /// So: drive every namespace the node actually uses through
     /// `KVStoreSync::write` and assert the transport saw the channel manager
@@ -2349,20 +2389,25 @@ mod tests {
     /// puts are being retried through a VSS outage — the store keeps a
     /// monitor blob that no manifest entry explains.
     ///
-    /// That orphan is UNRECOVERABLE client-side: keys go over the wire as
-    /// HMACs of their names, so a later session cannot even learn the orphan's
-    /// plaintext key to delete it or to backfill the manifest. Every future
-    /// restore for that seed therefore aborts with `BackupInconsistent`, and
-    /// this test shows it produces the exact reported shape — one unexplained
-    /// key alongside a healthy `channel_manager`.
+    /// The orphan is no longer FATAL: keys still go over the wire as HMACs of
+    /// their names, so a later session cannot guess the orphan's plaintext key
+    /// — but restore now fetches each unexplained listing entry by its STORED
+    /// key, and a blob that decrypts and deserializes as one of this wallet's
+    /// monitors is adopted, re-keyed from its own funding outpoint and written
+    /// back into the manifest (`crate::restore::verify_unexplained_keys`). What
+    /// this test pins is the state the write path can still leave behind, and
+    /// that the STRICT predicate — the invariant our own writers must keep —
+    /// flags it in the exact reported shape: one unexplained key alongside a
+    /// healthy `channel_manager`.
     ///
-    /// This is pinned so the contradiction between the archive/manifest
-    /// "best-effort" posture and reconcile's hard abort stays VISIBLE. The
-    /// real fix is atomicity — one transactional `putObjects` carrying the new
-    /// monitor blob and the manifest together — which changes the KTD-3
-    /// per-key conflict/fence semantics and is the maintainer's call. If you
-    /// make that change, this test SHOULD fail: replace it with its positive
-    /// counterpart above.
+    /// So the write-side hazard stays VISIBLE even though restore recovers from
+    /// it: until this window closes, every restore for that seed pays an extra
+    /// fetch-and-identify round, and a crash between the blob and the manifest
+    /// still leaves a store no client can enumerate. The real fix is atomicity
+    /// — one transactional `putObjects` carrying the new monitor blob and the
+    /// manifest together — which changes the KTD-3 per-key conflict/fence
+    /// semantics and is the maintainer's call. If you make that change, this
+    /// test SHOULD fail: replace it with its positive counterpart above.
     #[test]
     fn a_monitor_persist_interrupted_before_the_manifest_orphans_a_remote_key() {
         let h = harness();

@@ -58,6 +58,11 @@ pub(crate) mod test_support {
         fail_puts_keys: Mutex<HashSet<String>>,
         /// Keys whose GET fails (scripted recovery failures).
         fail_gets_keys: Mutex<HashSet<String>>,
+        /// Keys whose stored value cannot be DECRYPTED with this wallet's
+        /// seed-derived key: genuinely foreign (or corrupt) data in the store.
+        /// The mock keeps plaintext values, so this seam is the only way to
+        /// model the crypto verdict the real client reaches.
+        undecryptable_keys: Mutex<HashSet<String>>,
         /// Keys whose PUT is applied server-side but still returns an error to
         /// the client: the lost-acknowledgement seam (request timeout, dropped
         /// mobile connection after the server committed).
@@ -157,6 +162,17 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Plants `bytes` under `key` as data this seed cannot decrypt — the
+        /// "foreign or corrupt blob" verdict a real `getObject` reaches after
+        /// the ChaCha20-Poly1305 tag check fails.
+        pub(crate) fn seed_undecryptable(&self, key: &str, bytes: &[u8], version: i64) {
+            self.seed(key, bytes, version);
+            self.undecryptable_keys
+                .lock()
+                .unwrap()
+                .insert(key.to_string());
+        }
+
         pub(crate) fn fail_gets_for(&self, key: &str, fail: bool) {
             let mut keys = self.fail_gets_keys.lock().unwrap();
             if fail {
@@ -210,10 +226,29 @@ pub(crate) mod test_support {
                 Err(VssError::Network {
                     message: "mock: get failure injected".to_string(),
                 })
+            } else if self
+                .undecryptable_keys
+                .lock()
+                .unwrap()
+                .contains(plaintext_key)
+            {
+                Err(VssError::Crypto(super::crypto::CryptoError::DecryptFailed))
             } else {
                 Ok(self.state.lock().unwrap().get(plaintext_key).cloned())
             };
             Box::pin(std::future::ready(result))
+        }
+
+        /// The mock's `obfuscate` is the identity, so a "stored" key IS the
+        /// plaintext key here and this is the same lookup as [`Self::get`] —
+        /// which is exactly the property the restore tests need: they can
+        /// plant a blob under a key the manifest never lists and watch the
+        /// production code fetch it back by its listing entry.
+        fn get_by_stored_key<'a>(
+            &'a self,
+            stored_key: &'a str,
+        ) -> BoxFuture<'a, Result<VersionedValue, VssError>> {
+            self.get(stored_key)
         }
 
         fn put<'a>(

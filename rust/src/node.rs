@@ -3106,15 +3106,18 @@ mod tests {
     /// `Restore failed: backup inconsistent: N remote key(s) are not
     /// explained by the monitor manifest or the fixed key set`.
     ///
-    /// [`crate::restore::reconcile_backup_keys`] aborts a restore when
-    /// `listKeyVersions` reports ANY key that is not the obfuscated form of a
-    /// [`crate::vss::store::FIXED_REMOTE_KEYS`] entry or of a manifest entry.
-    /// That guard is only safe if our own node can never upload such a key:
-    /// one mis-wired component (a store handed the VSS-backed store instead
-    /// of the plain local one, or a new blob written remotely without being
-    /// added to the shared fixed list) would permanently brick restore for
-    /// that seed, and the failure would only surface months later at the
-    /// worst possible moment.
+    /// [`crate::restore::reconcile_backup_keys`] is the STRICT predicate: no
+    /// key `listKeyVersions` reports may be anything other than the obfuscated
+    /// form of a [`crate::vss::store::FIXED_REMOTE_KEYS`] entry or of a
+    /// manifest entry. Restore itself is no longer that strict — it fetches
+    /// each unexplained key and adopts the ones that turn out to be this
+    /// wallet's channel monitors — but that rescue only covers MONITORS. A
+    /// non-monitor blob (a store handed the VSS-backed store instead of the
+    /// plain local one, or a new remote blob never added to the shared fixed
+    /// list) can never deserialize as a monitor, so it still bricks restore
+    /// for that seed permanently, and the failure would only surface months
+    /// later at the worst possible moment. Hence the strict predicate stays
+    /// the write path's contract.
     ///
     /// So boot a REAL VSS-enabled node over a recording transport, drive the
     /// whole fresh-wallet lifecycle — start (fresh channel manager, the BDK

@@ -6,9 +6,12 @@
 //! - **Explicit restore** ([`run_restore`], surfaced as `Wallet::restore`):
 //!   derive keys from the ENTERED mnemonic → probe `listKeyVersions` (empty →
 //!   typed [`RestoreError::NoBackupFound`], local state untouched) → manifest
-//!   reconciliation (any remote key not explained by the manifest or the
-//!   fixed key set → typed [`RestoreError::BackupInconsistent`], abort before
-//!   any write) → download CM and manifest→monitors (chunks of
+//!   reconciliation: a remote key the manifest and the fixed key set do not
+//!   explain is FETCHED by its stored key and identified — one of this
+//!   wallet's monitors is adopted into the restore set (the PWA orphans such
+//!   keys by design), anything unidentifiable is a typed
+//!   [`RestoreError::BackupInconsistent`] before any write → download CM and
+//!   manifest→monitors (chunks of
 //!   [`RESTORE_CHUNK_SIZE`] in parallel, [`RESTORE_DOWNLOAD_BUDGET`] overall)
 //!   and known peers → validate EVERY blob by deserialization (monitors with
 //!   the restored wallet's `SignerProvider`) BEFORE any local write →
@@ -19,7 +22,10 @@
 //! - **Silent recovery** (U3's `vss::startup` branch for an empty/voided
 //!   local store) delegates the download/validate/write mechanics to the same
 //!   [`fetch_manifest`] / [`download_and_validate`] / [`write_plan_local`]
-//!   engine and keeps its own branch logic and fatality rules.
+//!   engine and keeps its own branch logic and fatality rules. It recovers
+//!   exactly what the manifest lists and does NOT run the unexplained-key
+//!   identification pass ([`verify_unexplained_keys`]) — extending adoption to
+//!   that path is a deliberate open item, not an oversight.
 //!
 //! Crash-prefix safety: the marker is written BEFORE anything destructive and
 //! contains the full restore context (`{mnemonic, started_at_ms}` as JSON),
@@ -68,7 +74,7 @@ use crate::vss::known_peers::{
     KNOWN_PEERS_PRIMARY_NAMESPACE, KNOWN_PEERS_SECONDARY_NAMESPACE,
 };
 use crate::vss::store::{
-    parse_monitor_manifest, VersionedValue, VssTransport, CHANNEL_MANAGER_VSS_KEY,
+    monitor_vss_key, parse_monitor_manifest, VersionedValue, VssTransport, CHANNEL_MANAGER_VSS_KEY,
     FENCED_FLAG_FILE_NAME, FIXED_REMOTE_KEYS, KNOWN_PEERS_VSS_KEY, MONITOR_MANIFEST_KEY,
 };
 use crate::vss::VssError;
@@ -321,27 +327,87 @@ pub(crate) async fn fetch_manifest(
 /// a few is safe — and without at least one the failure is un-triageable.
 const UNEXPLAINED_KEYS_IN_ERROR: usize = 3;
 
-/// Manifest reconciliation (U4, adversarially reviewed — load-bearing):
-/// every key `listKeyVersions` reports must be EXPLAINED — the obfuscated
-/// form of a manifest entry or of one of [`FIXED_REMOTE_KEYS`]. Any
-/// unexplained remote key means the manifest undercounts the monitors (or the
-/// store holds foreign data): restoring would silently drop fund-safety
-/// state, so the restore aborts BEFORE any write with a typed error.
+/// The obfuscated listing keys that neither [`FIXED_REMOTE_KEYS`] nor the
+/// manifest explains, in listing order. Pure: no blob is fetched here.
 ///
-/// The error text is a triage report, not just a hash: it names how big the
-/// listing was, how much of it the manifest and the fixed keys each accounted
-/// for, WHICH fixed keys were present versus absent, and the first few
-/// unexplained obfuscated keys. All of that is derived from key NAMES and
-/// counts — no blob is fetched or decrypted here, and the mnemonic,
-/// encryption key and plaintext values never enter the message.
+/// Obfuscated keys are deterministic HMACs, so the obfuscated form of every
+/// EXPECTED plaintext key is computable client-side and set-diffed against the
+/// (obfuscated) listing. The reverse is impossible, which is why an
+/// unexplained key can only be identified by FETCHING it
+/// ([`verify_unexplained_keys`]).
+pub(crate) fn unexplained_remote_keys(
+    listing: &[(String, i64)],
+    manifest_keys: &[String],
+    transport: &dyn VssTransport,
+) -> Vec<String> {
+    let expected: HashSet<String> = FIXED_REMOTE_KEYS
+        .iter()
+        .copied()
+        .chain(manifest_keys.iter().map(String::as_str))
+        .map(|key| transport.obfuscate(key))
+        .collect();
+    listing
+        .iter()
+        .filter(|(obfuscated_key, _)| !expected.contains(obfuscated_key))
+        .map(|(obfuscated_key, _)| obfuscated_key.clone())
+        .collect()
+}
+
+/// STRICT manifest reconciliation (U4, adversarially reviewed —
+/// load-bearing): every key `listKeyVersions` reports must be EXPLAINED — the
+/// obfuscated form of a manifest entry or of one of [`FIXED_REMOTE_KEYS`]. An
+/// unexplained remote key may mean the manifest undercounts the monitors, and
+/// restoring on an undercounting manifest silently drops fund-safety state.
+///
+/// This is the invariant OUR OWN write path must keep, and the permanent
+/// regression guards (`node.rs`'s fresh-wallet lifecycle, `vss::store`'s
+/// completed-monitor-persist) assert it directly — which is why it stays a
+/// single named predicate. The RESTORE flow deliberately does NOT stop here:
+/// it composes the two halves itself ([`unexplained_remote_keys`] then
+/// [`verify_unexplained_keys`]) so a key that turns out to be one of this
+/// wallet's own monitors is ADOPTED instead of bricking the wallet — the PWA
+/// leaves such keys behind by design. Only an unidentifiable key still aborts,
+/// through the same [`backup_inconsistent`] report.
+#[cfg(test)]
 pub(crate) fn reconcile_backup_keys(
     listing: &[(String, i64)],
     manifest_keys: &[String],
     transport: &dyn VssTransport,
 ) -> Result<(), RestoreError> {
-    // Obfuscated keys are deterministic HMACs, so the obfuscated form of
-    // every EXPECTED plaintext key is computable client-side and set-diffed
-    // against the (obfuscated) listing.
+    let unexplained = unexplained_remote_keys(listing, manifest_keys, transport);
+    if unexplained.is_empty() {
+        return Ok(());
+    }
+    Err(backup_inconsistent(
+        listing,
+        manifest_keys,
+        transport,
+        unexplained.len(),
+        &unexplained,
+        None,
+    ))
+}
+
+/// Builds the `BackupInconsistent` triage report: a triage report, not just a
+/// hash. It names how big the listing was, how much of it the manifest and the
+/// fixed keys each accounted for, WHICH fixed keys were present versus absent,
+/// the first few offending obfuscated keys, and — when the identification pass
+/// ran — how many unexplained keys were verified as this wallet's monitors
+/// versus rejected. All of that is derived from key NAMES and counts, so the
+/// mnemonic, the encryption key and plaintext values never enter the message.
+///
+/// `unexplained` is how many listing entries nothing explained; `offenders` are
+/// the ones to NAME (the unidentifiable subset once verification has run,
+/// otherwise all of them); `verified` is `(adopted, rejected)` when a
+/// verification pass ran.
+fn backup_inconsistent(
+    listing: &[(String, i64)],
+    manifest_keys: &[String],
+    transport: &dyn VssTransport,
+    unexplained: usize,
+    offenders: &[String],
+    verified: Option<(usize, usize)>,
+) -> RestoreError {
     let fixed: Vec<(&str, String)> = FIXED_REMOTE_KEYS
         .iter()
         .map(|key| (*key, transport.obfuscate(key)))
@@ -350,19 +416,6 @@ pub(crate) fn reconcile_backup_keys(
         .iter()
         .map(|key| transport.obfuscate(key))
         .collect();
-    let expected: HashSet<&String> = fixed
-        .iter()
-        .map(|(_, obfuscated)| obfuscated)
-        .chain(manifest_obfuscated.iter())
-        .collect();
-    let unexplained: Vec<&str> = listing
-        .iter()
-        .filter(|(obfuscated_key, _)| !expected.contains(obfuscated_key))
-        .map(|(obfuscated_key, _)| obfuscated_key.as_str())
-        .collect();
-    if unexplained.is_empty() {
-        return Ok(());
-    }
 
     // Which side of the comparison came up short: the plaintext names are the
     // only actionable fact a user or developer can relay.
@@ -380,35 +433,271 @@ pub(crate) fn reconcile_backup_keys(
         .iter()
         .filter(|(key, _)| manifest_obfuscated.contains(key))
         .count();
-    let shown: Vec<&str> = unexplained
+    let shown: Vec<&str> = offenders
         .iter()
         .take(UNEXPLAINED_KEYS_IN_ERROR)
-        .copied()
+        .map(String::as_str)
         .collect();
-    let elided = unexplained.len().saturating_sub(shown.len());
-    Err(RestoreError::BackupInconsistent {
+    let elided = offenders.len().saturating_sub(shown.len());
+    // With a verification pass the named keys are the UNIDENTIFIABLE subset, so
+    // the label has to say so — otherwise the count and the list disagree.
+    let (verification, label) = match verified {
+        Some((adopted, rejected)) => (
+            format!(
+                " Of those, {adopted} decrypted and deserialized as this wallet's channel \
+                 monitor(s) and would have been adopted, but {rejected} could not be identified \
+                 (undecryptable, or decrypted to something that is not a channel monitor).",
+            ),
+            "Unidentifiable",
+        ),
+        None => (String::new(), "Unexplained"),
+    };
+    RestoreError::BackupInconsistent {
         detail: format!(
             "{} of the {} key(s) on the backup server are not explained. The monitor manifest \
              declares {} monitor key(s) and accounts for {} of the listing; the expected wallet \
              keys account for {} more. Expected keys found: [{}]. Expected keys absent: [{}]. \
-             Unexplained obfuscated key(s): {}{}. This is usually a channel-monitor backup that \
-             was uploaded but never listed in the manifest, so restoring from it could silently \
-             drop channel state — nothing was written locally.",
-            unexplained.len(),
+             {} obfuscated key(s): {}{}.{} This is usually a channel-monitor backup that was \
+             uploaded but never listed in the manifest, so restoring from it could silently drop \
+             channel state — nothing was written locally.",
+            unexplained,
             listing.len(),
             manifest_keys.len(),
             explained_by_manifest,
             present.len(),
             present.join(", "),
             absent.join(", "),
+            label,
             shown.join(", "),
             if elided > 0 {
                 format!(" (+{elided} more)")
             } else {
                 String::new()
-            }
+            },
+            verification,
         ),
+    }
+}
+
+/// What deserializing a monitor blob under the RESTORED wallet's signer stack
+/// establishes about it.
+struct DeserializedMonitor {
+    /// Local `FilesystemStore` key (`MonitorName::to_string()`), so
+    /// `read_channel_monitors` finds the blob again after the restore.
+    local_key: String,
+    /// The monitor's own VSS key, derived from its funding outpoint with the
+    /// SAME helper the write path uses ([`monitor_vss_key`]). For a
+    /// manifest-listed monitor this re-derives the key it was fetched under;
+    /// for an adopted unexplained blob it is the only way to learn a plaintext
+    /// key at all, since the listing carries HMACs.
+    derived_vss_key: String,
+}
+
+/// THE monitor validation step (R4): a blob is accepted only if it
+/// deserializes as a `ChannelMonitor` under the ENTERED seed's `KeysManager` +
+/// [`WalletSignerProvider`]. Every monitor on every restore path goes through
+/// here — manifest-listed downloads and adopted unexplained keys alike — so
+/// there is exactly one deserializer to audit.
+fn deserialize_monitor(
+    bytes: &[u8],
+    keys_manager: &KeysManager,
+    signer_provider: &WalletSignerProvider,
+) -> Result<DeserializedMonitor, String> {
+    let (_block_hash, monitor) = <(BlockHash, ChannelMonitor<InMemorySigner>)>::read(
+        &mut Cursor::new(bytes),
+        (keys_manager, signer_provider),
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    Ok(DeserializedMonitor {
+        local_key: monitor.persistence_key().to_string(),
+        derived_vss_key: monitor_vss_key(&monitor.get_funding_txo()),
     })
+}
+
+/// The outcome of identifying the remote keys the manifest and the fixed key
+/// set do not explain.
+pub(crate) struct UnexplainedKeyVerdict {
+    /// Unexplained keys that decrypted AND deserialized as this wallet's
+    /// monitors, ready to join the restore set.
+    pub adopted: Vec<ValidatedMonitor>,
+    /// Unexplained keys that could not be identified: undecryptable with this
+    /// seed's encryption key, or decrypted to something that is not a channel
+    /// monitor. These are the genuine "foreign or corrupt data" case.
+    pub rejected: Vec<String>,
+}
+
+/// Identifies the remote keys nothing explains, by FETCHING each one under its
+/// stored (obfuscated) key and running it through the ordinary monitor
+/// validation ([`deserialize_monitor`]).
+///
+/// Why adopt rather than abort (the cross-client half of R4): the sibling PWA
+/// leaves unlisted monitor keys behind BY DESIGN — its manifest write is
+/// fire-and-forget, and archiving a channel deliberately orphans the monitor's
+/// VSS key ("orphaned VSS keys waste storage but do not affect fund safety").
+/// A blanket abort therefore makes every PWA wallet that ever closed a channel
+/// permanently un-restorable. Adoption is also the SAFE direction on the
+/// merits: restoring an already-archived (fully resolved) monitor is harmless —
+/// LDK re-reads it, sees nothing to claim, and archives it again — whereas
+/// dropping a monitor that is still live is fund loss. So the guard's real job,
+/// "never restore on a manifest that undercounts live monitors", is served
+/// strictly better by recovering the key than by refusing the wallet.
+///
+/// Two facts make an adoption safe to trust: the blob decrypted with the
+/// SEED-DERIVED encryption key (so it belongs to this wallet, not a colliding
+/// store), and it deserialized as a channel monitor under this seed's signer
+/// stack (so it is a monitor, not some other client's unrelated blob).
+/// Anything else stays a hard [`RestoreError::BackupInconsistent`].
+///
+/// `budget` time-boxes the whole pass the way [`download_and_validate`] boxes
+/// the monitor downloads: identification costs one fetch per unexplained key,
+/// and a store holding thousands of them must not turn a restore into an
+/// unbounded wait.
+pub(crate) async fn verify_unexplained_keys(
+    transport: &dyn VssTransport,
+    unexplained: &[String],
+    keys_manager: &KeysManager,
+    signer_provider: &WalletSignerProvider,
+    budget: Duration,
+    logger: &Arc<Logger>,
+) -> Result<UnexplainedKeyVerdict, RestoreError> {
+    let started = tokio::time::Instant::now();
+    let mut adopted = Vec::new();
+    let mut rejected = Vec::new();
+    for (index, obfuscated_key) in unexplained.iter().enumerate() {
+        if started.elapsed() > budget {
+            return Err(RestoreError::DownloadFailed {
+                detail: format!(
+                    "identifying the backup's unlisted keys timed out: checked {index}/{} in {}s. \
+                     Retry on a faster connection.",
+                    unexplained.len(),
+                    started.elapsed().as_secs()
+                ),
+            });
+        }
+        let fetched = match transport.get_by_stored_key(obfuscated_key).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                // The key vanished between the listing and this fetch (another
+                // client archiving a channel right now). Nothing is left to
+                // explain, and nothing is left to lose.
+                log_info!(
+                    logger,
+                    "Unexplained remote key {obfuscated_key} disappeared before it could be \
+                     identified; treating it as archived"
+                );
+                continue;
+            }
+            // An undecryptable value is a verdict about the DATA (a foreign or
+            // corrupt blob); any other transport failure is a network problem
+            // and must not be reported as an inconsistent backup.
+            Err(VssError::Crypto(e)) => {
+                log_error!(
+                    logger,
+                    "Unexplained remote key {obfuscated_key} does not decrypt with this seed's \
+                     key ({e}); it is foreign or corrupt data"
+                );
+                rejected.push(obfuscated_key.clone());
+                continue;
+            }
+            Err(e) => return Err(download_err(e)),
+        };
+        let (bytes, version) = fetched;
+        match deserialize_monitor(&bytes, keys_manager, signer_provider) {
+            Ok(parsed) => {
+                if transport.obfuscate(&parsed.derived_vss_key) != *obfuscated_key {
+                    // The blob IS one of our monitors, so adopting it still
+                    // recovers more state than aborting — but the writer that
+                    // stored it derived a different plaintext key than
+                    // `monitor_vss_key` does, so future writes would land on a
+                    // second key and this one would go stale. That is a
+                    // key-format divergence between clients, not a backup
+                    // fault; the byte-order vector tests exist to keep it from
+                    // ever happening silently.
+                    log_error!(
+                        logger,
+                        "Adopted monitor {} was stored under a remote key its funding outpoint \
+                         does not reproduce; monitor VSS key derivation may have diverged from \
+                         the writing client",
+                        parsed.derived_vss_key
+                    );
+                }
+                log_info!(
+                    logger,
+                    "Adopting an unlisted remote monitor as {} (the manifest never listed it)",
+                    parsed.derived_vss_key
+                );
+                adopted.push(ValidatedMonitor {
+                    vss_key: parsed.derived_vss_key,
+                    local_key: parsed.local_key,
+                    bytes,
+                    version,
+                });
+            }
+            Err(e) => {
+                log_error!(
+                    logger,
+                    "Unexplained remote key {obfuscated_key} decrypted but is not a channel \
+                     monitor ({e})"
+                );
+                rejected.push(obfuscated_key.clone());
+            }
+        }
+    }
+    Ok(UnexplainedKeyVerdict { adopted, rejected })
+}
+
+/// Best-effort manifest backfill after a restore adopted unlisted monitors, so
+/// the NEXT restore on this seed reconciles cleanly with no identification pass
+/// at all. Never fails the restore: the adopted monitors are already durable
+/// locally, and an unwritten manifest only costs the next restore another
+/// verification round.
+async fn backfill_manifest(
+    transport: &dyn VssTransport,
+    monitor_keys: &BTreeSet<String>,
+    known_version: i64,
+    logger: &Arc<Logger>,
+) {
+    let mut keys: BTreeSet<String> = monitor_keys.clone();
+    let payload = serde_json::to_vec(&keys).expect("a set of strings always serializes to JSON");
+    match transport
+        .put(MONITOR_MANIFEST_KEY, &payload, known_version)
+        .await
+    {
+        Ok(_) => return,
+        Err(VssError::Conflict { .. }) => {}
+        Err(e) => {
+            log_error!(logger, "Post-restore manifest backfill failed: {e}");
+            return;
+        }
+    }
+    // Another client wrote the manifest meanwhile: merge its keys in (never
+    // drop a monitor another device tracks) and retry once at its version.
+    match transport.get(MONITOR_MANIFEST_KEY).await {
+        Ok(Some((remote_bytes, remote_version))) => {
+            match parse_monitor_manifest(&remote_bytes) {
+                Ok(remote_keys) => keys.extend(remote_keys),
+                Err(e) => log_error!(
+                    logger,
+                    "Remote manifest did not parse during the post-restore backfill ({e}); \
+                     writing our key set"
+                ),
+            }
+            let merged =
+                serde_json::to_vec(&keys).expect("a set of strings always serializes to JSON");
+            if let Err(e) = transport
+                .put(MONITOR_MANIFEST_KEY, &merged, remote_version)
+                .await
+            {
+                log_error!(logger, "Post-restore manifest backfill retry failed: {e}");
+            }
+        }
+        Ok(None) => log_error!(
+            logger,
+            "Post-restore manifest backfill conflicted but the manifest is gone; leaving it to \
+             the next session"
+        ),
+        Err(e) => log_error!(logger, "Post-restore manifest refetch failed: {e}"),
+    }
 }
 
 /// Downloads CM + monitors + known peers and validates EVERY blob by
@@ -488,16 +777,17 @@ pub(crate) async fn download_and_validate(
             })?;
             // Validate by deserialization with the RESTORED wallet's signer
             // BEFORE anything is written (R4).
-            let (_block_hash, monitor) = <(BlockHash, ChannelMonitor<InMemorySigner>)>::read(
-                &mut Cursor::new(&bytes),
-                (keys_manager, signer_provider),
-            )
-            .map_err(|e| RestoreError::ValidationFailed {
-                detail: format!("monitor \"{vss_key}\" from VSS failed deserialization: {e:?}"),
-            })?;
+            let parsed =
+                deserialize_monitor(&bytes, keys_manager, signer_provider).map_err(|detail| {
+                    RestoreError::ValidationFailed {
+                        detail: format!(
+                            "monitor \"{vss_key}\" from VSS failed deserialization: {detail}"
+                        ),
+                    }
+                })?;
             monitors.push(ValidatedMonitor {
                 vss_key: vss_key.clone(),
-                local_key: monitor.persistence_key().to_string(),
+                local_key: parsed.local_key,
                 bytes,
                 version,
             });
@@ -751,7 +1041,7 @@ pub(crate) fn run_restore(
         .as_ref()
         .map(|(keys, _)| keys.clone())
         .unwrap_or_default();
-    reconcile_backup_keys(&listing, &manifest_keys, &*transport)?;
+    let unexplained = unexplained_remote_keys(&listing, &manifest_keys, &*transport);
 
     // Validation signer stack from the ENTERED mnemonic, over a throwaway
     // scratch store: the real data dir stays untouched until the plan is
@@ -783,13 +1073,76 @@ pub(crate) fn run_restore(
         keys.channel_keys_id_hmac_key,
         Arc::clone(&logger),
     );
-    let plan = runtime.block_on(download_and_validate(
+
+    // Identify anything the manifest and the fixed key set do not explain
+    // BEFORE the bulk download: an unidentifiable key still aborts here, with
+    // nothing written and nothing downloaded in vain.
+    let adopted = if unexplained.is_empty() {
+        Vec::new()
+    } else {
+        let verdict = runtime.block_on(verify_unexplained_keys(
+            &*transport,
+            &unexplained,
+            &keys_manager,
+            &signer_provider,
+            RESTORE_DOWNLOAD_BUDGET,
+            &logger,
+        ))?;
+        if !verdict.rejected.is_empty() {
+            return Err(backup_inconsistent(
+                &listing,
+                &manifest_keys,
+                &*transport,
+                unexplained.len(),
+                &verdict.rejected,
+                Some((verdict.adopted.len(), verdict.rejected.len())),
+            ));
+        }
+        verdict.adopted
+    };
+
+    let mut plan = runtime.block_on(download_and_validate(
         &transport,
         manifest,
         &keys_manager,
         &signer_provider,
         RESTORE_DOWNLOAD_BUDGET,
     ))?;
+    // Adopted monitors join the restore set. A manifest-listed monitor wins any
+    // collision: it is the authoritative copy of that channel's state.
+    let planned: HashSet<String> = plan
+        .monitors
+        .iter()
+        .map(|monitor| monitor.local_key.clone())
+        .collect();
+    let mut adopted_count = 0usize;
+    for monitor in adopted {
+        if planned.contains(&monitor.local_key) {
+            log_error!(
+                logger,
+                "Adopted monitor {} duplicates a manifest-listed one; keeping the listed copy",
+                monitor.vss_key
+            );
+            continue;
+        }
+        log_info!(
+            logger,
+            "Restoring adopted monitor {} that no manifest listed",
+            monitor.vss_key
+        );
+        plan.monitors.push(monitor);
+        adopted_count += 1;
+    }
+    if !plan.monitors.is_empty() && plan.cm.is_none() {
+        // The same invariant `download_and_validate` enforces for
+        // manifest-listed monitors: monitors without a channel manager cannot
+        // be booted into a working wallet (F3's CM-before-monitors ordering has
+        // nothing to order), so an adopted monitor may not smuggle that state
+        // past the check.
+        return Err(RestoreError::BackupInconsistent {
+            detail: "monitors present remotely but channel_manager missing".to_string(),
+        });
+    }
     drop(signer_provider);
     drop(scratch);
     drop(keys); // WalletKeys::drop scrubs the derived key material.
@@ -845,9 +1198,23 @@ pub(crate) fn run_restore(
     remove_marker(&storage_dir).map_err(|e| RestoreError::LocalWriteFailed {
         detail: format!("marker removal failed: {e}"),
     })?;
+
+    // The restore is complete and durable from here on: the manifest backfill
+    // is a courtesy to the NEXT restore (so it needs no identification pass),
+    // and a failure must never turn a finished restore into a failed one.
+    if adopted_count > 0 {
+        runtime.block_on(backfill_manifest(
+            &*transport,
+            &plan.monitor_keys(),
+            plan.manifest_version.unwrap_or(0),
+            &logger,
+        ));
+    }
+
     log_info!(
         logger,
-        "Restore complete: {} monitor(s), channel_manager: {}, peers: {}",
+        "Restore complete: {} monitor(s) ({adopted_count} adopted from unlisted remote key(s)), \
+         channel_manager: {}, peers: {}",
         plan.monitors.len(),
         plan.cm.is_some(),
         plan.peers.is_some()
@@ -945,6 +1312,120 @@ mod tests {
 
     const PEER_PUBKEY: &str = "034066e29e402d9cf55af1ae1026cc5adf92eed1e0e421785442f53717ad1453b0";
     const PEERS_JSON: &str = r#"{"034066e29e402d9cf55af1ae1026cc5adf92eed1e0e421785442f53717ad1453b0": {"host": "64.23.159.177", "port": 9735}}"#;
+
+    // ---------- real channel-monitor vectors ----------
+
+    /// Two REAL serialized monitors (see the fixture's own `_provenance`).
+    /// Nothing in this crate can mint a `ChannelMonitor` offline — a funded
+    /// channel is required — so without these the restore tests could only ever
+    /// assert that garbage is REJECTED, never that a genuine monitor is
+    /// accepted, adopted and written.
+    const MONITOR_VECTORS: &str = include_str!("../fixtures/channel_monitor_vectors.json");
+
+    /// One fixture monitor: its bytes and the two candidate key spellings of
+    /// its funding outpoint.
+    struct MonitorVector {
+        bytes: Vec<u8>,
+        /// `{raw-order txid hex}:{vout}` — the PWA wire format
+        /// (`outpointKey` = `bytesToHex(outpoint.get_txid())`,
+        /// `zinq/src/ldk/traits/persist.ts:17`).
+        raw_key: String,
+        /// `{display-order txid hex}:{vout}` — what an explorer shows, and the
+        /// spelling our key MUST NOT use.
+        display_key: String,
+    }
+
+    fn monitor_vectors() -> Vec<MonitorVector> {
+        let doc: serde_json::Value = serde_json::from_str(MONITOR_VECTORS).unwrap();
+        doc["monitors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let vout = entry["funding_vout"].as_u64().unwrap();
+                MonitorVector {
+                    bytes: hex_bytes(entry["monitor_hex"].as_str().unwrap()),
+                    raw_key: format!("{}:{vout}", entry["funding_txid_raw_hex"].as_str().unwrap()),
+                    display_key: format!(
+                        "{}:{vout}",
+                        entry["funding_txid_display_hex"].as_str().unwrap()
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The validation signer stack a restore builds from the ENTERED words,
+    /// over a throwaway store (the same construction as [`run_restore`]).
+    fn validation_stack(dir: &Path) -> (Arc<KeysManager>, WalletSignerProvider) {
+        let keys = derive_wallet_keys(
+            &parse_mnemonic(crate::keys::tests::TEST_MNEMONIC).unwrap(),
+            bitcoin::Network::Bitcoin,
+        );
+        let logger = Arc::new(Logger);
+        let keys_manager = Arc::new(KeysManager::new(&keys.ldk_seed, 0, 0, false));
+        let wallet = Arc::new(
+            OnchainWallet::new(
+                &keys.descriptor_external,
+                &keys.descriptor_internal,
+                bitcoin::Network::Bitcoin,
+                Arc::new(FilesystemStore::new(dir.join(KV_STORE_SUBDIR))),
+                Arc::clone(&logger),
+            )
+            .unwrap(),
+        );
+        let provider = WalletSignerProvider::new(
+            Arc::clone(&keys_manager),
+            wallet,
+            keys.channel_keys_id_hmac_key,
+            logger,
+        );
+        (keys_manager, provider)
+    }
+
+    /// FIX B VECTOR (cross-client wire format, end to end): the VSS key we
+    /// derive for a REAL monitor must be `{funding txid RAW byte order}:{vout}`
+    /// — byte-identical to what the PWA writes
+    /// (`outpointKey` = `` `${bytesToHex(outpoint.get_txid())}:${index}` ``,
+    /// `zinq/src/ldk/traits/persist.ts:17-19`; LDK's `get_txid()` hands JS the
+    /// hash's raw internal bytes, and the PWA's separate `txidBytesToHex`
+    /// display-order helper is deliberately NOT used there).
+    ///
+    /// If this ever flips to the reversed display order, cross-client
+    /// dual-write silently breaks in a second way: after restoring a PWA
+    /// wallet our next monitor write would create a DUPLICATE remote blob
+    /// under a different key while the PWA's original went stale. The
+    /// companion unit vector lives in `vss::store`
+    /// (`monitor_vss_key_uses_raw_txid_byte_order`); this one pins the whole
+    /// path — deserialize a real monitor, ask it for its funding outpoint,
+    /// derive the key.
+    #[test]
+    fn derived_monitor_vss_keys_use_the_pwa_raw_txid_byte_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keys_manager, signer_provider) = validation_stack(dir.path());
+        for vector in monitor_vectors() {
+            let parsed = deserialize_monitor(&vector.bytes, &keys_manager, &signer_provider)
+                .expect("a real serialized monitor must deserialize under any seed's signer");
+            assert_eq!(
+                parsed.derived_vss_key, vector.raw_key,
+                "monitor VSS keys must use the funding txid's RAW byte order (PWA wire format)"
+            );
+            assert_ne!(
+                parsed.derived_vss_key, vector.display_key,
+                "the display (reversed) order would break cross-client dual-write"
+            );
+            assert!(crate::vss::store::is_valid_monitor_key(
+                &parsed.derived_vss_key
+            ));
+        }
+    }
 
     // ---------- scenario 1 (AE3 offline half) + progress copy ----------
 
@@ -1053,7 +1534,183 @@ mod tests {
 
     // ---------- scenario 4: manifest reconciliation ----------
 
-    /// A remote monitor-shaped key that no manifest explains → typed
+    /// The reported cross-client bug (R4/AE2): a PWA-shaped backup — the fixed
+    /// keys, a manifest listing ONE monitor, and a second monitor blob the
+    /// manifest never listed.
+    ///
+    /// The PWA produces exactly this by design: its manifest write is
+    /// fire-and-forget (`writeManifest(): void`, never awaited —
+    /// `zinq/src/ldk/traits/persist.ts:98`) and archiving a channel
+    /// deliberately orphans the monitor's VSS key ("orphaned VSS keys waste
+    /// storage but do not affect fund safety", ibid. 370-376). Aborting made
+    /// every PWA wallet that ever closed a channel permanently
+    /// un-restorable, so the unlisted monitor must be ADOPTED: BOTH monitors
+    /// land locally, and the manifest is backfilled so the next restore on
+    /// this seed reconciles with no identification pass at all.
+    #[test]
+    fn a_pwa_shaped_backup_adopts_the_unlisted_monitor_and_backfills_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        create_local_wallet(dir.path());
+        let vectors = monitor_vectors();
+        let (listed, unlisted) = (&vectors[0], &vectors[1]);
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![listed.raw_key.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&listed.raw_key, &listed.bytes, 1);
+        // The orphan: a real monitor blob no manifest mentions.
+        transport.seed(&unlisted.raw_key, &unlisted.bytes, 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        node.restore(crate::keys::tests::TEST_MNEMONIC)
+            .expect("a PWA backup with an unlisted monitor must restore");
+
+        // BOTH monitors are local, byte-for-byte — the adopted one included.
+        let store = kv_store(dir.path());
+        let local_keys = store
+            .list(
+                CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+            )
+            .unwrap();
+        assert_eq!(local_keys.len(), 2, "listed + adopted, got {local_keys:?}");
+        let written: BTreeSet<Vec<u8>> = local_keys
+            .iter()
+            .map(|key| {
+                store
+                    .read(
+                        CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                        CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                        key,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            written.contains(&unlisted.bytes),
+            "the ADOPTED monitor's bytes must be written locally"
+        );
+        assert!(written.contains(&listed.bytes));
+
+        // The manifest was backfilled to list both, at the next version.
+        let (manifest_bytes, manifest_version) = transport.value(MONITOR_MANIFEST_KEY).unwrap();
+        let backfilled: BTreeSet<String> = parse_monitor_manifest(&manifest_bytes)
+            .expect("the backfilled manifest must be valid")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            backfilled,
+            BTreeSet::from([listed.raw_key.clone(), unlisted.raw_key.clone()]),
+            "the backfilled manifest must explain every remote monitor key"
+        );
+        assert_eq!(manifest_version, 2, "backfilled at the known version + 1");
+
+        // Sanity: the same listing now reconciles STRICTLY, which is the whole
+        // point of the backfill.
+        let listing = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(transport.list_key_versions())
+            .unwrap();
+        let manifest_keys: Vec<String> = backfilled.into_iter().collect();
+        reconcile_backup_keys(&listing, &manifest_keys, &*transport)
+            .expect("after the backfill the backup is self-describing");
+
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            parse_mnemonic(crate::keys::tests::TEST_MNEMONIC)
+                .unwrap()
+                .to_string()
+        );
+    }
+
+    /// An unexplained key whose value does not DECRYPT with this seed's
+    /// encryption key is genuinely foreign (or corrupt) data — the store is not
+    /// ours to interpret, so the restore still aborts, and the diagnostic says
+    /// the key was rejected rather than verified.
+    #[test]
+    fn an_undecryptable_unexplained_key_still_aborts_and_reports_it_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mnemonic) = create_local_wallet(dir.path());
+        let cm_before = local_cm(dir.path()).unwrap();
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        let foreign = format!("{}:0", "ab".repeat(32));
+        transport.seed_undecryptable(&foreign, b"ciphertext from another key", 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        let err = node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err();
+        let detail = match &err {
+            RestoreError::BackupInconsistent { detail } => detail.clone(),
+            other => panic!("expected BackupInconsistent, got {other:?}"),
+        };
+        assert!(
+            detail.contains("0 decrypted and deserialized"),
+            "the diagnostic must report how many keys were verified: {detail}"
+        );
+        assert!(
+            detail.contains("1 could not be identified"),
+            "the diagnostic must report the rejected count: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("Unidentifiable obfuscated key(s): {foreign}")),
+            "the report must name the key it could not identify: {detail}"
+        );
+
+        // Nothing was touched.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            mnemonic
+        );
+        assert_eq!(local_cm(dir.path()).unwrap(), cm_before);
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+    }
+
+    /// One adoptable orphan does not buy amnesty for the other: a real
+    /// unlisted monitor ALONGSIDE an unexplained key that decrypts but is not a
+    /// monitor still aborts, and the diagnostic reports both counts.
+    #[test]
+    fn an_unexplained_non_monitor_aborts_even_next_to_an_adoptable_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mnemonic) = create_local_wallet(dir.path());
+        let vectors = monitor_vectors();
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(&vectors[0].raw_key, &vectors[0].bytes, 1);
+        let junk = format!("{}:7", "ab".repeat(32));
+        transport.seed(&junk, b"decrypts fine, not a channel monitor", 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        let err = node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err();
+        let detail = match &err {
+            RestoreError::BackupInconsistent { detail } => detail.clone(),
+            other => panic!("expected BackupInconsistent, got {other:?}"),
+        };
+        assert!(
+            detail.contains("1 decrypted and deserialized") && detail.contains("1 could not be"),
+            "the diagnostic must separate verified monitors from rejects: {detail}"
+        );
+        assert!(
+            detail.contains(&junk),
+            "the report names the offender, not the adoptable orphan: {detail}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            mnemonic
+        );
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+    }
+
+    /// A remote monitor-shaped key that no manifest explains AND that is not a
+    /// channel monitor (the identification pass rejects it) → typed
     /// BackupInconsistent, aborted before ANY write (no marker, words
     /// intact, store intact).
     #[test]
@@ -1083,7 +1740,8 @@ mod tests {
     }
 
     /// Same with a manifest present: a monitor key OUTSIDE the manifest is
-    /// unexplained even though other monitor keys are listed.
+    /// unexplained even though other monitor keys are listed, and here neither
+    /// blob is a real monitor, so nothing can be adopted.
     #[test]
     fn monitor_key_absent_from_manifest_aborts_with_backup_inconsistent() {
         let dir = tempfile::tempdir().unwrap();

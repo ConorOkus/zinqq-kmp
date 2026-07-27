@@ -123,9 +123,35 @@ impl VssWireClient {
         &self,
         plaintext_key: &str,
     ) -> Result<Option<(Vec<u8>, i64)>, VssError> {
+        self.get_by_wire_key(crypto::obfuscate_key(&self.encryption_key, plaintext_key))
+            .await
+    }
+
+    /// Fetches and decrypts an object by the key it is ALREADY STORED UNDER —
+    /// i.e. the obfuscated form `listKeyVersions` reports — applying NO further
+    /// obfuscation. `GetObjectRequest.key` carries whatever the server holds,
+    /// so this is an ordinary request; only the client-side key derivation is
+    /// skipped.
+    ///
+    /// It exists because obfuscation is a one-way HMAC of the key NAME: a
+    /// listing entry that no expected key explains cannot be turned back into
+    /// a plaintext key, so the only way to learn WHAT it is (U4's restore
+    /// reconciliation: an unlisted monitor another client orphaned, versus
+    /// genuinely foreign data) is to fetch it by its stored key. The value is
+    /// decrypted with the same seed-derived encryption key as any normal get,
+    /// so a successful decrypt is itself proof the blob belongs to this
+    /// wallet's seed.
+    pub async fn get_object_by_stored_key(
+        &self,
+        stored_key: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>, VssError> {
+        self.get_by_wire_key(stored_key.to_string()).await
+    }
+
+    async fn get_by_wire_key(&self, wire_key: String) -> Result<Option<(Vec<u8>, i64)>, VssError> {
         let request = GetObjectRequest {
             store_id: self.store_id.clone(),
-            key: crypto::obfuscate_key(&self.encryption_key, plaintext_key),
+            key: wire_key,
         };
         let (status, payload) = self.post("getObject", request.encode_to_vec()).await?;
         if status == 404 {
@@ -509,6 +535,40 @@ mod tests {
         let sent = GetObjectRequest::decode(&stub.body(0)[..]).unwrap();
         assert_eq!(sent.store_id, TEST_STORE_ID);
         assert_eq!(sent.key, crypto::obfuscate_key(&VECTOR_ENC_KEY, "my-key"));
+    }
+
+    /// U4 restore reconciliation depends on this: the stored (already
+    /// obfuscated) key must go on the wire VERBATIM — obfuscating it a second
+    /// time would ask the server for a key that cannot exist — while the value
+    /// is decrypted exactly like a normal get.
+    #[tokio::test]
+    async fn get_object_by_stored_key_sends_the_key_verbatim_and_still_decrypts() {
+        let stored_key = crypto::obfuscate_key(&VECTOR_ENC_KEY, "some-monitor-key");
+        let response = GetObjectResponse {
+            value: Some(KeyValue {
+                key: stored_key.clone(),
+                version: 9,
+                value: crypto::encrypt(&VECTOR_ENC_KEY, b"monitor bytes"),
+            }),
+        };
+        let stub = spawn_stub(vec![(200, response.encode_to_vec())]);
+        let client = test_client(stub.url.clone());
+
+        let (value, version) = client
+            .get_object_by_stored_key(&stored_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, b"monitor bytes".to_vec());
+        assert_eq!(version, 9);
+
+        let sent = GetObjectRequest::decode(&stub.body(0)[..]).unwrap();
+        assert_eq!(sent.key, stored_key, "the stored key must not be re-hashed");
+        assert_ne!(
+            sent.key,
+            crypto::obfuscate_key(&VECTOR_ENC_KEY, &stored_key),
+            "double obfuscation would request a key that cannot exist"
+        );
     }
 
     #[tokio::test]
