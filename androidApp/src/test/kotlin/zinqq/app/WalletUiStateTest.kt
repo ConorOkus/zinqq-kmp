@@ -1,4 +1,4 @@
-package zinqq.spike.android
+package zinqq.app
 
 import uniffi.wallet_core.Event
 import kotlin.test.Test
@@ -69,8 +69,28 @@ class WalletUiStateTest {
         assertFalse(reduce(started, Event.NodeStopped).nodeRunning)
     }
 
+    @Test
+    fun fencedEventRaisesTheBlockingFencedFlag() {
+        val state = reduce(
+            UiState(nodeRunning = true),
+            Event.Fenced(detail = "vss 409: divergent channel_manager"),
+        )
+
+        assertTrue(state.fenced)
+    }
+
+    @Test
+    fun noEventClearsTheFencedFlag() {
+        // Un-fencing is user-owned (KTD-3, System-Wide Impact): restore or
+        // quit — a node stop must not lower the fence.
+        val fenced = reduce(UiState(nodeRunning = true), Event.Fenced(detail = "409"))
+
+        assertTrue(reduce(fenced, Event.NodeStopped).fenced)
+        assertTrue(reduce(fenced, Event.SyncCompleted).fenced)
+    }
+
     private companion object {
-        // Opaque display data to the shell (R4); never parsed by Android code.
+        // Opaque display data to the shell (R14); never parsed by Android code.
         const val BOLT11 = "lnbc2500u1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypq"
         val PAYMENT_HASH = "11".repeat(32)
     }

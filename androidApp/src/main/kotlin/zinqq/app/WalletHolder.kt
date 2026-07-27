@@ -1,4 +1,4 @@
-package zinqq.spike.android
+package zinqq.app
 
 import android.content.Context
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -14,9 +14,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.Wallet
+import uniffi.wallet_core.WalletException
+import zinqq.app.theme.AppearanceMode
+import zinqq.app.theme.SettingsRepository
 import zinqq.spike.WalletCore
 
 /**
@@ -33,13 +35,20 @@ import zinqq.spike.WalletCore
  * second wallet over the same directory: two `ChannelManager`s on one seed with
  * last-writer-wins persistence.
  *
- * Created once from [SpikeApplication], so activity recreation (rotation, back
+ * Created once from [ZinqqApplication], so activity recreation (rotation, back
  * press and relaunch) reuses the running node instead of racing a second one.
  * The Rust core independently refuses a second instance over the same storage
  * directory, so this class is the ergonomic half of that guarantee, not its
  * only line of defence.
+ *
+ * This is also the only place uniffi types are touched (R14): screens read
+ * [state] and call intent methods; classification, fee math, and protocol
+ * work stay in the Rust core.
  */
-class WalletHolder(context: Context) : DefaultLifecycleObserver {
+class WalletHolder(
+    context: Context,
+    private val settings: SettingsRepository,
+) : DefaultLifecycleObserver {
     // App-private filesDir (NOT cache, which the OS may purge): holds the seed,
     // channel monitors, and the storage lock, and is the directory
     // data_extraction_rules.xml excludes from backup and device transfer (R6).
@@ -51,10 +60,24 @@ class WalletHolder(context: Context) : DefaultLifecycleObserver {
 
     private val wallet: Wallet by lazy { WalletCore.create(storageDir) }
 
-    private val _state = MutableStateFlow(UiState())
+    // The synchronous read is deliberate (KTD-11): the persisted appearance
+    // mode must be in the very first emitted state so no frame renders in the
+    // wrong theme. It runs once, at process start, against a tiny local file.
+    private val _state = MutableStateFlow(
+        UiState(appearanceMode = settings.appearanceModeBlocking()),
+    )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private var loopJob: Job? = null
+
+    init {
+        // Keep the state's appearance mode mirroring the persisted selection.
+        scope.launch {
+            settings.appearanceMode.collect { mode ->
+                _state.update { it.copy(appearanceMode = mode) }
+            }
+        }
+    }
 
     fun observeProcessLifecycle() {
         ProcessLifecycleOwner.get().lifecycle.addObserver(this)
@@ -63,6 +86,11 @@ class WalletHolder(context: Context) : DefaultLifecycleObserver {
     override fun onStart(owner: LifecycleOwner) = startNode()
 
     override fun onStop(owner: LifecycleOwner) = stopNode()
+
+    /** Persist a new appearance mode; [state] updates through the mirror above. */
+    fun setAppearanceMode(mode: AppearanceMode) {
+        scope.launch { settings.setAppearanceMode(mode) }
+    }
 
     fun refreshBalances() {
         scope.launch {
@@ -113,6 +141,12 @@ class WalletHolder(context: Context) : DefaultLifecycleObserver {
         loopJob = scope.launch {
             try {
                 wallet.start()
+            } catch (e: WalletException.Fenced) {
+                // The durable fence survives restart (KTD-3): a fenced wallet
+                // refuses to start, and the shell must block every screen even
+                // though no Event.Fenced will arrive on this run (U13).
+                _state.update { it.copy(fenced = true) }
+                return@launch
             } catch (e: Exception) {
                 _state.update { it.copy(lastOutcome = "Node start failed: ${e.message}") }
                 return@launch

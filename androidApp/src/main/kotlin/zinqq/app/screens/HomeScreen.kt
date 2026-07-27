@@ -1,0 +1,158 @@
+package zinqq.app.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
+import zinqq.app.WalletHolder
+import zinqq.app.components.QrView
+import zinqq.app.theme.ZinqqTheme
+
+/**
+ * Home temporarily hosts the spike's single WalletScreen (U13): the proven
+ * receive/send flow moved here unchanged so the shell keeps paying while
+ * U14 builds the real Home. Only the QR rendering moved into the shared
+ * [QrView] component; everything else is the spike content verbatim.
+ */
+@Composable
+fun HomeScreen(holder: WalletHolder) {
+    val state by holder.state.collectAsState()
+    var receiveAmount by remember { mutableStateOf("") }
+    var sendBolt11 by remember { mutableStateOf("") }
+    val colors = ZinqqTheme.colors
+
+    CompositionLocalProvider(LocalContentColor provides colors.onField) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(colors.field)
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "${state.balanceMsat / 1_000uL} sats",
+                        style = MaterialTheme.typography.headlineMedium,
+                    )
+                    Text(
+                        text = "on-chain ${state.onchainSats} sats · " +
+                            "node ${if (state.nodeRunning) "running" else "stopped"}",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                TextButton(onClick = holder::refreshBalances) { Text("Refresh") }
+            }
+            state.syncBanner?.let {
+                Text(text = it, color = colors.dangerStrong)
+            }
+
+            HorizontalDivider(color = colors.onFieldMuted)
+            Text(text = "Receive", style = MaterialTheme.typography.titleMedium)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                OutlinedTextField(
+                    value = receiveAmount,
+                    onValueChange = { receiveAmount = it },
+                    label = { Text("Amount (sats)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                val parsedAmount = remember(receiveAmount) { receiveAmount.toULongOrNull() }
+                Button(
+                    onClick = { parsedAmount?.let(holder::requestInvoice) },
+                    enabled = state.nodeRunning && parsedAmount != null,
+                ) { Text("Invoice") }
+            }
+            state.currentInvoice?.let { InvoiceDisplay(it) }
+
+            HorizontalDivider(color = colors.onFieldMuted)
+            Text(text = "Send", style = MaterialTheme.typography.titleMedium)
+            OutlinedTextField(
+                value = sendBolt11,
+                onValueChange = { sendBolt11 = it },
+                label = { Text("BOLT11 invoice") },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = { holder.sendPayment(sendBolt11) },
+                enabled = state.nodeRunning && sendBolt11.isNotBlank(),
+            ) { Text("Pay") }
+
+            state.lastOutcome?.let {
+                HorizontalDivider(color = colors.onFieldMuted)
+                Text(text = it, style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ColumnScope.InvoiceDisplay(invoice: zinqq.app.InvoiceUi) {
+    // The BOLT11 is opaque display data here (R14): it goes straight from the
+    // InvoiceReady event into pixels.
+    QrView(
+        payload = invoice.bolt11,
+        contentDescription = "Invoice QR code",
+        modifier = Modifier
+            .size(240.dp)
+            .align(Alignment.CenterHorizontally),
+    )
+    ExpiryCountdown(expiryUnixSecs = invoice.expiryUnixSecs)
+    Text(text = invoice.bolt11, style = MaterialTheme.typography.bodySmall)
+}
+
+@Composable
+private fun ExpiryCountdown(expiryUnixSecs: ULong) {
+    var remaining by remember(expiryUnixSecs) { mutableLongStateOf(secsUntil(expiryUnixSecs)) }
+    LaunchedEffect(expiryUnixSecs) {
+        while (remaining > 0) {
+            delay(1_000)
+            remaining = secsUntil(expiryUnixSecs)
+        }
+    }
+    Text(
+        text = if (remaining > 0) {
+            "Expires in ${remaining / 60}m ${remaining % 60}s"
+        } else {
+            "Invoice expired"
+        },
+        style = MaterialTheme.typography.bodyMedium,
+    )
+}
+
+private fun secsUntil(expiryUnixSecs: ULong): Long =
+    expiryUnixSecs.toLong() - System.currentTimeMillis() / 1_000
