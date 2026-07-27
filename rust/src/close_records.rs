@@ -776,7 +776,7 @@ impl CloseRecordStore {
     pub(crate) fn snapshot(&self) -> Vec<CloseRecord> {
         let mut records: Vec<CloseRecord> =
             self.records.lock().unwrap().values().cloned().collect();
-        records.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at_ms));
         records
     }
 

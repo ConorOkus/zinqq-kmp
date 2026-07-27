@@ -585,7 +585,7 @@ pub(crate) fn merge_activity(
 
     // Stable descending sort: equal timestamps keep the PWA's push order
     // (on-chain, lightning, closes).
-    rows.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.created_at_ms));
     rows
 }
 

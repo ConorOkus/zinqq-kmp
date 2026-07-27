@@ -1438,7 +1438,7 @@ impl SweepEngine {
                 script_pubkey: txout.script_pubkey,
             })
             .collect();
-        candidates.sort_by(|a, b| b.value_sats.cmp(&a.value_sats));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.value_sats));
         candidates
     }
 
