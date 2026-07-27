@@ -31,6 +31,10 @@ class RefreshTriggerTest {
         assertTrue(shouldRefreshWalletData(Event.ChannelReady(channelId = "33".repeat(32))))
         assertTrue(shouldRefreshWalletData(Event.SweepStateChanged))
         assertTrue(shouldRefreshWalletData(Event.RecoveryStateChanged))
+        // The on-chain half: the bdk sync tick is the only source of an
+        // on-chain receive/confirmation, so without this the balance stays
+        // stale until an unrelated event or a relaunch.
+        assertTrue(shouldRefreshWalletData(Event.OnchainStateChanged))
     }
 
     @Test

@@ -6,14 +6,16 @@
 //! U8 send engine's tx factory (focused build/sign methods over the mutexed
 //! bdk wallet — the raw wallet is never exposed).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use bdk_esplora::EsploraAsyncExt;
-use bdk_wallet::chain::Merge;
+use bdk_wallet::chain::spk_client::SyncRequest;
+use bdk_wallet::chain::{spk_txout, tx_graph, ConfirmationBlockTime, Merge};
 use bdk_wallet::{
     ChangeSet, KeychainKind, PersistedWallet, SignOptions, Wallet as BdkWallet, WalletPersister,
 };
-use bitcoin::{Amount, FeeRate, Network, Psbt, ScriptBuf, Transaction};
+use bitcoin::{Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction};
 use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::log_error;
 use lightning::sign::ChangeDestinationSourceSync;
@@ -23,6 +25,7 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use crate::builder::BuildError;
 use crate::chain::ChainError;
+use crate::config::ONCHAIN_SYNC_KEYCHAIN_WINDOW;
 use crate::onchain_send::{BuiltTxFacts, OnchainSendError, TxBuildFailure, TxSpec};
 use crate::types::Logger;
 
@@ -120,6 +123,30 @@ pub(crate) struct OnchainWallet {
     ///
     /// [`ChainSource::sync_onchain_wallet`]: crate::chain::ChainSource::sync_onchain_wallet
     cold_restore: std::sync::atomic::AtomicBool,
+    /// EXTERNAL indices that a KTD-4 deterministic close destination lands on
+    /// (`BE(channel_keys_id[0..4]) mod 10_000`), pinned into every incremental
+    /// sync by [`OnchainWallet::bounded_sync_request`].
+    ///
+    /// WHY A SEPARATE SET: destination indices are uniform over 0..9 999, so
+    /// they sit in the MIDDLE of the revealed range — neither the lowest-unused
+    /// window (where `next_unused_address` vends) nor the highest-revealed
+    /// window (where `reveal_next_address` vends) can cover them, and dropping
+    /// one would permanently hide a channel's close funds. Every path that can
+    /// hand a destination script to LDK registers here:
+    /// [`OnchainWallet::destination_script_for_index`] (channel open, and the
+    /// signer's lazy `get_destination_script`) and
+    /// [`crate::signer::WalletSignerProvider::reveal_derived_destinations`]
+    /// (every boot, over every loaded monitor's `channel_keys_id`).
+    ///
+    /// Per-process by design, and correct without persistence because it is
+    /// rebuilt from the SAME source of truth on every boot — the monitors —
+    /// before the first scan runs. RESIDUAL (inherited verbatim from
+    /// `reveal_derived_destinations`): a channel whose monitor was fully
+    /// archived AND deleted leaves no `channel_keys_id` to derive from, so its
+    /// index is not pinned. Such a channel was resolved on chain, which means
+    /// its destination either already received (→ it is a USED spk, and used
+    /// spks are always in the sync set) or never will.
+    destination_indexes: Mutex<BTreeSet<u32>>,
     logger: Arc<Logger>,
 }
 
@@ -164,6 +191,7 @@ impl OnchainWallet {
             inner: Mutex::new(WalletInner { wallet, persister }),
             initial_scan_complete: std::sync::atomic::AtomicBool::new(false),
             cold_restore: std::sync::atomic::AtomicBool::new(false),
+            destination_indexes: Mutex::new(BTreeSet::new()),
             logger,
         })
     }
@@ -181,26 +209,37 @@ impl OnchainWallet {
         self.cold_restore.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Syncs against Esplora: full scan on first use, incremental afterwards.
-    /// The first SUCCESSFUL pass marks the Initial Scan complete (U10 gate);
-    /// a failed scan never does.
-    pub(crate) async fn sync(
-        &self,
-        client: &EsploraAsyncClient,
-        stop_gap: usize,
-        concurrency: usize,
-    ) -> Result<(), ChainError> {
-        // A fresh wallet's local chain only knows genesis; do a full scan
-        // once, then cheaper revealed-script syncs.
-        let needs_full_scan = self
-            .inner
+    /// Registers `index` as a KTD-4 deterministic close destination that every
+    /// incremental sync must keep querying (see
+    /// [`OnchainWallet::destination_indexes`]). Monotone and idempotent.
+    pub(crate) fn watch_destination_indexes(&self, indexes: impl IntoIterator<Item = u32>) {
+        self.destination_indexes.lock().unwrap().extend(indexes);
+    }
+
+    /// Whether the wallet has never seen a block, i.e. the next sync must be a
+    /// FULL scan. A fresh (or freshly restored) wallet's local chain knows only
+    /// genesis.
+    fn needs_full_scan(&self) -> bool {
+        self.inner
             .lock()
             .unwrap()
             .wallet
             .latest_checkpoint()
             .height()
-            == 0;
-        let result = if needs_full_scan {
+            == 0
+    }
+
+    /// Syncs against Esplora: full scan on first use, incremental afterwards.
+    /// The first SUCCESSFUL pass marks the Initial Scan complete (U10 gate);
+    /// a failed scan never does. Returns whether the pass CHANGED any
+    /// wallet-visible data (see [`OnchainWallet::apply_update`]).
+    pub(crate) async fn sync(
+        &self,
+        client: &EsploraAsyncClient,
+        stop_gap: usize,
+        concurrency: usize,
+    ) -> Result<bool, ChainError> {
+        let result = if self.needs_full_scan() {
             let request = self.inner.lock().unwrap().wallet.start_full_scan().build();
             let update = client
                 .full_scan(request, stop_gap, concurrency)
@@ -208,13 +247,7 @@ impl OnchainWallet {
                 .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?;
             self.apply_update(update)
         } else {
-            let request = self
-                .inner
-                .lock()
-                .unwrap()
-                .wallet
-                .start_sync_with_revealed_spks()
-                .build();
+            let request = self.bounded_sync_request();
             let update = client
                 .sync(request, concurrency)
                 .await
@@ -226,6 +259,131 @@ impl OnchainWallet {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         result
+    }
+
+    /// The INCREMENTAL sync request: a SPARSE UNION of the SPKs that can
+    /// plausibly move, instead of bdk's `start_sync_with_revealed_spks()` —
+    /// which queries every revealed SPK and therefore pays the full price of
+    /// the KTD-4 destination scheme's inclusive reveal on every single tick
+    /// (see [`ONCHAIN_SYNC_KEYCHAIN_WINDOW`] for the measurement that forced
+    /// this).
+    ///
+    /// Additive over the same primitives bdk uses: `revealed_spks_from_indexer`
+    /// is itself a one-line wrapper over `spks_with_indexes(...)`
+    /// (`bdk_chain::keychain_txout`), so narrowing the SPK set changes nothing
+    /// else about the request — the chain tip and the `expected_spk_txids`
+    /// eviction detection are constructed exactly as
+    /// `Wallet::start_sync_with_revealed_spks` does.
+    ///
+    /// THE SAFETY PROPERTY: an SPK that has ever been handed out, or that has
+    /// any known history, is NEVER dropped — missing a payment permanently is
+    /// strictly worse than a slow sync. Each member of the union carries its
+    /// own proof:
+    ///
+    /// 1. Every USED SPK the indexer TRACKS, on both keychains (revealed range
+    ///    plus lookahead). Covers all history we know about, hence every UTXO's
+    ///    own script and every previously-paid address, and (with 5.) keeps
+    ///    spends of our coins detectable. It is also a superset of the SPKs
+    ///    `expected_spk_txids` names — those come from canonical txs, which by
+    ///    definition made their SPKs used — so eviction /
+    ///    malicious-replacement detection is fully preserved.
+    /// 2. The LOWEST [`ONCHAIN_SYNC_KEYCHAIN_WINDOW`] UNUSED revealed SPKs per
+    ///    keychain. This is where the wallet vends next: `next_receive_address`
+    ///    and the signer's shutdown script both use `next_unused_address`, and
+    ///    bdk returns the LOWEST unused revealed index — never a high junk one.
+    ///    Change outputs land here too (bdk's `TxBuilder` takes the next unused
+    ///    internal spk).
+    /// 3. The HIGHEST [`ONCHAIN_SYNC_KEYCHAIN_WINDOW`] revealed SPKs per
+    ///    keychain. `reveal_next_external_script` (U11 sweep destinations) and
+    ///    the reserve-output change script use `reveal_next_address`, which
+    ///    vends `last_revealed + 1` — the HIGH end. (That is exactly why the
+    ///    observed sweep paid to index 5030 rather than 3.)
+    /// 4. The pinned KTD-4 destination indices
+    ///    ([`OnchainWallet::destination_indexes`]) — mid-range by construction,
+    ///    so provably outside 2. and 3.
+    /// 5. The outpoints of the current UTXO set, queried BY OUTPOINT rather
+    ///    than by script. Exact and index-independent: a spend of one of our
+    ///    coins is seen even if some pathological wallet shape ever excluded
+    ///    its script.
+    ///
+    /// What this deliberately DOES drop is the interior of the revealed range:
+    /// `reveal_addresses_to(5030)` reveals 0..=5030 inclusive, and the ~5 000
+    /// indices in the middle were never vended to anybody and have no history.
+    /// The FULL SCAN path is untouched — it still walks the descriptors
+    /// exhaustively under the stop gaps (`BDK_CLIENT_STOP_GAP` /
+    /// `BDK_COLD_RESTORE_STOP_GAP`), which is what discovers history in the
+    /// first place.
+    fn bounded_sync_request(&self) -> SyncRequest<(KeychainKind, u32)> {
+        let inner = self.inner.lock().unwrap();
+        let wallet = &inner.wallet;
+        let index = wallet.spk_index();
+        let tip = wallet.latest_checkpoint();
+        let tip_block_id = tip.block_id();
+
+        // Deduped by (keychain, derivation index): `spks_with_indexes` only
+        // extends a queue, so a duplicate would be a duplicate Esplora query.
+        let mut spks: BTreeMap<(KeychainKind, u32), ScriptBuf> = BTreeMap::new();
+        // (1) everything with known history, taken from the indexer's FULL spk
+        // map rather than the revealed range: bdk also tracks a lookahead
+        // window, and an incremental sync (unlike a full scan) does not bump
+        // `last_revealed` for what it finds there. Reading "used" off the
+        // tracked set makes this an unconditional superset of every SPK
+        // `expected_spk_txids` can name.
+        let tracked: &spk_txout::SpkTxOutIndex<(KeychainKind, u32)> = index.as_ref();
+        spks.extend(
+            tracked
+                .all_spks()
+                .iter()
+                .filter(|(keychain_index, _)| tracked.is_used(keychain_index))
+                .map(|(keychain_index, spk)| (*keychain_index, spk.clone())),
+        );
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            // (2) the low end: where `next_unused_address` vends.
+            spks.extend(
+                index
+                    .unused_keychain_spks(keychain)
+                    .take(ONCHAIN_SYNC_KEYCHAIN_WINDOW)
+                    .map(|(i, spk)| ((keychain, i), spk)),
+            );
+            // (3) the high end: where `reveal_next_address` vends.
+            spks.extend(
+                index
+                    .revealed_keychain_spks(keychain)
+                    .rev()
+                    .take(ONCHAIN_SYNC_KEYCHAIN_WINDOW)
+                    .map(|(i, spk)| ((keychain, i), spk)),
+            );
+        }
+        // (4) the pinned close destinations. `peek_address` is a pure
+        // derivation, so this needs no wallet mutation; every pinned index was
+        // revealed by the path that pinned it, so the indexer recognises the
+        // script when a tx for it comes back.
+        //
+        // Lock order is inner -> destination_indexes throughout (this is the
+        // only place that holds both).
+        for destination in self.destination_indexes.lock().unwrap().iter().copied() {
+            spks.entry((KeychainKind::External, destination))
+                .or_insert_with(|| {
+                    wallet
+                        .peek_address(KeychainKind::External, destination)
+                        .address
+                        .script_pubkey()
+                });
+        }
+        // (5) spends of our current coins, by outpoint.
+        let outpoints: Vec<OutPoint> = wallet.list_unspent().map(|utxo| utxo.outpoint).collect();
+
+        SyncRequest::builder()
+            .chain_tip(tip)
+            .spks_with_indexes(spks)
+            .outpoints(outpoints)
+            .expected_spk_txids(wallet.tx_graph().list_expected_spk_txids(
+                wallet.local_chain(),
+                tip_block_id,
+                index,
+                ..,
+            ))
+            .build()
     }
 
     /// Whether this process completed a successful chain scan yet (U10:
@@ -262,16 +420,28 @@ impl OnchainWallet {
             .is_some_and(|tx| tx.chain_position.is_confirmed())
     }
 
-    fn apply_update(&self, update: impl Into<bdk_wallet::Update>) -> Result<(), ChainError> {
+    /// Applies a sync/scan update and persists it, reporting whether the update
+    /// CHANGED wallet-visible data — the trigger for the shells' on-chain
+    /// refresh (see [`crate::node::CoreEvent::OnchainStateChanged`]).
+    ///
+    /// The signal is read off the STAGED bdk changeset between apply and
+    /// persist, which is exact: every other mutation path on this wallet
+    /// persists immediately after staging (the address-reveal learning) and the
+    /// estimate path discards with `take_staged`, so the stage is empty when a
+    /// sync starts and holds precisely this update's effect here.
+    fn apply_update(&self, update: impl Into<bdk_wallet::Update>) -> Result<bool, ChainError> {
         let mut inner = self.inner.lock().unwrap();
         let WalletInner { wallet, persister } = &mut *inner;
         wallet
             .apply_update(update)
             .map_err(|e| ChainError::WalletSyncFailed(e.to_string()))?;
+        let changed = wallet
+            .staged()
+            .is_some_and(|staged| changes_wallet_data(&staged.tx_graph));
         wallet
             .persist(persister)
             .map_err(|e| ChainError::WalletSyncFailed(e.to_string()))?;
-        Ok(())
+        Ok(changed)
     }
 
     /// Current confirmed + unconfirmed balance.
@@ -316,6 +486,9 @@ impl OnchainWallet {
     /// `reveal_addresses_to` so bdk tracks it for syncing, and persist the
     /// reveal — a restored wallet must watch the same close scripts.
     pub(crate) fn destination_script_for_index(&self, index: u32) -> Result<ScriptBuf, ()> {
+        // Pin it BEFORE any early return: a destination handed to LDK that the
+        // incremental sync stopped querying would hide close funds forever.
+        self.watch_destination_indexes([index]);
         let mut inner = self.inner.lock().unwrap();
         let WalletInner { wallet, persister } = &mut *inner;
         let script = wallet
@@ -359,16 +532,23 @@ impl OnchainWallet {
         Ok(())
     }
 
-    /// The SPKs a revealed-SPK sync request would query (tests): proof that a
-    /// revealed destination index is actually watched by the next sync.
+    /// The SPKs the next INCREMENTAL sync would query (tests): proof that a
+    /// revealed destination index is actually watched by the next sync, and the
+    /// bound on how many scripts a tick costs.
     #[cfg(test)]
-    pub(crate) fn revealed_sync_request_spks(&self) -> Vec<ScriptBuf> {
-        let inner = self.inner.lock().unwrap();
-        let mut request = inner.wallet.start_sync_with_revealed_spks().build();
+    pub(crate) fn sync_request_spks(&self) -> Vec<ScriptBuf> {
+        let mut request = self.bounded_sync_request();
         request
             .iter_spks_with_expected_txids()
             .map(|spk| spk.spk)
             .collect()
+    }
+
+    /// The outpoints the next incremental sync would query directly (tests).
+    #[cfg(test)]
+    pub(crate) fn sync_request_outpoints(&self) -> Vec<OutPoint> {
+        let mut request = self.bounded_sync_request();
+        request.iter_outpoints().collect()
     }
 
     /// Trusted-spendable balance in sats: confirmed + trusted pending — the
@@ -707,6 +887,31 @@ fn facts_from(psbt: &Psbt) -> Result<BuiltTxFacts, TxBuildFailure> {
     })
 }
 
+/// Whether a staged bdk `tx_graph` changeset carries something the WALLET
+/// SCREENS can see — the "did anything actually change" test behind the
+/// on-chain refresh event.
+///
+/// Deliberately NOT `ChangeSet::is_empty()`:
+/// - `local_chain` is non-empty on every new block (~10 min), which is a tip
+///   advance, not a balance or activity change. `SyncCompleted`/`SyncFailed`
+///   already carry sync liveness.
+/// - `last_seen` / `first_seen` are non-empty on EVERY tick while any
+///   unconfirmed tx sits in the mempool, because bdk re-stamps a mempool tx's
+///   last-seen with the request's start time each pass. Firing on those would
+///   reintroduce exactly the "event every 120 s for nothing" the shells must
+///   not get.
+///
+/// What remains is genuinely new information: a new tx (`txs`), a new
+/// floating txout (`txouts`), a CONFIRMATION (`anchors`), or a mempool
+/// eviction (`last_evicted`) — each of which moves a balance or an activity
+/// row.
+fn changes_wallet_data(staged: &tx_graph::ChangeSet<ConfirmationBlockTime>) -> bool {
+    !staged.txs.is_empty()
+        || !staged.txouts.is_empty()
+        || !staged.anchors.is_empty()
+        || !staged.last_evicted.is_empty()
+}
+
 /// U10: the reconcile pass's wallet-receipt evidence rides on the bdk
 /// wallet. This invariant relies on BDK's graph containing only SPK-tracked
 /// txs — nothing `insert_tx`es broadcast transactions, so a force-close
@@ -951,5 +1156,285 @@ mod tests {
             Some(735),
             "the revealed external index must survive persistence"
         );
+    }
+
+    // ---------- bounded incremental sync (the 804 s regression) ----------
+
+    /// The index the real mainnet wallet's closed channel derived to, which
+    /// dragged `last_revealed` to 5 030 and every 120 s sync tick to ~5 031
+    /// Esplora script queries / 804 s wall clock.
+    const OBSERVED_DESTINATION_INDEX: u32 = 5_030;
+    /// A second destination in the MIDDLE of the revealed range: neither the
+    /// low-unused nor the high-revealed window can reach it, so only the pinned
+    /// destination set keeps it watched.
+    const INTERIOR_DESTINATION_INDEX: u32 = 2_000;
+
+    fn spk_of(address: &str) -> ScriptBuf {
+        address
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .unwrap()
+            .assume_checked()
+            .script_pubkey()
+    }
+
+    /// The whole point of the fix: a wallet whose `last_revealed` sits at 5 030
+    /// must still cost a SMALL, concretely bounded number of script queries per
+    /// tick, while keeping every SPK that can matter.
+    #[test]
+    fn a_high_index_destination_keeps_the_incremental_sync_bounded() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+
+        // Real history at the low indices (external 0 and 1) ...
+        test_support::fund_confirmed(&wallet, 25_000);
+        test_support::fund_confirmed(&wallet, 10_000);
+        // ... plus two closed channels' deterministic KTD-4 destinations. The
+        // reveal is INCLUSIVE, so this alone makes 5 031 external addresses
+        // "revealed" — that is what `start_sync_with_revealed_spks` queried.
+        let interior = wallet
+            .destination_script_for_index(INTERIOR_DESTINATION_INDEX)
+            .unwrap();
+        let observed = wallet
+            .destination_script_for_index(OBSERVED_DESTINATION_INDEX)
+            .unwrap();
+        assert_eq!(
+            test_support::derivation_index(&wallet, KeychainKind::External),
+            Some(OBSERVED_DESTINATION_INDEX),
+        );
+
+        let spks = wallet.sync_request_spks();
+
+        // The concrete bound, itemised so a future change to the union shows up
+        // here as an arithmetic mismatch rather than a silent cost regression:
+        //   2 used external (0, 1)
+        //   + 20 lowest UNUSED external (2..=21)      — `next_unused_address`
+        //   + 20 highest revealed external (5011..=5030) — `reveal_next_address`
+        //   + 1 pinned interior destination (2 000)
+        //   + 0 internal (nothing revealed on the change keychain yet)
+        const EXPECTED_SPKS: usize = 2 + 20 + 20 + 1;
+        assert_eq!(
+            spks.len(),
+            EXPECTED_SPKS,
+            "the incremental sync must stay bounded, not scale with last_revealed"
+        );
+        assert!(
+            spks.len() < 100,
+            "5 031 scripts per tick is the regression being fixed"
+        );
+
+        // ... and nothing that can matter was dropped.
+        assert!(
+            spks.contains(&observed),
+            "the high close destination must stay watched"
+        );
+        assert!(
+            spks.contains(&interior),
+            "an INTERIOR close destination is only reachable via the pinned set"
+        );
+        for used in [0, 1] {
+            assert!(
+                spks.contains(&wallet.peek_external_script(used)),
+                "external index {used} has history and must never be dropped"
+            );
+        }
+        // The address the Receive screen would hand out next (lowest unused).
+        let next_receive = spk_of(&wallet.next_receive_address().unwrap());
+        assert!(
+            spks.contains(&next_receive),
+            "the next vended receive address must be watched before it is paid"
+        );
+        // Spends of our own coins are followed by outpoint, independent of any
+        // script window.
+        let outpoints = wallet.sync_request_outpoints();
+        assert_eq!(outpoints.len(), 2, "both confirmed UTXOs, queried directly");
+    }
+
+    /// `reveal_next_external_script` (U11 sweep destinations, the PWA's
+    /// `revealNextAddress`) vends `last_revealed + 1` — the HIGH end, which is
+    /// exactly why the observed sweep paid to 5 030 rather than 3. Only the
+    /// high-end window covers it: it is not a KTD-4 destination, so nothing
+    /// pins it.
+    #[test]
+    fn a_freshly_revealed_sweep_destination_is_in_the_high_end_window() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+        test_support::fund_confirmed(&wallet, 25_000);
+        wallet
+            .destination_script_for_index(OBSERVED_DESTINATION_INDEX)
+            .unwrap();
+
+        let sweep_destination = wallet.reveal_next_external_script().unwrap();
+        assert_eq!(
+            test_support::derivation_index(&wallet, KeychainKind::External),
+            Some(OBSERVED_DESTINATION_INDEX + 1),
+            "reveal_next_address always advances past last_revealed"
+        );
+        assert_ne!(
+            sweep_destination,
+            wallet.peek_external_script(OBSERVED_DESTINATION_INDEX),
+            "the sweep destination is not the pinned KTD-4 destination"
+        );
+        assert!(
+            wallet.sync_request_spks().contains(&sweep_destination),
+            "a sweep destination must be watched the moment it is vended"
+        );
+    }
+
+    /// The non-negotiable safety property, at the point where a window alone is
+    /// not enough: an SPK with KNOWN HISTORY at a low index that has already
+    /// fallen out of the lowest-unused window is still queried. Missing a
+    /// payment permanently is strictly worse than a slow sync.
+    #[test]
+    fn a_used_low_index_spk_survives_a_high_index_destination() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+
+        // Burn the whole low window: external 0..=24 all have history, so the
+        // lowest-UNUSED window is 25..=44 and index 0 is outside every window.
+        for i in 0..25u64 {
+            test_support::fund_confirmed(&wallet, 10_000 + i);
+        }
+        wallet
+            .destination_script_for_index(OBSERVED_DESTINATION_INDEX)
+            .unwrap();
+
+        let spks = wallet.sync_request_spks();
+        for used in 0..25u32 {
+            assert!(
+                spks.contains(&wallet.peek_external_script(used)),
+                "used external index {used} must be queried, window or not"
+            );
+        }
+        assert_eq!(
+            spks.len(),
+            25 + 20 + 20,
+            "used SPKs widen the set exactly by their own count"
+        );
+    }
+
+    /// The FULL SCAN is deliberately untouched: it still walks the descriptors
+    /// exhaustively (the client applies `BDK_CLIENT_STOP_GAP` /
+    /// `BDK_COLD_RESTORE_STOP_GAP`), because that scan is what DISCOVERS the
+    /// history the bounded incremental sync then maintains.
+    #[test]
+    fn the_full_scan_path_is_unchanged() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+        assert!(
+            wallet.needs_full_scan(),
+            "a wallet that has never seen a block must full-scan"
+        );
+
+        let unbounded = {
+            let inner = wallet.inner.lock().unwrap();
+            let mut request = inner.wallet.start_full_scan().build();
+            request.iter_spks(KeychainKind::External).take(500).count()
+        };
+        assert_eq!(
+            unbounded, 500,
+            "the full scan's spk iterator is still unbounded by any revealed set"
+        );
+
+        // Once a block is known, the bounded incremental path takes over.
+        test_support::fund_confirmed(&wallet, 25_000);
+        assert!(!wallet.needs_full_scan());
+    }
+
+    // ---------- on-chain sync change detection (Fix B) ----------
+
+    /// The refresh event must fire on real news and stay silent otherwise. The
+    /// dangerous case is the mempool re-stamp: bdk re-records a pending tx's
+    /// `last_seen` with the request's start time on EVERY pass, so a
+    /// changeset-is-non-empty test would fire every 120 s for a wallet with one
+    /// unconfirmed transaction.
+    #[test]
+    fn only_new_chain_facts_count_as_an_onchain_change() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+        test_support::fund_untrusted_pending(&wallet, 50_000);
+        // Every real mutation path persists immediately after staging (the
+        // address-reveal learning), so the stage is empty when a sync starts.
+        {
+            let mut inner = wallet.inner.lock().unwrap();
+            let WalletInner { wallet, persister } = &mut *inner;
+            wallet.persist(persister).unwrap();
+        }
+        let txid: bitcoin::Txid = wallet.list_transactions()[0].txid.parse().unwrap();
+        let tip = wallet.inner.lock().unwrap().wallet.latest_checkpoint();
+
+        // A quiet tick over a still-pending tx: same tip, a later last-seen.
+        let quiet = bdk_wallet::Update {
+            last_active_indices: BTreeMap::new(),
+            tx_update: {
+                let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+                tx_update.seen_ats = [(txid, 1_700_001_000)].into_iter().collect();
+                tx_update
+            },
+            chain: Some(tip.clone()),
+        };
+        assert_eq!(
+            wallet.apply_update(quiet),
+            Ok(false),
+            "a mempool re-stamp is not news; firing here is the 120 s heartbeat bug"
+        );
+
+        // The same tx confirming IS news (balance moves from untrusted pending
+        // to confirmed).
+        let confirmed = bdk_wallet::Update {
+            last_active_indices: BTreeMap::new(),
+            tx_update: {
+                let mut tx_update = bdk_wallet::chain::TxUpdate::default();
+                tx_update.anchors = [(
+                    ConfirmationBlockTime {
+                        block_id: tip.block_id(),
+                        confirmation_time: 1_700_002_000,
+                    },
+                    txid,
+                )]
+                .into_iter()
+                .collect();
+                tx_update
+            },
+            chain: Some(tip),
+        };
+        assert_eq!(
+            wallet.apply_update(confirmed),
+            Ok(true),
+            "a confirmation must tell the shells to re-query"
+        );
+    }
+
+    /// The individual discriminations behind [`changes_wallet_data`], stated as
+    /// assertions so the exclusions are deliberate rather than accidental.
+    #[test]
+    fn changes_wallet_data_ignores_tip_and_last_seen_noise() {
+        let txid = bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
+        let mut staged = tx_graph::ChangeSet::<ConfirmationBlockTime>::default();
+        assert!(
+            !changes_wallet_data(&staged),
+            "an empty pass is not a change"
+        );
+
+        staged.last_seen.insert(txid, 1_700_000_000);
+        staged.first_seen.insert(txid, 1_700_000_000);
+        assert!(
+            !changes_wallet_data(&staged),
+            "mempool seen-at bookkeeping moves no balance and no activity row"
+        );
+
+        let mut evicted = staged.clone();
+        evicted.last_evicted.insert(txid, 1_700_000_000);
+        assert!(
+            changes_wallet_data(&evicted),
+            "an eviction removes an activity row"
+        );
+
+        staged.txs.insert(std::sync::Arc::new(Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        }));
+        assert!(changes_wallet_data(&staged), "a new transaction is news");
     }
 }

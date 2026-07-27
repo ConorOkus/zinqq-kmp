@@ -18,6 +18,10 @@ final class RefreshTriggerTests: XCTestCase {
         XCTAssertTrue(shouldRefreshWalletData(.channelReady))
         XCTAssertTrue(shouldRefreshWalletData(.sweepStateChanged))
         XCTAssertTrue(shouldRefreshWalletData(.recoveryStateChanged))
+        // The on-chain half: the bdk sync tick is the only source of an
+        // on-chain receive/confirmation, so without this the balance stays
+        // stale until an unrelated event or a relaunch.
+        XCTAssertTrue(shouldRefreshWalletData(.onchainStateChanged))
     }
 
     func testOtherEventsDoNot() {

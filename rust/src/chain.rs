@@ -527,13 +527,14 @@ impl ChainSource {
     }
 
     /// Sync the on-chain bdk wallet (separate from the lightning sync path,
-    /// sharing the same esplora client).
+    /// sharing the same esplora client). `Ok(true)` means the pass changed
+    /// wallet-visible data and the shells must re-query.
     pub(crate) async fn sync_onchain_wallet(
         &self,
         wallet: &OnchainWallet,
-    ) -> Result<(), ChainError> {
-        // The stop gap only ever governs a FULL scan (the revealed-SPK
-        // incremental sync has none), and a wallet only full-scans once — so
+    ) -> Result<bool, ChainError> {
+        // The stop gap only ever governs a FULL scan (the bounded incremental
+        // sync has none), and a wallet only full-scans once — so
         // this choice is exactly "how wide is the first scan". A restore /
         // silent recovery starts from an empty changeset over another client's
         // address history and needs the wider gap; a wallet this device created

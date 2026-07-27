@@ -120,6 +120,17 @@ pub(crate) enum CoreEvent {
     /// (PWA parity): consumers re-read `recovery_state()` — a stale payload
     /// resolving late would show yesterday's state.
     RecoveryStateChanged,
+    /// An on-chain (bdk) sync pass changed wallet-visible data (U8): a new
+    /// transaction, a confirmation, or a mempool eviction. Payload-less like
+    /// its siblings above — consumers re-read `balances()` / activity.
+    ///
+    /// WHY IT EXISTS: the on-chain sync tick used to persist its changeset and
+    /// emit nothing, and both shells re-query wallet data only on events. A
+    /// recovered sweep landed in the persisted bdk changeset while the UI sat
+    /// on a stale balance for minutes; a relaunch showed the right number
+    /// immediately. Emitted only when something actually changed, so a quiet
+    /// wallet stays silent across every 120 s tick.
+    OnchainStateChanged,
     /// Restore-from-seed progress (U4): the step strings match the PWA's
     /// Restore.tsx copy exactly.
     RestoreProgress { step: String },
@@ -1809,16 +1820,25 @@ impl Node {
                         if onchain_sync_paused.load(Ordering::Acquire) {
                             continue;
                         }
-                        if let Err(e) = chain_source.sync_onchain_wallet(&onchain_wallet).await {
-                            log_error!(logger, "On-chain wallet sync failed: {e}");
+                        // U8: a pass that changed wallet-visible data is the
+                        // ONLY thing that tells the shells to re-query the
+                        // on-chain balance and activity; an unchanged pass
+                        // stays silent so a quiet wallet gets no 120 s
+                        // heartbeat event.
+                        match chain_source.sync_onchain_wallet(&onchain_wallet).await {
+                            Ok(true) => event_sink.emit(CoreEvent::OnchainStateChanged),
+                            Ok(false) => {}
+                            Err(e) => log_error!(logger, "On-chain wallet sync failed: {e}"),
                         }
                     }
                     _ = onchain_sync_now.notified() => {
                         // U8: the post-broadcast immediate sync (PWA syncNow)
                         // — runs regardless of the pause flag, exactly like
                         // the PWA's in-window syncNow.
-                        if let Err(e) = chain_source.sync_onchain_wallet(&onchain_wallet).await {
-                            log_error!(logger, "Post-broadcast wallet sync failed: {e}");
+                        match chain_source.sync_onchain_wallet(&onchain_wallet).await {
+                            Ok(true) => event_sink.emit(CoreEvent::OnchainStateChanged),
+                            Ok(false) => {}
+                            Err(e) => log_error!(logger, "Post-broadcast wallet sync failed: {e}"),
                         }
                     }
                     _ = fee_interval.tick() => {

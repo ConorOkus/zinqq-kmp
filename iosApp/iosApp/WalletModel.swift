@@ -38,6 +38,9 @@ enum WalletEvent {
     /// The force-close recovery state machine moved (U10): re-query it and
     /// invalidate any session-local banner dismissal.
     case recoveryStateChanged
+    /// An on-chain (bdk) sync pass found real news — a new transaction, a
+    /// confirmation, or a mempool eviction (U8): re-query balances and activity.
+    case onchainStateChanged
     /// Another client took over this seed's VSS namespace (KTD-3, plan
     /// System-Wide Impact): the core fenced itself durably and halted.
     case fenced(detail: String)
@@ -83,6 +86,8 @@ enum WalletEvent {
             return .sweepStateChanged
         case is Event.RecoveryStateChanged:
             return .recoveryStateChanged
+        case is Event.OnchainStateChanged:
+            return .onchainStateChanged
         case let e as Event.Fenced:
             return .fenced(detail: e.detail)
         case let e as Event.RestoreProgress:
@@ -100,10 +105,18 @@ enum WalletEvent {
 /// triggers extended with the sweep/recovery change events (U19; identical to
 /// Android's `shouldRefreshWalletData` — the PWA's hooks re-read on the
 /// equivalent change notifications).
+///
+/// `onchainStateChanged` is the ON-CHAIN half, and it is not optional: the
+/// core's bdk sync tick is the only thing that learns about an on-chain receive
+/// or confirmation, and nothing else fires when it does. Without it a recovered
+/// sweep sat in the persisted changeset while this model kept a stale balance
+/// until an unrelated Lightning event or a relaunch — the exact symptom observed
+/// once the manual refresh button was removed. `syncCompleted` is NOT a
+/// substitute: it only fires on a failed→healthy transition.
 func shouldRefreshWalletData(_ event: WalletEvent) -> Bool {
     switch event {
     case .paymentReceived, .paymentSuccessful, .channelReady,
-         .sweepStateChanged, .recoveryStateChanged:
+         .sweepStateChanged, .recoveryStateChanged, .onchainStateChanged:
         return true
     default:
         return false
@@ -603,6 +616,10 @@ final class WalletModel: ObservableObject {
             // Fresh recovery state invalidates a session-local banner
             // dismissal (the triggered refresh re-queries the state itself).
             recoveryBannerDismissed = false
+        case .onchainStateChanged:
+            // No direct state: the triggered refresh re-queries balances() and
+            // the activity list, which are the authoritative on-chain view.
+            break
         case .fenced:
             // The core fenced itself (KTD-3): the shell blocks every
             // destination behind the fenced screen until the user restores

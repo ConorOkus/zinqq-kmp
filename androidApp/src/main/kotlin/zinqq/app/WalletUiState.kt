@@ -93,6 +93,14 @@ data class UiState(
  * recovery state, pending sweep) must be re-queried: the spike's balance
  * triggers extended with the sweep/recovery change events (U14; the PWA's
  * hooks re-read on the equivalent change notifications).
+ *
+ * [Event.OnchainStateChanged] is the ON-CHAIN half, and it is not optional: the
+ * core's bdk sync tick is the only thing that learns about an on-chain receive
+ * or confirmation, and nothing else fires when it does. Without it a recovered
+ * sweep sat in the persisted changeset while this state kept a stale balance
+ * until an unrelated Lightning event or a relaunch — the exact symptom observed
+ * once the manual refresh button was removed. [Event.SyncCompleted] is NOT a
+ * substitute: it only fires on a failed→healthy transition.
  */
 fun shouldRefreshWalletData(event: Event): Boolean = when (event) {
     is Event.PaymentReceived,
@@ -100,6 +108,7 @@ fun shouldRefreshWalletData(event: Event): Boolean = when (event) {
     is Event.ChannelReady,
     is Event.SweepStateChanged,
     is Event.RecoveryStateChanged,
+    is Event.OnchainStateChanged,
     -> true
     else -> false
 }

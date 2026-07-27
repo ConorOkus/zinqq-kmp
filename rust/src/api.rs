@@ -1259,7 +1259,9 @@ impl Wallet {
         self.node.reveal_mnemonic().ok_or(WalletError::NoMnemonic)
     }
 
-    /// Current balances; requires a running node.
+    /// Current balances; requires a running node. On-chain changes announce
+    /// themselves with [`Event::OnchainStateChanged`] (the background bdk sync
+    /// is the only thing that observes them); re-read on that event.
     pub fn balances(&self) -> Result<Balances, WalletError> {
         let lightning_msat = self
             .node

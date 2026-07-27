@@ -122,25 +122,39 @@ impl WalletSignerProvider {
     ///
     /// COST: bdk can only watch an index by REVEALING it, and a reveal is
     /// inclusive — one channel at index 9 970 means 9 971 tracked external
-    /// addresses, a proportionally larger persisted changeset, and a
-    /// revealed-SPK sync that queries all of them. That cost is inherent to the
-    /// KTD-4 destination scheme and a wallet that OPENED the channel here
-    /// already pays it (`destination_script_for_index` reveals the same index at
-    /// channel-open time); this only stops a restored wallet from silently
-    /// paying less and seeing less.
+    /// addresses and a proportionally larger persisted changeset. That cost is
+    /// inherent to the KTD-4 destination scheme and a wallet that OPENED the
+    /// channel here already pays it (`destination_script_for_index` reveals the
+    /// same index at channel-open time); this only stops a restored wallet from
+    /// silently paying less and seeing less. What it no longer costs is a
+    /// per-tick Esplora query for all 9 971: the incremental sync watches the
+    /// pinned destinations plus a bounded window at each end of the revealed
+    /// range, never the inclusive interior (see
+    /// [`crate::wallet::OnchainWallet::bounded_sync_request`], and
+    /// [`crate::config::ONCHAIN_SYNC_KEYCHAIN_WINDOW`] for the 13-minute sync
+    /// this regression cost before it was bounded).
     ///
     /// NOT a brute force of the 10 000-index space. Revealing all of it would
-    /// make every later revealed-SPK sync a 10 000-script Esplora query on a
-    /// mobile connection, for a wallet that has at most a handful of channels.
+    /// bloat the persisted changeset a hundredfold and force the FULL SCAN to
+    /// walk 10 000 addresses, for a wallet that has at most a handful of
+    /// channels.
     /// RESIDUAL: a channel whose monitor was fully archived AND deleted leaves
     /// no `channel_keys_id` to derive from, so its destination index is
     /// unrecoverable by derivation. That is a real, known gap for the
     /// maintainer — not something a 10k-address scan should paper over.
     pub(crate) fn reveal_derived_destinations(&self) -> Option<u32> {
+        let indexes = self.derived_destination_indexes();
+        // Revealing an index is not enough to keep it WATCHED: the incremental
+        // sync deliberately queries a bounded SPK set, so every destination has
+        // to be pinned into it by index (see
+        // `OnchainWallet::bounded_sync_request`). Pin before the reveal — a
+        // failed persist below is a reason to keep watching, not to stop.
+        self.wallet
+            .watch_destination_indexes(indexes.iter().copied());
         // Destinations are EXTERNAL-only and `reveal_addresses_to` is
         // monotone, so revealing to the single highest index covers every
         // recorded channel in one persist.
-        let max_index = self.derived_destination_indexes().into_iter().max()?;
+        let max_index = indexes.into_iter().max()?;
         if self.wallet.reveal_external_addresses_to(max_index).is_err() {
             // The wallet logs the underlying persistence error; an unpersisted
             // reveal would be lost on the next start (the PWA's
@@ -402,10 +416,7 @@ mod tests {
         // the signer hands LDK.
         let destination = provider.get_destination_script(keys_id).unwrap();
         assert!(
-            provider
-                .wallet()
-                .revealed_sync_request_spks()
-                .contains(&destination),
+            provider.wallet().sync_request_spks().contains(&destination),
             "the next chain sync must query the close destination's SPK"
         );
     }

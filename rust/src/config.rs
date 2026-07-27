@@ -160,6 +160,33 @@ pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 /// by brute-force scanning, so this number does not have to cover them.
 pub(crate) const BDK_COLD_RESTORE_STOP_GAP: usize = 200;
 
+/// How many revealed SPKs per keychain each END of the revealed range
+/// contributes to the INCREMENTAL (steady-state) on-chain sync — see
+/// [`crate::wallet::OnchainWallet::bounded_sync_request`]. Governs nothing
+/// about the full scan (that still uses the stop gaps above).
+///
+/// WHY A WINDOW AT ALL: bdk's `start_sync_with_revealed_spks` queries EVERY
+/// revealed SPK, and the KTD-4 close-destination scheme reveals at
+/// `BE(channel_keys_id[0..4]) mod 10_000`, so ONE closed channel drags
+/// `last_revealed` to ~5 000 on average (the indices are uniform over
+/// 0..9 999). Measured on a real mainnet wallet with `last_revealed` at 5 030:
+/// 804 s (13.4 min) between sync writes against an
+/// [`ONCHAIN_SYNC_INTERVAL`] of 120 s, through the Vercel→Blockstream proxy,
+/// with one pass tripping [`CHAIN_SYNC_TIMEOUT`]. Correct but useless: an
+/// incoming payment took 13 minutes to appear. The ~5 000 indices in between
+/// were never handed to anyone — `reveal_addresses_to` is INCLUSIVE, so they
+/// are collateral of revealing the one destination that matters.
+///
+/// WHY 20: the same anchor as [`BDK_CLIENT_STOP_GAP`] — BIP44's conventional
+/// 20-address gap limit. A wallet is only ever vended addresses from the two
+/// ends of its revealed range (`next_unused_address` returns the LOWEST unused
+/// index; `reveal_next_address` returns `last_revealed + 1`), and 20 is the
+/// industry-standard bound on how far a gap of unpaid-but-vended addresses
+/// realistically runs. Deliberately the SAME number as the full scan's stop
+/// gap: a steady-state sync that watched a narrower window than the scan that
+/// discovered the wallet would be able to miss what the scan found.
+pub(crate) const ONCHAIN_SYNC_KEYCHAIN_WINDOW: usize = 20;
+
 /// Megalith's LSPS2 node id (U4), taken from the Zinqq PWA's own working
 /// configuration (`VITE_LSP_NODE_ID`) rather than a public explorer listing.
 /// The explorer-listed `038a9e56...e889bf` at 64.23.162.51 completes a BOLT8

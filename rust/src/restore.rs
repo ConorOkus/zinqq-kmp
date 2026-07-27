@@ -1476,7 +1476,7 @@ mod tests {
         );
 
         // Each monitor's destination SPK is now one the next chain sync queries.
-        let watched = signer_provider.wallet().revealed_sync_request_spks();
+        let watched = signer_provider.wallet().sync_request_spks();
         for index in indexes {
             assert!(
                 watched.contains(&signer_provider.wallet().peek_external_script(index)),

@@ -96,6 +96,12 @@ pub enum Event {
     SweepStateChanged,
     /// Force-close recovery state changed (U5 defines; U10 fires).
     RecoveryStateChanged,
+    /// An on-chain sync pass changed wallet-visible data — a new transaction, a
+    /// confirmation, or a mempool eviction (U8 fires). Payload-less like its
+    /// siblings: consumers re-read `balances()` and the activity list. Never
+    /// fired for a sync pass that found nothing new, so this is not a
+    /// per-interval heartbeat.
+    OnchainStateChanged,
     /// Restore-from-seed progress (U5 defines; U4's restore flow fires).
     RestoreProgress { step: String },
 }
@@ -262,6 +268,7 @@ impl EventSink for EventQueue {
             CoreEvent::Fenced { detail } => Event::Fenced { detail },
             CoreEvent::SweepStateChanged => Event::SweepStateChanged,
             CoreEvent::RecoveryStateChanged => Event::RecoveryStateChanged,
+            CoreEvent::OnchainStateChanged => Event::OnchainStateChanged,
             CoreEvent::RestoreProgress { step } => Event::RestoreProgress { step },
         };
         self.push(event);
@@ -428,6 +435,7 @@ mod tests {
         });
         queue.emit(CoreEvent::SweepStateChanged);
         queue.emit(CoreEvent::RecoveryStateChanged);
+        queue.emit(CoreEvent::OnchainStateChanged);
         queue.emit(CoreEvent::RestoreProgress {
             step: "monitors".to_string(),
         });
@@ -502,6 +510,7 @@ mod tests {
         );
         assert_eq!(queue.ack(), Some(Event::SweepStateChanged));
         assert_eq!(queue.ack(), Some(Event::RecoveryStateChanged));
+        assert_eq!(queue.ack(), Some(Event::OnchainStateChanged));
         assert_eq!(
             queue.ack(),
             Some(Event::RestoreProgress {
