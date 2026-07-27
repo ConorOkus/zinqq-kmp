@@ -26,6 +26,7 @@ import zinqq.app.screens.HomeScreen
 import zinqq.app.screens.PlaceholderScreen
 import zinqq.app.screens.RecoverFundsScreen
 import zinqq.app.screens.TransactionDetailScreen
+import zinqq.app.screens.receive.ReceiveScreen
 import zinqq.app.screens.scan.ScanScreen
 import zinqq.app.screens.send.SendScreen
 import zinqq.app.theme.ZinqqDimens
@@ -136,7 +137,13 @@ private fun ZinqqNavHost(
             )
         }
         composable(Route.Receive.pattern) {
-            PlaceholderScreen("Receive", backFor(Route.Receive))
+            // The PWA's z-200 overlay ≈ this dedicated route: no TabBar here
+            // (only Home/Activity have it) and the fenced screen still
+            // renders above (U16, R6 UI).
+            ReceiveScreen(
+                port = holder,
+                onClose = { navController.navigateTo(Route.Receive.backTo ?: Route.Home) },
+            )
         }
         composable(Route.Send.pattern) { entry ->
             // The scanned raw string travels like the PWA's location.state

@@ -22,11 +22,16 @@ import kotlinx.coroutines.withContext
 import uniffi.wallet_core.ClassifiedView
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.FeeEstimate
+import uniffi.wallet_core.JitInvoice
+import uniffi.wallet_core.JitQuote
 import uniffi.wallet_core.LnurlPayView
 import uniffi.wallet_core.MaxSendEstimate
+import uniffi.wallet_core.ReceiveBundle
 import uniffi.wallet_core.ResolvedView
 import uniffi.wallet_core.Wallet
 import uniffi.wallet_core.WalletException
+import zinqq.app.screens.receive.ReceivePort
+import zinqq.app.screens.receive.usableInboundMsat
 import zinqq.app.screens.send.SendPort
 import zinqq.app.theme.AppearanceMode
 import zinqq.app.theme.SettingsRepository
@@ -59,7 +64,7 @@ import zinqq.spike.WalletCore
 class WalletHolder(
     context: Context,
     private val settings: SettingsRepository,
-) : DefaultLifecycleObserver, SendPort {
+) : DefaultLifecycleObserver, SendPort, ReceivePort {
     // App-private filesDir (NOT cache, which the OS may purge): holds the seed,
     // channel monitors, and the storage lock, and is the directory
     // data_extraction_rules.xml excludes from backup and device transfer (R6).
@@ -255,6 +260,35 @@ class WalletHolder(
     override fun onchainBalanceSats(): ULong =
         _state.value.balances?.let { it.onchainTotalSats - it.onchainUntrustedPendingSats }
             ?: 0uL
+
+    // ------------------------------------------------------------------
+    // ReceivePort (U16, R14): thin passthroughs to the core's receive FFI.
+    // The capacity decision, live floor, quote/buy protocol, and expiry
+    // clamp all live in Rust; blocking calls hop to IO.
+    // ------------------------------------------------------------------
+
+    override suspend fun receiveBundle(amountMsat: ULong?): ReceiveBundle =
+        withContext(Dispatchers.IO) { wallet.receiveBundle(amountMsat) }
+
+    override suspend fun jitQuote(amountMsat: ULong): JitQuote =
+        withContext(Dispatchers.IO) { wallet.jitQuote(amountMsat) }
+
+    override suspend fun jitAccept(quoteToken: ULong, amountMsat: ULong): JitInvoice =
+        withContext(Dispatchers.IO) { wallet.jitAccept(quoteToken, amountMsat) }
+
+    override suspend fun minReceiveSats(refresh: Boolean): ULong =
+        withContext(Dispatchers.IO) { wallet.minReceiveSats(refresh) }
+
+    override suspend fun usableInboundMsat(): ULong =
+        withContext(Dispatchers.IO) { usableInboundMsat(wallet.listChannels()) }
+
+    override suspend fun buildUnifiedUri(
+        address: String,
+        amountSats: ULong?,
+        invoice: String?,
+    ): String = withContext(Dispatchers.IO) {
+        uniffi.wallet_core.buildBip321Uri(address, amountSats, invoice)
+    }
 
     private fun startNode() {
         // Still active while a just-stopped loop drains its terminal
