@@ -2,7 +2,8 @@ import SwiftUI
 
 /// Minimal stand-in for every not-yet-built destination (U18): correct
 /// header, declared back target, and the right room/field background so all
-/// 16 routes are reachable in all three themes. U19–U22 replace these bodies.
+/// 16 routes are reachable in all three themes. U19 replaced the wallet and
+/// activity destinations; U20–U22 replace the rest.
 struct PlaceholderScreen: View {
     let title: String
     let route: Route
@@ -22,7 +23,7 @@ struct PlaceholderScreen: View {
                 tint: tint
             )
             Spacer()
-            Text("TODO U19-U22")
+            Text("TODO U20-U22")
                 .font(ZinqqFont.sans(14))
                 .foregroundColor(muted)
             Spacer()

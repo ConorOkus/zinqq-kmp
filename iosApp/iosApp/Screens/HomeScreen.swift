@@ -1,151 +1,156 @@
 import SwiftUI
-import UIKit
 
-/// Home temporarily hosts the spike's single wallet screen (U18): the proven
-/// receive/send flow moved here from `ContentView` unchanged so the shell
-/// keeps paying while U19 builds the real Home. Only the QR rendering moved
-/// into the shared `QrView` component and the hardcoded colors onto the field
-/// tokens; everything else is the spike content verbatim. Talks only to
-/// WalletModel — no shared-framework types leak into the view (R14).
+/// The PWA's Home (U19, R12; `Home.tsx`), mirroring Android's `HomeScreen`:
+/// field screen with a refresh icon (re-queries wallet data — no page-reload
+/// concept natively; the PWA install button is omitted on native), the
+/// unified BalanceDisplay, RecoveryBanner / PendingSweepBanner, and the two
+/// 88pt CTAs. A fatal start failure replaces the content with "Something went
+/// wrong" (`Home.tsx:29-42`). Every derivation comes from the pure helpers in
+/// `WalletPresentation.swift` (R14) — this view only places results.
 struct HomeScreen: View {
     @ObservedObject var model: WalletModel
-
-    @State private var amountSats = ""
-    @State private var bolt11Input = ""
+    let onNavigate: (Route) -> Void
 
     @Environment(\.zinqqColors) private var colors
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                balanceSection
-                if let banner = model.syncBanner {
-                    Text(banner)
-                        .font(ZinqqFont.sans(13))
-                        .foregroundColor(colors.warning)
-                }
-                receiveSection
-                sendSection
-                statusSection
+        Group {
+            if let startError = model.startError {
+                errorState(startError)
+            } else {
+                content
             }
-            .padding(24)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(colors.field.ignoresSafeArea())
-        .onChange(of: model.currentInvoice) { invoice in
-            // Screen must not sleep mid-payment while an invoice is showing.
-            UIApplication.shared.isIdleTimerDisabled = invoice != nil
-        }
-        .onDisappear {
-            UIApplication.shared.isIdleTimerDisabled = false
-        }
     }
 
-    // MARK: Balance
-
-    private var balanceSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Balance")
-                .font(ZinqqFont.sans(16, weight: .semibold))
+    /// The PWA's fatal error state (`Home.tsx:29-42`).
+    private func errorState(_ detail: String) -> some View {
+        VStack(spacing: 8) {
+            Text("Something went wrong")
+                .font(ZinqqFont.sans(18, weight: .semibold))
                 .foregroundColor(colors.onField)
-            Text("\(model.balanceMsat / 1_000) sats")
-                .font(ZinqqFont.display(34, weight: .semibold))
-                .foregroundColor(colors.onField)
-                .accessibilityLabel("Balance \(model.balanceMsat / 1_000) sats")
-            Text("\(model.balanceMsat) msat · node \(model.running ? "running" : "stopped")")
-                .font(ZinqqFont.sans(13))
+            Text(detail)
+                .font(ZinqqFont.sans(14))
                 .foregroundColor(colors.onFieldMuted)
+                .multilineTextAlignment(.center)
         }
+        .padding(.horizontal, 24)
     }
 
-    // MARK: Receive
-
-    private var receiveSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Receive")
-                .font(ZinqqFont.sans(16, weight: .semibold))
-                .foregroundColor(colors.onField)
+    private var content: some View {
+        VStack(spacing: 0) {
+            // Top bar: install slot omitted on native (left spacer keeps the
+            // refresh pinned right, like the PWA's placeholder div).
             HStack {
-                TextField("Amount (sats)", text: $amountSats)
-                    .keyboardType(.numberPad)
-                    .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("Amount in sats")
-                let parsedSats = UInt64(amountSats)
-                Button("Request invoice") {
-                    guard let sats = parsedSats, sats > 0 else { return }
-                    model.requestInvoice(amountSats: sats)
+                Spacer()
+                Button(action: { model.refreshWalletData() }) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(colors.onField)
+                        .frame(
+                            width: ZinqqDimens.minTouchTarget,
+                            height: ZinqqDimens.minTouchTarget
+                        )
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(colors.fieldCta)
-                .disabled(!model.running || model.busy || parsedSats == nil)
-                .accessibilityLabel("Request invoice")
+                .accessibilityLabel("Refresh")
             }
-            if let invoice = model.currentInvoice {
-                invoiceView(invoice)
-            }
-        }
-    }
 
-    private func invoiceView(_ invoice: WalletModel.Invoice) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            QrView(payload: invoice.bolt11, accessibilityLabel: "Invoice QR code")
-                .frame(maxWidth: 240)
-                .frame(maxWidth: .infinity)
-            Text(invoice.bolt11)
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundColor(colors.onField)
-                .lineLimit(4)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                let remaining = Int(Double(invoice.expiryUnixSecs) - context.date.timeIntervalSince1970)
-                if remaining > 0 {
-                    Text("Expires in \(remaining / 60)m \(remaining % 60)s")
-                        .font(ZinqqFont.sans(13))
-                        .foregroundColor(colors.onFieldMuted)
-                } else {
-                    Text("Invoice expired")
-                        .font(ZinqqFont.sans(13))
-                        .foregroundColor(colors.dangerStrong)
+            // Balance centered in the flexible middle, like the PWA's
+            // justify-between column.
+            HStack {
+                let balance = model.balances.map(homeBalance)
+                BalanceDisplay(
+                    balanceSats: balance?.totalSats ?? 0,
+                    visible: model.balanceVisible,
+                    onToggleVisible: { model.balanceVisible.toggle() },
+                    pendingSats: balance?.pendingSats,
+                    loading: balance == nil
+                )
+                Spacer()
+            }
+            .frame(maxHeight: .infinity)
+
+            if let banner = recoveryBanner(
+                model.recoveryState, dismissed: model.recoveryBannerDismissed
+            ) {
+                BannerView(
+                    icon: banner.dismissible ? .check : .warningHot,
+                    title: banner.title,
+                    subtitle: banner.subtitle,
+                    onTap: banner.navigatesToRecover ? { onNavigate(.recover) } : nil,
+                    onDismiss: banner.dismissible ? { model.dismissRecoveryBanner() } : nil
+                )
+                .padding(.bottom, 12)
+            }
+
+            if let banner = sweepBanner(model.pendingSweep) {
+                BannerView(
+                    icon: banner.navigatesToReceive ? .warningHot : .warning,
+                    title: banner.heading,
+                    subtitle: banner.subtitle,
+                    onTap: banner.navigatesToReceive ? { onNavigate(.receive) } : nil
+                )
+                .padding(.bottom, 12)
+            }
+
+            // The two 88pt CTAs: Send filled (the field screen's hot moment),
+            // Request outlined (Home.tsx:92-107).
+            HStack(spacing: 12) {
+                HomeCta(
+                    label: "Send",
+                    systemImage: "arrow.up.right",
+                    background: colors.fieldCta,
+                    contentColor: colors.onFieldCta,
+                    outline: nil,
+                    action: { onNavigate(.send) }
+                )
+                HomeCta(
+                    label: "Request",
+                    systemImage: "arrow.down.left",
+                    background: .clear,
+                    contentColor: colors.onField,
+                    outline: colors.fieldOutline,
+                    action: { onNavigate(.receive) }
+                )
+            }
+            .padding(.bottom, 12)
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+    }
+}
+
+private struct HomeCta: View {
+    let label: String
+    let systemImage: String
+    let background: Color
+    let contentColor: Color
+    let outline: Color?
+    let action: () -> Void
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 16)
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Text(label.uppercased())
+                    .font(ZinqqFont.display(20, weight: .bold))
+                    .kerning(1)
+                Image(systemName: systemImage)
+                    .font(.system(size: 22, weight: .semibold))
+            }
+            .foregroundColor(contentColor)
+            .frame(maxWidth: .infinity)
+            .frame(height: 88)
+            .background(background)
+            .overlay {
+                if let outline {
+                    shape.strokeBorder(outline, lineWidth: 2)
                 }
             }
+            .clipShape(shape)
         }
-    }
-
-    // MARK: Send
-
-    private var sendSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Send")
-                .font(ZinqqFont.sans(16, weight: .semibold))
-                .foregroundColor(colors.onField)
-            TextField("Paste BOLT11 invoice", text: $bolt11Input, axis: .vertical)
-                .lineLimit(2...4)
-                .font(.system(.caption, design: .monospaced))
-                .autocorrectionDisabled()
-                .textInputAutocapitalization(.never)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityLabel("BOLT11 invoice")
-            Button("Pay") {
-                model.sendPayment(bolt11: bolt11Input)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(colors.fieldCta)
-            .disabled(
-                !model.running || model.busy
-                    || bolt11Input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            )
-            .accessibilityLabel("Pay")
-        }
-    }
-
-    // MARK: Status
-
-    @ViewBuilder
-    private var statusSection: some View {
-        if let outcome = model.lastOutcome {
-            Text(outcome)
-                .font(ZinqqFont.sans(13))
-                .foregroundColor(colors.onFieldMuted)
-        }
+        .accessibilityLabel(label)
     }
 }

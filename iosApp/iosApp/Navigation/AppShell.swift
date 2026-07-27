@@ -24,7 +24,7 @@ struct AppShell: View {
 
             VStack(spacing: 0) {
                 NavigationStack(path: $path) {
-                    HomeScreen(model: model)
+                    HomeScreen(model: model, onNavigate: navigate)
                         .toolbar(.hidden, for: .navigationBar)
                         .navigationDestination(for: Route.self) { route in
                             destination(route)
@@ -64,14 +64,15 @@ struct AppShell: View {
         path = route.backChain
     }
 
-    /// Placeholder bodies (U19–U22 replace them); every destination declares
-    /// its PWA title and backTo target so headers and back behave now.
+    /// Real wallet/activity destinations (U19) plus placeholder bodies for
+    /// the remaining routes (U20–U22 replace them); every destination
+    /// declares its PWA title and backTo target so headers and back behave.
     @ViewBuilder
     private func destination(_ route: Route) -> some View {
         switch route {
         case .home:
             // Home is the stack root, never pushed; unreachable.
-            HomeScreen(model: model)
+            HomeScreen(model: model, onNavigate: navigate)
         case .receive:
             PlaceholderScreen(title: "Receive", route: route, onNavigate: navigate)
         case .send:
@@ -79,15 +80,27 @@ struct AppShell: View {
         case .scan:
             PlaceholderScreen(title: "Scan", route: route, onNavigate: navigate)
         case .activity:
-            PlaceholderScreen(
-                title: "Activity", route: route, onNavigate: navigate, isFieldScreen: true
+            ActivityScreen(
+                model: model,
+                onOpenTx: { navigate(.activityTxDetail(txId: $0)) },
+                onOpenClose: { navigate(.activityCloseDetail(channelId: $0)) }
             )
-        case .activityCloseDetail:
-            PlaceholderScreen(title: "Channel Close", route: route, onNavigate: navigate)
-        case .activityTxDetail:
-            PlaceholderScreen(title: "Transaction", route: route, onNavigate: navigate)
+        case let .activityCloseDetail(channelId):
+            ChannelCloseDetailScreen(
+                model: model,
+                channelId: channelId,
+                onBack: { navigate(.activity) },
+                onRecover: { navigate(.recover) }
+            )
+        case let .activityTxDetail(txId):
+            TransactionDetailScreen(
+                model: model,
+                txId: txId,
+                onBack: { navigate(.activity) },
+                onRedirectToClose: { navigate(.activityCloseDetail(channelId: $0)) }
+            )
         case .recover:
-            PlaceholderScreen(title: "Recover Funds", route: route, onNavigate: navigate)
+            RecoverFundsScreen(model: model, onBack: { navigate(.home) })
         case .settings:
             PlaceholderScreen(title: "Settings", route: route, onNavigate: navigate)
         case .settingsBackup:

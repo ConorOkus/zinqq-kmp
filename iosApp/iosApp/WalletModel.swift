@@ -26,6 +26,11 @@ enum WalletEvent {
     case channelPending
     case channelReady
     case lsps2Failed(reason: String)
+    /// Outputs entered/left the sweep pipeline (U11): re-query pendingSweep.
+    case sweepStateChanged
+    /// The force-close recovery state machine moved (U10): re-query it and
+    /// invalidate any session-local banner dismissal.
+    case recoveryStateChanged
     /// Another client took over this seed's VSS namespace (KTD-3, plan
     /// System-Wide Impact): the core fenced itself durably and halted.
     case fenced(detail: String)
@@ -58,6 +63,10 @@ enum WalletEvent {
             return .channelReady
         case let e as Event.Lsps2Failed:
             return .lsps2Failed(reason: e.reason)
+        case is Event.SweepStateChanged:
+            return .sweepStateChanged
+        case is Event.RecoveryStateChanged:
+            return .recoveryStateChanged
         case let e as Event.Fenced:
             return .fenced(detail: e.detail)
         default:
@@ -66,12 +75,60 @@ enum WalletEvent {
     }
 }
 
+// MARK: - Refresh triggers
+
+/// The events after which the wallet-data snapshots (balances, activity,
+/// recovery state, pending sweep) must be re-queried: the spike's balance
+/// triggers extended with the sweep/recovery change events (U19; identical to
+/// Android's `shouldRefreshWalletData` — the PWA's hooks re-read on the
+/// equivalent change notifications).
+func shouldRefreshWalletData(_ event: WalletEvent) -> Bool {
+    switch event {
+    case .paymentReceived, .paymentSuccessful, .channelReady,
+         .sweepStateChanged, .recoveryStateChanged:
+        return true
+    default:
+        return false
+    }
+}
+
+// MARK: - Event source seam
+
+/// Minimal seam over the generated Wallet's event queue (U19): the event loop
+/// consumes only this protocol, so the single-consumer regression test can
+/// drive the loop with a fake queue instead of the blocking FFI.
+protocol WalletEventSource: AnyObject {
+    /// Kotlin suspend `nextEvent()` adapted to the Swift-side event enum.
+    func nextWalletEvent() async throws -> WalletEvent
+    /// Handle-then-ack (KTD-8): acks the last event returned by next.
+    func ackEvent() async throws
+}
+
+extension Wallet: WalletEventSource {
+    func nextWalletEvent() async throws -> WalletEvent {
+        WalletEvent.from(try await nextEvent())
+    }
+
+    func ackEvent() async throws {
+        try eventHandled()
+    }
+}
+
 // MARK: - Model
 
+/// The channel-close detail query result (U19): `record` is nil when the
+/// core has no record for `channelId` ("Close record not found"), while a
+/// missing `CloseDetailUi` altogether means the query hasn't run yet.
+struct CloseDetailUi {
+    let channelId: String
+    let record: CloseRecordView?
+}
+
 /// Owns the shared `Wallet` and its handle-then-ack event loop, reducing
-/// events into published UI state. No Lightning logic lives here (R4):
+/// events into published UI state. No Lightning logic lives here (R14):
 /// strings go in, events come out — the core does all parsing, fees, and
-/// reconnect (KTD-10).
+/// reconnect (KTD-10). Display derivations live in `WalletPresentation.swift`
+/// as pure functions; this class only snapshots core queries.
 @MainActor
 final class WalletModel: ObservableObject {
     struct Invoice: Equatable {
@@ -99,8 +156,33 @@ final class WalletModel: ObservableObject {
         didSet { appearanceMode.persist() }
     }
 
+    // MARK: Wallet-data snapshots (U19)
+
+    /// Last `balances()` snapshot; nil until the first refresh (loading).
+    @Published private(set) var balances: Balances?
+    /// Last `listActivity()` snapshot; nil until the first refresh (loading).
+    @Published private(set) var activity: [ActivityRow]?
+    /// Force-close recovery state; nil = no recovery in progress (R9).
+    @Published private(set) var recoveryState: RecoveryStateView?
+    /// Session-local hide of the sweep-confirmed success banner. The durable
+    /// half is the core's `dismissRecovery()`; the session flag hides the
+    /// banner immediately and resets whenever `Event.RecoveryStateChanged`
+    /// announces fresh state.
+    @Published private(set) var recoveryBannerDismissed = false
+    /// Outputs waiting to sweep; the banner gates on `lastAttemptFailed` (R8).
+    @Published private(set) var pendingSweep: PendingSweepView?
+    /// The close-detail screen's current query result.
+    @Published private(set) var closeDetail: CloseDetailUi?
+    /// Fatal start failure — Home replaces its content with the PWA's
+    /// "Something went wrong" state (`Home.tsx:29-42`).
+    @Published private(set) var startError: String?
+    /// Persisted `balance-visible` toggle (R12), PWA localStorage key parity.
+    @Published var balanceVisible: Bool =
+        (UserDefaults.standard.object(forKey: "balance-visible") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(balanceVisible, forKey: "balance-visible") }
+    }
+
     private var wallet: Wallet?
-    private var eventLoop: Task<Void, Never>?
     private var startRequested = false
 
     // MARK: Blocking FFI dispatch
@@ -109,9 +191,7 @@ final class WalletModel: ObservableObject {
     /// documents start/receive_jit/send as blocking and stop() as blocking up
     /// to ~20s — mirroring the Android shell's Dispatchers.IO wrapping.
     /// Callers hop back to the MainActor (their own isolation) to publish
-    /// state. Caveat (same unverified-bindings pattern as WalletEvent.from):
-    /// the generated Wallet type must be confirmed thread-safe for calls off
-    /// the main thread at the first Xcode build.
+    /// state.
     private static func runBlockingFFI<T>(
         _ body: @escaping () throws -> T
     ) async throws -> T {
@@ -122,7 +202,7 @@ final class WalletModel: ObservableObject {
 
     // MARK: Lifecycle (KTD-10: foreground-only node)
 
-    /// Called on scenePhase .active. Starts the node and (re)starts the event
+    /// Called on scenePhase .active. Starts the node and schedules the event
     /// loop; peer reconnect after a suspend is the core's job.
     func start() {
         guard !startRequested else { return }
@@ -133,14 +213,12 @@ final class WalletModel: ObservableObject {
                 let wallet = try self.ensureWallet()
                 // start() is a blocking FFI call — run it off the MainActor.
                 try await Self.runBlockingFFI { try wallet.start() }
-                // The previous loop (if any) exited on NodeStopped, or is still
-                // parked on a stale nextEvent — cancel it and start fresh.
-                // Cancellation can only land while awaiting nextEvent, before an
-                // event is handled, so no event is lost (unacked events redeliver).
-                self.eventLoop?.cancel()
-                self.eventLoop = Task { [weak self] in
-                    await self?.runEventLoop(wallet)
-                }
+                self.startError = nil
+                self.refreshWalletData()
+                // Single-consumer contract (the U19 P2 fix): the loop is only
+                // ever (re)scheduled after a successful start, and scheduling
+                // chains onto the previous run instead of cancelling it.
+                self.scheduleEventLoop(wallet)
             } catch {
                 self.startRequested = false
                 if Self.isFencedError(error) {
@@ -151,6 +229,7 @@ final class WalletModel: ObservableObject {
                     self.fenced = true
                 } else {
                     self.lastOutcome = "Start failed: \(error.localizedDescription)"
+                    self.startError = error.localizedDescription
                 }
             }
         }
@@ -232,39 +311,115 @@ final class WalletModel: ObservableObject {
         }
     }
 
-    func refreshBalances() {
+    // MARK: Wallet-data queries (U19)
+
+    /// Re-query every wallet-data snapshot the screens render (U19): balances,
+    /// the unified activity feed, recovery state, pending sweep, and the open
+    /// close detail, if any. Home's refresh icon calls this directly; the
+    /// event loop calls it on `shouldRefreshWalletData` events. All derivation
+    /// happens in pure presentation functions (R14) — this only snapshots.
+    func refreshWalletData() {
         guard let wallet else { return }
         Task { [weak self] in
-            do {
-                // balances() crosses the blocking FFI — run off the MainActor.
-                let msat = try await Self.runBlockingFFI {
-                    try wallet.balances().lightningMsat
+            // Balances/activity need a running node; keep the previous
+            // snapshots when the query fails (e.g. refresh while stopped).
+            let balances = try? await Self.runBlockingFFI { try wallet.balances() }
+            let activity = try? await Self.runBlockingFFI { try wallet.listActivity() }
+            // Local-first stores: readable even while stopped, and nil is a
+            // real answer (no recovery / nothing pending), not a failure.
+            let recovery = try? await Self.runBlockingFFI { wallet.recoveryState() }
+            let sweep = try? await Self.runBlockingFFI { wallet.pendingSweep() }
+            guard let self else { return }
+            if let balances {
+                self.balances = balances
+                self.balanceMsat = balances.lightningMsat
+            }
+            self.activity = activity ?? self.activity
+            self.recoveryState = recovery ?? nil
+            self.pendingSweep = sweep ?? nil
+            if let detail = self.closeDetail {
+                let record = try? await Self.runBlockingFFI {
+                    wallet.closeDetail(channelId: detail.channelId)
                 }
-                self?.balanceMsat = msat
-            } catch {
-                self?.lastOutcome = "Balance refresh failed: \(error.localizedDescription)"
+                self.closeDetail = CloseDetailUi(
+                    channelId: detail.channelId, record: record ?? nil
+                )
             }
         }
     }
 
-    // MARK: Event loop (handle-then-ack, KTD-8)
+    /// Load (or re-load) the close-detail screen's record. The screen renders
+    /// `closeDetail`; refreshes keep it live while the close resolves.
+    func loadCloseDetail(channelId: String) {
+        guard let wallet else {
+            closeDetail = CloseDetailUi(channelId: channelId, record: nil)
+            return
+        }
+        Task { [weak self] in
+            let record = try? await Self.runBlockingFFI {
+                wallet.closeDetail(channelId: channelId)
+            }
+            self?.closeDetail = CloseDetailUi(channelId: channelId, record: record ?? nil)
+        }
+    }
 
-    /// Consumes nextEvent() (Kotlin suspend → Swift async) until the terminal
-    /// NodeStopped: each event is reduced BEFORE it is acked, so a crash in
-    /// between redelivers the same event on restart. Restarted by `start()`.
-    private func runEventLoop(_ wallet: Wallet) async {
+    /// Dismiss the sweep-confirmed success banner: durable via the core
+    /// (`dismissRecovery`, a no-op unless SweepConfirmed) plus the session
+    /// flag so the UI hides immediately.
+    func dismissRecoveryBanner() {
+        recoveryBannerDismissed = true
+        guard let wallet else { return }
+        Task { [weak self] in
+            _ = try? await Self.runBlockingFFI { wallet.dismissRecovery() }
+            self?.refreshWalletData()
+        }
+    }
+
+    // MARK: Event loop (handle-then-ack KTD-8; single consumer, the U19 P2 fix)
+
+    /// The one task allowed to touch the event queue. Internal (not private)
+    /// so the regression test can await the chain's completion.
+    private(set) var eventLoopTask: Task<Void, Never>?
+
+    /// Schedules the next consumption run while preserving the queue's
+    /// single-consumer contract.
+    ///
+    /// The old cancel-and-restart pattern could double-consume: task
+    /// cancellation is cooperative, so on a quick background→foreground flip
+    /// the cancelled loop could still be between `nextEvent` and
+    /// `eventHandled` (or blocked past its cancellation check) while the
+    /// replacement loop already awaited `nextEvent` — two live consumers on a
+    /// queue whose contract is exactly one. The consumer is now never
+    /// cancelled: each successful `start()` CHAINS the next run onto the
+    /// previous task, so a new run first awaits the old run's exit — the old
+    /// run ends by consuming the terminal NodeStopped its `stop()` pushed —
+    /// and only then calls `nextEvent`. At most one run ever consumes; rapid
+    /// stop/start cycles serialize instead of overlapping. Internal so the
+    /// regression test can drive it against a fake `WalletEventSource`.
+    func scheduleEventLoop(_ source: WalletEventSource) {
+        let previous = eventLoopTask
+        eventLoopTask = Task { [weak self] in
+            await previous?.value
+            await self?.runEventLoop(source)
+        }
+    }
+
+    /// Consumes nextEvent until the terminal NodeStopped: each event is
+    /// reduced BEFORE it is acked, so a crash in between redelivers the same
+    /// event on restart. Restarted (chained) only by a successful `start()`.
+    private func runEventLoop(_ source: WalletEventSource) async {
         while true {
             let event: WalletEvent
             do {
                 // Kotlin suspend exports as async throws; it only throws on
                 // task cancellation, which we treat as loop exit.
-                event = WalletEvent.from(try await wallet.nextEvent())
+                event = try await source.nextWalletEvent()
             } catch {
                 return
             }
-            reduce(event)
+            handle(event)
             do {
-                try wallet.eventHandled()
+                try await source.ackEvent()
             } catch {
                 lastOutcome = "Event ack failed: \(error.localizedDescription)"
             }
@@ -272,41 +427,53 @@ final class WalletModel: ObservableObject {
         }
     }
 
+    /// Reduce + conditional wallet-data refresh; internal so tests can drive
+    /// the same path the event loop takes.
+    func handle(_ event: WalletEvent) {
+        reduce(event)
+        if shouldRefreshWalletData(event) { refreshWalletData() }
+    }
+
     private func reduce(_ event: WalletEvent) {
         switch event {
         case .nodeStarted:
             running = true
-            refreshBalances()
         case .nodeStopped:
             running = false
         case .syncFailed:
             syncBanner = "Chain sync failed — retrying…"
         case .syncCompleted:
             syncBanner = nil
-            refreshBalances()
         case let .invoiceReady(bolt11, expiryUnixSecs):
             currentInvoice = Invoice(bolt11: bolt11, expiryUnixSecs: expiryUnixSecs)
         case let .paymentReceived(amountMsat, skimmedFeeMsat):
+            // Optimistic bookkeeping; the triggered refreshWalletData()
+            // overwrites it with the authoritative balances() snapshot.
+            balanceMsat += amountMsat
             currentInvoice = nil
             if let skimmedFeeMsat {
-                lastOutcome = "Received \(amountMsat) msat (LSP fee \(skimmedFeeMsat) msat)"
+                lastOutcome = "Received \(amountMsat / 1_000) sats (LSP fee \(skimmedFeeMsat / 1_000) sats)"
             } else {
-                lastOutcome = "Received \(amountMsat) msat"
+                lastOutcome = "Received \(amountMsat / 1_000) sats"
             }
-            refreshBalances()
         case .paymentSuccessful:
             lastOutcome = "Payment sent"
-            refreshBalances()
         case let .paymentFailed(reason):
             lastOutcome = "Payment failed: \(reason)"
         case .channelPending:
-            lastOutcome = "Channel opening…"
+            lastOutcome = "JIT channel opening"
         case .channelReady:
             lastOutcome = "Channel ready"
-            refreshBalances()
         case let .lsps2Failed(reason):
             currentInvoice = nil
-            lastOutcome = "LSP failed: \(reason)"
+            lastOutcome = "Invoice request failed: \(reason)"
+        case .sweepStateChanged:
+            // No direct state: the triggered refresh re-queries pendingSweep.
+            break
+        case .recoveryStateChanged:
+            // Fresh recovery state invalidates a session-local banner
+            // dismissal (the triggered refresh re-queries the state itself).
+            recoveryBannerDismissed = false
         case .fenced:
             // The core fenced itself (KTD-3): the shell blocks every
             // destination behind the fenced screen until the user restores
