@@ -16,7 +16,8 @@
 //! counterparty's (ours is superseded and can never confirm) — the CPFP is
 //! moot and the deposit ask is wrong; a 10 s tick clears it. The auto-recover
 //! sweep attempt (~60 s) transitions to `sweep_confirmed` when U11's sweep
-//! lands funds ([`RecoverySweeper`] is the seam; [`NoSweeper`] until then).
+//! engine ([`crate::sweep::SweepEngine`], via the [`RecoverySweeper`] seam)
+//! lands funds.
 
 use std::sync::{Arc, Mutex};
 
@@ -137,19 +138,22 @@ pub(crate) fn close_confirmed_for_all_channels(
 // Sweep seam (U11)
 // ---------------------------------------------------------------------------
 
-/// The auto-recover sweep attempt (U11 provides the real pipeline; the tick
-/// calls this every ~60 s while recovery is active). Returns sats swept —
-/// `> 0` transitions the banner to `sweep_confirmed`.
+/// The auto-recover sweep attempt (U11's `SweepEngine` implements this; the
+/// tick calls it every ~60 s while recovery is active). Returns swept
+/// outputs — `> 0` transitions the banner to `sweep_confirmed`. Async
+/// because a real attempt broadcasts (the engine runs on the node runtime).
 pub(crate) trait RecoverySweeper: Send + Sync {
-    fn attempt_sweep(&self) -> u64;
+    fn attempt_sweep(&self) -> crate::vss::store::BoxFuture<'_, u64>;
 }
 
-/// Default no-op until U11 lands the sweep pipeline.
+/// No-op sweeper (recovery tests exercise the seam without an engine).
+#[cfg(test)]
 pub(crate) struct NoSweeper;
 
+#[cfg(test)]
 impl RecoverySweeper for NoSweeper {
-    fn attempt_sweep(&self) -> u64 {
-        0
+    fn attempt_sweep(&self) -> crate::vss::store::BoxFuture<'_, u64> {
+        Box::pin(async { 0 })
     }
 }
 
@@ -397,16 +401,16 @@ impl RecoveryStore {
 
     /// Auto-recovery (`context.tsx:1452-1495`, every ~60 s): attempt the
     /// sweep; swept > 0 transitions to `sweep_confirmed`.
-    pub(crate) fn maybe_auto_recover(&self, sweeper: &dyn RecoverySweeper, now_ms: u64) {
+    pub(crate) async fn maybe_auto_recover(&self, sweeper: &dyn RecoverySweeper, now_ms: u64) {
         let Some(state) = self.state() else {
             return;
         };
         if state.status == RecoveryStatus::SweepConfirmed {
             return;
         }
-        let swept = sweeper.attempt_sweep();
+        let swept = sweeper.attempt_sweep().await;
         if swept > 0 {
-            log_info!(self.logger, "Auto-sweep recovered {swept} sats");
+            log_info!(self.logger, "Auto-sweep recovered {swept} output(s)");
             self.mark_sweep_confirmed(now_ms);
         }
     }
@@ -805,9 +809,17 @@ mod tests {
 
     struct FixedSweeper(u64);
     impl RecoverySweeper for FixedSweeper {
-        fn attempt_sweep(&self) -> u64 {
-            self.0
+        fn attempt_sweep(&self) -> crate::vss::store::BoxFuture<'_, u64> {
+            let swept = self.0;
+            Box::pin(async move { swept })
         }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     #[test]
@@ -823,21 +835,21 @@ mod tests {
             1_000,
         );
 
-        // The default (pre-U11) sweeper never transitions.
-        recovery.maybe_auto_recover(&NoSweeper, 2_000);
+        // The no-op sweeper never transitions.
+        block_on(recovery.maybe_auto_recover(&NoSweeper, 2_000));
         assert_eq!(
             recovery.state().unwrap().status,
             RecoveryStatus::NeedsRecovery
         );
 
-        recovery.maybe_auto_recover(&FixedSweeper(9_500), 3_000);
+        block_on(recovery.maybe_auto_recover(&FixedSweeper(3), 3_000));
         let state = recovery.state().unwrap();
         assert_eq!(state.status, RecoveryStatus::SweepConfirmed);
         assert_eq!(state.updated_at, 3_000);
 
         // sweep_confirmed is terminal for the tick: no more attempts, and the
         // exit reconcile leaves the success banner alone.
-        recovery.maybe_auto_recover(&FixedSweeper(1), 4_000);
+        block_on(recovery.maybe_auto_recover(&FixedSweeper(1), 4_000));
         assert_eq!(recovery.state().unwrap().updated_at, 3_000);
         let close_records = close_store_in(dir.path());
         assert!(!recovery.maybe_clear_resolved(&close_records));

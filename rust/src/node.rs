@@ -53,8 +53,12 @@ use crate::payment::{
     send_bolt12, validate_offer, SendError,
 };
 use crate::recovery::{
-    self, NoSweeper, RecoveryState, RecoveryStore, RecoverySweeper, AUTO_RECOVER_EVERY_TICKS,
+    self, RecoveryState, RecoveryStore, RecoverySweeper, AUTO_RECOVER_EVERY_TICKS,
     RECOVERY_TICK_INTERVAL,
+};
+use crate::sweep::{
+    PendingSweepInfo, SweepBroadcast, SweepEngine, SweepStore, SWEEP_RETRY_EVERY_TICKS,
+    SWEEP_TICK_INTERVAL,
 };
 use crate::types::{Logger, Sweeper};
 use crate::util::{hex_str, unix_now};
@@ -109,8 +113,9 @@ pub(crate) enum CoreEvent {
     /// Another client took over this seed's VSS store — the node fenced
     /// itself (U3: durable flag, zero further puts, halt; KTD-3).
     Fenced { detail: String },
-    /// The sweep pipeline's state changed (fired by U11).
-    #[allow(dead_code)] // Placeholder until U11 fires it.
+    /// The sweep pipeline's state changed (U11): pending outputs, a failed
+    /// attempt, or the shortfall/add-funds state — consumers re-read
+    /// `pending_sweep()`.
     SweepStateChanged,
     /// Force-close recovery state changed (U10). Payload-less by design
     /// (PWA parity): consumers re-read `recovery_state()` — a stale payload
@@ -240,9 +245,10 @@ pub struct Node {
     close_records: Arc<CloseRecordStore>,
     /// U10 recovery state machine: local-first + best-effort VSS blob.
     recovery: Arc<RecoveryStore>,
-    /// The auto-recover sweep attempt (U11 provides the real pipeline;
-    /// [`NoSweeper`] until then).
-    recovery_sweeper: Arc<dyn RecoverySweeper>,
+    /// U11 spendable-outputs store (KTD-8): owns its own store handle so
+    /// `pending_sweep()` is readable while stopped; the running
+    /// [`SweepEngine`] shares it.
+    sweep_store: Arc<SweepStore>,
 }
 
 impl Node {
@@ -271,10 +277,11 @@ impl Node {
             Arc::clone(&logger),
         ));
         let recovery = Arc::new(RecoveryStore::new(
-            kv_store,
+            Arc::clone(&kv_store),
             Arc::clone(&event_sink),
-            logger,
+            Arc::clone(&logger),
         ));
+        let sweep_store = Arc::new(SweepStore::new(kv_store, logger));
         Self {
             config,
             state: Mutex::new(None),
@@ -282,7 +289,7 @@ impl Node {
             payment_store,
             close_records,
             recovery,
-            recovery_sweeper: Arc::new(NoSweeper),
+            sweep_store,
         }
     }
 
@@ -470,7 +477,38 @@ impl Node {
             Arc::clone(&liquidity_source),
             stop_sender.subscribe(),
         );
-        self.spawn_recovery_task(&runtime, stop_sender.subscribe());
+
+        // U11 (KTD-8): the core-owned sweep engine over the shared
+        // descriptor store. The reserve closure reads the channel count at
+        // sweep time (U8 arithmetic: 10,000 sats iff any channel is open).
+        let sweep_engine = {
+            let channel_manager = Arc::clone(&components.channel_manager);
+            Arc::new(SweepEngine::new(
+                Arc::clone(&self.sweep_store),
+                Arc::clone(&components.keys_manager),
+                Arc::clone(&components.onchain_wallet),
+                Arc::clone(&components.chain_source) as Arc<dyn SweepBroadcast>,
+                components.chain_source.fee_estimator(),
+                Arc::clone(&self.close_records),
+                Arc::new(move || {
+                    onchain_send::anchor_reserve_sats(channel_manager.list_channels().len())
+                }),
+                Arc::clone(&self.event_sink),
+                Arc::clone(&components.logger),
+            ))
+        };
+        let sweep_wake = Arc::new(tokio::sync::Notify::new());
+        self.spawn_sweep_task(
+            &runtime,
+            Arc::clone(&sweep_engine),
+            Arc::clone(&sweep_wake),
+            stop_sender.subscribe(),
+        );
+        self.spawn_recovery_task(
+            &runtime,
+            Arc::clone(&sweep_engine) as Arc<dyn RecoverySweeper>,
+            stop_sender.subscribe(),
+        );
         let bp_handle = spawn_background_processor(
             &runtime,
             &components,
@@ -478,6 +516,8 @@ impl Node {
             Arc::clone(&self.payment_store),
             Arc::clone(&self.close_records),
             Arc::clone(&self.recovery),
+            sweep_engine,
+            sweep_wake,
             Arc::clone(&self.event_sink),
             bp_stop_sender.subscribe(),
         );
@@ -1114,6 +1154,7 @@ impl Node {
         self.payment_store.reset();
         self.close_records.reset();
         self.recovery.reset();
+        self.sweep_store.reset();
         Ok(())
     }
 
@@ -1202,6 +1243,15 @@ impl Node {
     /// recovery is active. Readable while stopped (local-first store).
     pub fn recovery_state(&self) -> Option<RecoveryState> {
         self.recovery.state()
+    }
+
+    /// Outputs still waiting to sweep (U11, R8), `None` when nothing is
+    /// pending. `pending_sats` is a LOWER BOUND (`has_unknown_value` marks
+    /// undercounting); `needs_onchain_funds`/`shortfall_sats` drive the
+    /// add-funds UX. Readable while stopped; changes arrive as
+    /// `SweepStateChanged` events.
+    pub fn pending_sweep(&self) -> Option<PendingSweepInfo> {
+        self.sweep_store.pending_info()
     }
 
     /// One close record with the last-known tip height (U10) for the detail
@@ -1638,13 +1688,13 @@ impl Node {
         let chain_source = Arc::clone(&components.chain_source);
         let channel_manager = Arc::clone(&components.channel_manager);
         let chain_monitor = Arc::clone(&components.chain_monitor);
-        let sweeper = Arc::clone(&components.sweeper);
         let onchain_wallet = Arc::clone(&components.onchain_wallet);
         let gossip_source = Arc::clone(&components.gossip_source);
         let dual_kv_store = Arc::clone(&components.dual_kv_store);
         let logger = Arc::clone(&components.logger);
         let event_sink = Arc::clone(&self.event_sink);
         let close_records = Arc::clone(&self.close_records);
+        let sweep_store = Arc::clone(&self.sweep_store);
 
         runtime.spawn(async move {
             let mut lightning_interval = tokio::time::interval(LIGHTNING_SYNC_INTERVAL);
@@ -1660,10 +1710,12 @@ impl Node {
                 tokio::select! {
                     _ = stop_receiver.changed() => return,
                     _ = lightning_interval.tick() => {
+                        // U11/KTD-8: no OutputSweeper confirmable — the
+                        // descriptor-store pipeline verifies its broadcasts
+                        // against chain truth itself.
                         let confirmables: Vec<&(dyn Confirm + Sync + Send)> = vec![
                             &*channel_manager,
                             &*chain_monitor,
-                            &*sweeper,
                         ];
                         let now_synced = match chain_source.sync_confirmables(confirmables).await {
                             Ok(()) => true,
@@ -1702,10 +1754,10 @@ impl Node {
                                 &*chain_source,
                                 &*onchain_wallet,
                                 &open_ids,
-                                // U11 seam: pending un-swept channels block
-                                // completion; empty until the sweep store
-                                // lands.
-                                &HashSet::new(),
+                                // U11: channels with un-swept outputs block
+                                // completion — a partial sweep's receipt
+                                // must not complete the record early.
+                                &sweep_store.pending_channel_ids(),
                                 unix_now().as_millis() as u64,
                                 &logger,
                             )
@@ -1823,11 +1875,16 @@ impl Node {
     /// U10 recovery ticks (PWA `context.tsx:1535-1553`): the exit reconcile
     /// runs EVERY ~10 s tick (cheap — in-memory record lookups) so a false
     /// "deposit needed" banner clears within a sync cycle of the close
-    /// record healing; the sweep-based auto-recovery runs every ~60 s.
-    fn spawn_recovery_task(&self, runtime: &Runtime, mut stop_receiver: watch::Receiver<()>) {
+    /// record healing; the sweep-based auto-recovery (U11's engine via the
+    /// [`RecoverySweeper`] seam) runs every ~60 s.
+    fn spawn_recovery_task(
+        &self,
+        runtime: &Runtime,
+        sweeper: Arc<dyn RecoverySweeper>,
+        mut stop_receiver: watch::Receiver<()>,
+    ) {
         let recovery = Arc::clone(&self.recovery);
         let close_records = Arc::clone(&self.close_records);
-        let sweeper = Arc::clone(&self.recovery_sweeper);
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(RECOVERY_TICK_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1842,7 +1899,45 @@ impl Node {
                             recovery.maybe_auto_recover(
                                 &*sweeper,
                                 unix_now().as_millis() as u64,
-                            );
+                            ).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// U11 sweep cadence (PWA `context.tsx:1495-1563` + the startup sweep,
+    /// `event-handler.ts:189-213`): the first tick fires immediately (crash
+    /// recovery for descriptors persisted by a previous run), then retries
+    /// run hourly — or every 60 s while only incoming on-chain funds block a
+    /// subsidized sweep, so a fresh deposit is picked up promptly. The
+    /// `SpendableOutputs` event arm wakes an immediate pass via `sweep_now`.
+    fn spawn_sweep_task(
+        &self,
+        runtime: &Runtime,
+        engine: Arc<SweepEngine>,
+        sweep_now: Arc<tokio::sync::Notify>,
+        mut stop_receiver: watch::Receiver<()>,
+    ) {
+        let store = Arc::clone(&self.sweep_store);
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(SWEEP_TICK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick: u32 = 0;
+            loop {
+                tokio::select! {
+                    _ = stop_receiver.changed() => return,
+                    _ = sweep_now.notified() => {
+                        engine.sweep_once().await;
+                    }
+                    _ = interval.tick() => {
+                        let due = tick == 0
+                            || store.needs_onchain_funds()
+                            || tick.is_multiple_of(SWEEP_RETRY_EVERY_TICKS);
+                        tick = tick.wrapping_add(1);
+                        if due {
+                            engine.sweep_once().await;
                         }
                     }
                 }
@@ -1975,7 +2070,9 @@ pub(crate) fn record_payment_claimed(
 #[allow(clippy::too_many_arguments)]
 fn handle_ldk_event(
     event: Event,
-    sweeper: &Sweeper,
+    sweep_engine: &SweepEngine,
+    sweep_wake: &tokio::sync::Notify,
+    bump_handler: &crate::bump::BumpEventHandler,
     liquidity_source: &LiquiditySource,
     payment_store: &PaymentStore,
     channels_ctx: &ChannelEventContext,
@@ -1989,21 +2086,28 @@ fn handle_ldk_event(
             outputs,
             channel_id,
         } => {
-            // `track_spendable_outputs` persists before returning Ok; on
-            // failure we replay the event rather than dropping funds.
-            // Static outputs are NOT excluded: the signer's payment keys are
-            // still KeysManager-derived (U1's provider only redirects
-            // destination/shutdown scripts), so the sweeper (not the bdk
-            // wallet) owns them.
-            sweeper
-                .track_spendable_outputs(outputs, channel_id, false, None)
-                .map_err(|()| {
+            // U11/KTD-8: persist into the core-owned descriptor store —
+            // wallet-owned StaticOutputs excluded pre-persist (U1's signer
+            // hands LDK bdk destination scripts, so those funds are already
+            // in the wallet AND unsignable by the KeysManager), replays
+            // deduped by descriptor+outpoint. On persist failure the event
+            // is REPLAYED rather than dropping funds. The sweep attempt
+            // itself runs on the sweep task (woken below), so a slow
+            // broadcast never blocks the background processor.
+            let channel_id_hex = channel_id.map(|id| hex_str(&id.0));
+            match sweep_engine.track_spendable_outputs(&outputs, channel_id_hex) {
+                Ok(_) => {
+                    sweep_wake.notify_one();
+                    Ok(())
+                }
+                Err(e) => {
                     log_error!(
                         logger,
-                        "Failed to persist spendable outputs; replaying event"
+                        "Failed to persist spendable outputs; replaying event: {e}"
                     );
-                    ReplayEvent()
-                })
+                    Err(ReplayEvent())
+                }
+            }
         }
         // KTD-9: 0-conf acceptance from the trusted LSP only.
         Event::OpenChannelRequest {
@@ -2218,11 +2322,11 @@ fn handle_ldk_event(
             reason,
         ),
         // U10: OBSERVE the bump event for close records + gated recovery
-        // entry; the CPFP handling itself is U11's
-        // (`BumpTransactionEventHandler` slots in after the observation).
-        // Acking here is safe: LDK re-yields bump events on each new block
-        // until the claim confirms, so U11's handler will still see the
-        // need. The observation is idempotent under replay.
+        // entry FIRST; then U11's CPFP handler consumes it (fee-sanity
+        // gated). Acking is safe either way: LDK re-yields bump events on
+        // each new block until the claim confirms, so a refused or failed
+        // bump is retried at fresh rates. The observation is idempotent
+        // under replay.
         Event::BumpTransaction(ref bump_event) => {
             use lightning::events::bump_transaction::BumpTransactionEvent;
             let (channel_id_hex, commitment) = match bump_event {
@@ -2256,10 +2360,31 @@ fn handle_ldk_event(
                 unix_now().as_millis() as u64,
                 logger,
             );
-            log_info!(
-                logger,
-                "BumpTransaction observed for close records/recovery; CPFP handling lands in U11"
-            );
+            // U11 CPFP handling (KTD-9), AFTER the U10 observation: the
+            // fee-sanity middleware refuses a bump whose requested package
+            // rate exceeds 5x a fresh 3-block estimate (the ~30x overpay
+            // incident class) BEFORE any coins are selected or signed.
+            let target_sat_per_kw = crate::bump::bump_event_target_sat_per_kw(bump_event);
+            match crate::bump::check_bump_target_sanity(
+                target_sat_per_kw,
+                &channels_ctx.chain_source.fee_estimator(),
+            ) {
+                Ok(()) => {
+                    log_info!(
+                        logger,
+                        "BumpTransaction for {channel_id_hex}: handling CPFP fee bump at \
+                         {target_sat_per_kw} sat/kW"
+                    );
+                    bump_handler.handle_event(bump_event);
+                }
+                Err(e) => {
+                    log_error!(
+                        logger,
+                        "BumpTransaction for {channel_id_hex} REFUSED: {e}; LDK re-yields \
+                         on the next block"
+                    );
+                }
+            }
             Ok(())
         }
         // Per-path telemetry: the background processor already feeds these to
@@ -2290,6 +2415,8 @@ fn spawn_background_processor(
     payment_store: Arc<PaymentStore>,
     close_records: Arc<CloseRecordStore>,
     recovery: Arc<RecoveryStore>,
+    sweep_engine: Arc<SweepEngine>,
+    sweep_wake: Arc<tokio::sync::Notify>,
     event_sink: Arc<dyn EventSink>,
     bp_stop_receiver: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
@@ -2304,12 +2431,23 @@ fn spawn_background_processor(
     let onion_messenger = Arc::clone(&components.onion_messenger);
     let gossip_sync = components.gossip_source.gossip_sync();
     let peer_manager = Arc::clone(&components.peer_manager);
-    let sweeper = Arc::clone(&components.sweeper);
     let scorer = Arc::clone(&components.scorer);
     let logger = Arc::clone(&components.logger);
     let error_logger = Arc::clone(&components.logger);
 
-    let event_sweeper = Arc::clone(&components.sweeper);
+    // U11: the CPFP handler (BumpTransactionEventHandlerSync over the bdk
+    // wallet source; the KeysManager is the signer provider for anchor-input
+    // re-derivation).
+    let bump_handler = Arc::new(crate::bump::build_bump_handler(
+        Arc::clone(&components.broadcaster),
+        Arc::new(crate::bump::BdkWalletSource::new(
+            Arc::clone(&components.onchain_wallet),
+            Arc::clone(&components.logger),
+        )),
+        Arc::clone(&components.keys_manager),
+        Arc::clone(&components.logger),
+    ));
+
     let event_logger = Arc::clone(&components.logger);
     // U9: the channel-event context (funding flow + auto-forget handles).
     // The funding store rides on the raw local KVStore — funding txs are
@@ -2326,7 +2464,9 @@ fn spawn_background_processor(
         )),
     });
     let event_handler = move |event: Event| {
-        let sweeper = Arc::clone(&event_sweeper);
+        let sweep_engine = Arc::clone(&sweep_engine);
+        let sweep_wake = Arc::clone(&sweep_wake);
+        let bump_handler = Arc::clone(&bump_handler);
         let liquidity_source = Arc::clone(&liquidity_source);
         let payment_store = Arc::clone(&payment_store);
         let channels_ctx = Arc::clone(&channels_ctx);
@@ -2337,7 +2477,9 @@ fn spawn_background_processor(
         async move {
             handle_ldk_event(
                 event,
-                &sweeper,
+                &sweep_engine,
+                &sweep_wake,
+                &bump_handler,
                 &liquidity_source,
                 &payment_store,
                 &channels_ctx,
@@ -2372,7 +2514,10 @@ fn spawn_background_processor(
             // polling + persistence) and the peer manager's custom message
             // handler — omitting either makes LSPS2 silently do nothing.
             Some(liquidity_manager),
-            Some(sweeper),
+            // U11/KTD-8: no OutputSweeper — the core-owned descriptor store
+            // (`crate::sweep`) owns tracking, sweeping, and attribution. The
+            // alias only types the empty slot.
+            None::<Arc<Sweeper>>,
             logger,
             Some(scorer),
             sleeper,

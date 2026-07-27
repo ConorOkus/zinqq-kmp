@@ -423,6 +423,112 @@ impl OnchainWallet {
         Ok(address.address.to_string())
     }
 
+    /// Whether `script` belongs to this wallet (either keychain) — the sweep
+    /// pipeline's wallet-owned `StaticOutput` exclusion, first half (U11/
+    /// KTD-8, PWA `sweep.ts:117-149` `isWalletOwnedStaticOutput`).
+    pub(crate) fn is_mine_script(&self, script: &bitcoin::Script) -> bool {
+        self.inner.lock().unwrap().wallet.is_mine(script.into())
+    }
+
+    /// Whether `outpoint` is an unspent output the wallet currently tracks —
+    /// the subsidized sweep's shared-input verification helper (tests).
+    #[cfg(test)]
+    pub(crate) fn owns_unspent_outpoint(&self, outpoint: &bitcoin::OutPoint) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet
+            .list_unspent()
+            .any(|utxo| utxo.outpoint == *outpoint)
+    }
+
+    /// The EXTERNAL script at `index` WITHOUT revealing it — the exclusion's
+    /// second half (post-recovery re-derivation by `channel_keys_id`, PWA
+    /// `sweep.ts:131-144`): compare against a pure derivation first; reveal
+    /// (a wallet mutation) only on a confirmed match via
+    /// [`OnchainWallet::destination_script_for_index`].
+    pub(crate) fn peek_external_script(&self, index: u32) -> ScriptBuf {
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet
+            .peek_address(KeychainKind::External, index)
+            .address
+            .script_pubkey()
+    }
+
+    /// Reveals the next EXTERNAL script for a sweep destination (U11, PWA
+    /// `revealNextAddress` — always advances, unlike next-unused) and
+    /// persists the reveal so a restart keeps watching it.
+    pub(crate) fn reveal_next_external_script(&self) -> Result<ScriptBuf, ()> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, persister } = &mut *inner;
+        let address = wallet.reveal_next_address(KeychainKind::External);
+        wallet.persist(persister).map_err(|e| {
+            log_error!(
+                self.logger,
+                "Failed to persist sweep-destination reveal: {e}"
+            );
+        })?;
+        Ok(address.address.script_pubkey())
+    }
+
+    /// Every CONFIRMED UTXO as `(outpoint, txout)` — the CPFP wallet source
+    /// and the subsidized sweep's candidate list (U11). Confirmed only: an
+    /// unconfirmed parent could drop from the mempool and invalidate the
+    /// child, leaving the force-close stuck (PWA `bdk-wallet-source.ts:36-47`,
+    /// `subsidized-sweep.ts:185-187`).
+    pub(crate) fn confirmed_utxos(&self) -> Vec<(bitcoin::OutPoint, bitcoin::TxOut)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet
+            .list_unspent()
+            .filter(|utxo| utxo.chain_position.is_confirmed())
+            .map(|utxo| (utxo.outpoint, utxo.txout))
+            .collect()
+    }
+
+    /// Signs `psbt`'s wallet-owned inputs with `trust_witness_utxo: true`
+    /// (U11 — the historic CPFP-cannot-sign bug): LDK-produced PSBTs carry
+    /// only `witness_utxo` for our inputs, and bdk's default `SignOptions`
+    /// reject that (CVE-2020-14199 fee-siphon mitigation, aimed at UNTRUSTED
+    /// PSBT producers). Here LDK builds the PSBT on our behalf from state we
+    /// already trust, so the trust flag is safe — and the only way CPFP or a
+    /// subsidized sweep can sign (PWA `bdk-wallet-source.ts:102-112`,
+    /// `subsidized-sweep.ts:403-407`). Returns whether the PSBT finalized
+    /// (inputs already carrying a final witness — LDK's — count as done).
+    pub(crate) fn sign_psbt_trusted(&self, psbt: &mut Psbt) -> Result<bool, String> {
+        let sign_options = SignOptions {
+            trust_witness_utxo: true,
+            ..Default::default()
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet
+            .sign(psbt, sign_options)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Registers a self-broadcast unconfirmed tx with the wallet graph so
+    /// coin selection excludes its inputs BEFORE the next chain sync (~180 s
+    /// window), persisting the changeset (U11, PWA
+    /// `subsidized-sweep.ts:248-277` `markSubsidyInputsSpent`). Failure is
+    /// non-fatal for the caller — the session reservation set still guards
+    /// the sweep path.
+    pub(crate) fn apply_unconfirmed_tx(
+        &self,
+        tx: Transaction,
+        last_seen_secs: u64,
+    ) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, persister } = &mut *inner;
+        wallet.apply_unconfirmed_txs([(tx, last_seen_secs)]);
+        wallet.persist(persister).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Next unused external script for the signer's
     /// `get_shutdown_scriptpubkey` — non-deterministic by design (PWA parity):
     /// shutdown scripts are recorded at channel open and replayed from
@@ -628,6 +734,22 @@ pub(crate) mod test_support {
             Amount::from_sat(sats),
             ReceiveTo::Mempool(1_700_000_000),
         );
+    }
+
+    /// Signs `psbt` with explicit `SignOptions` — the U11 trust-flag guard
+    /// compares default-vs-trusted signing behavior.
+    pub(crate) fn sign_with_options(
+        onchain: &OnchainWallet,
+        psbt: &mut Psbt,
+        sign_options: SignOptions,
+    ) -> Result<bool, String> {
+        onchain
+            .inner
+            .lock()
+            .unwrap()
+            .wallet
+            .sign(psbt, sign_options)
+            .map_err(|e| e.to_string())
     }
 
     /// Whether `script` belongs to the wallet's INTERNAL (change) keychain —

@@ -112,9 +112,13 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 pub(crate) type RapidGossipSync =
     lightning_rapid_gossip_sync::RapidGossipSync<Arc<Graph>, Arc<Logger>>;
 
-/// The sweeper persists through the same `KVStoreSync` the background
-/// processor uses (the BP's generics require it); its `output_sweeper` key
-/// routes local-only inside [`crate::vss::DualWriteKvStore`].
+/// TYPE-ONLY (U11/KTD-8): no `OutputSweeperSync` instance exists anymore —
+/// the sweep pipeline is the core-owned descriptor store in
+/// [`crate::sweep`] (`OutputSweeper` was rejected: no untrack/release, its
+/// regenerate-and-rebroadcast cycle would race the subsidized path over the
+/// same outpoints, and it emits no per-tx attribution). This alias remains
+/// solely to type the background processor's `None` sweeper slot, whose
+/// generic bound demands a concrete `OutputSweeperSync` type.
 pub(crate) type Sweeper = OutputSweeperSync<
     Arc<Broadcaster>,
     Arc<OnchainWallet>,

@@ -38,13 +38,10 @@ use lightning::util::persist::{
     read_channel_monitors, KVStoreSync, CHANNEL_MANAGER_PERSISTENCE_KEY,
     CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
     NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
-    NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_KEY,
-    OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
-    SCORER_PERSISTENCE_KEY, SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
-    SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+    NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, SCORER_PERSISTENCE_KEY,
+    SCORER_PERSISTENCE_PRIMARY_NAMESPACE, SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
 };
 use lightning::util::ser::{ReadableArgs, Writeable};
-use lightning::util::sweep::OutputSweeperSync;
 use lightning_liquidity::lsps2::client::LSPS2ClientConfig;
 use lightning_liquidity::LiquidityClientConfig;
 use lightning_persister::fs_store::FilesystemStore;
@@ -57,7 +54,7 @@ use crate::node::EventSink;
 use crate::signer::WalletSignerProvider;
 use crate::types::{
     ChainMonitor, ChannelManager, Graph, LiquidityManager, Logger, MessageRouter, OnionMessenger,
-    PeerManager, Scorer, Sweeper,
+    PeerManager, Scorer,
 };
 use crate::vss::known_peers::KnownPeersStore;
 use crate::vss::startup::{establish_vss_state, VssStartupState};
@@ -244,7 +241,6 @@ pub(crate) struct NodeComponents {
     pub(crate) peer_manager: Arc<PeerManager>,
     pub(crate) scorer: Arc<Mutex<Scorer>>,
     pub(crate) gossip_source: Arc<GossipSource>,
-    pub(crate) sweeper: Arc<Sweeper>,
     /// Whether the initial chain sync reached the tip. `false` is a degraded
     /// start (only possible with zero monitors); the background loop retries.
     pub(crate) chain_synced_at_start: bool,
@@ -816,41 +812,10 @@ pub(crate) fn build(
         Arc::clone(&keys_manager),
     ));
 
-    // Output sweeper: durable Event::SpendableOutputs handling.
-    let sweeper: Arc<Sweeper> = match kv_store.read(
-        OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
-        OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
-        OUTPUT_SWEEPER_PERSISTENCE_KEY,
-    ) {
-        Ok(bytes) => {
-            let args = (
-                Arc::clone(&broadcaster),
-                Arc::clone(&fee_estimator),
-                Some(Arc::clone(&chain_source)),
-                Arc::clone(&keys_manager),
-                Arc::clone(&onchain_wallet),
-                Arc::clone(&dual_kv_store),
-                Arc::clone(&logger),
-            );
-            let (_best_block, sweeper) =
-                <(BestBlock, Sweeper)>::read(&mut Cursor::new(bytes), args)
-                    .map_err(|_| BuildError::ReadFailed)?;
-            Arc::new(sweeper)
-        }
-        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {
-            Arc::new(OutputSweeperSync::new(
-                channel_manager.current_best_block(),
-                Arc::clone(&broadcaster),
-                Arc::clone(&fee_estimator),
-                Some(Arc::clone(&chain_source)),
-                Arc::clone(&keys_manager),
-                Arc::clone(&onchain_wallet),
-                Arc::clone(&dual_kv_store),
-                Arc::clone(&logger),
-            ))
-        }
-        Err(_) => return Err(BuildError::ReadFailed),
-    };
+    // U11/KTD-8: NO OutputSweeperSync is built — spendable outputs are
+    // tracked and swept by the core-owned descriptor store (`crate::sweep`),
+    // wired by the node at start. The spike's persisted `output_sweeper`
+    // blob (if any) is ignored: spike installs are disposable per plan.
 
     // U3: `_known_peers` — local mirror + LWW VSS sync (recovery has already
     // written any remotely-recovered peers to the local mirror).
@@ -877,7 +842,6 @@ pub(crate) fn build(
         peer_manager,
         scorer,
         gossip_source,
-        sweeper,
         chain_synced_at_start,
     })
 }

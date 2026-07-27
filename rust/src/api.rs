@@ -170,6 +170,23 @@ pub enum RecoveryStatusView {
     SweepConfirmed,
 }
 
+/// Outputs still waiting to sweep (U11, R8): the pending banner + add-funds
+/// UX. `pending_sats` is a LOWER BOUND — `has_unknown_value` marks
+/// undercounting; `needs_onchain_funds`/`shortfall_sats` mean a subsidized
+/// sweep would rescue the funds once the confirmed balance grows by the
+/// shortfall. Changes arrive as [`Event::SweepStateChanged`]; re-read on
+/// every one (the PWA's `usePendingSweep`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PendingSweepView {
+    pub entry_count: u32,
+    pub descriptor_count: u32,
+    pub pending_sats: u64,
+    pub has_unknown_value: bool,
+    pub last_attempt_failed: bool,
+    pub needs_onchain_funds: bool,
+    pub shortfall_sats: Option<u64>,
+}
+
 /// The force-close recovery state for the banner/screen (U10, R9).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RecoveryStateView {
@@ -1437,6 +1454,20 @@ impl Wallet {
             channel_ids: state.channel_ids,
             created_at_ms: state.created_at,
             updated_at_ms: state.updated_at,
+        })
+    }
+
+    /// Outputs still waiting to sweep (U11, R8), `None` when nothing is
+    /// pending. Readable while stopped (the store owns its own handle).
+    pub fn pending_sweep(&self) -> Option<PendingSweepView> {
+        self.node.pending_sweep().map(|info| PendingSweepView {
+            entry_count: info.entry_count,
+            descriptor_count: info.descriptor_count,
+            pending_sats: info.pending_sats,
+            has_unknown_value: info.has_unknown_value,
+            last_attempt_failed: info.last_attempt_failed,
+            needs_onchain_funds: info.needs_onchain_funds,
+            shortfall_sats: info.shortfall_sats,
         })
     }
 

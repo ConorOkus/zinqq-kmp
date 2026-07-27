@@ -272,21 +272,114 @@ impl BroadcasterInterface for Broadcaster {
 }
 
 /// Whether a failed broadcast is benign because the network already knows the
-/// transaction (already in mempool / already confirmed). Pure so it is
+/// transaction (or one resolving the same outputs/inputs). Pure so it is
 /// unit-testable; matches bitcoind's `sendrawtransaction` error strings that
-/// Esplora relays in HTTP 400 bodies.
+/// Esplora relays in HTTP 400 bodies — the PWA's full sentinel list
+/// (`broadcaster.ts:33-49`, U11/KTD-9):
+///
+/// - the already-known family (mempool / block chain / known / confirmed);
+/// - "insufficient fee, rejecting replacement" — an equivalent tx already
+///   rides the mempool and ours cannot RBF it;
+/// - RPC `-27` / "outputs already in utxo set" — the tx (or one with the same
+///   outputs) is on chain; after a successful CPFP'd force close LDK keeps
+///   re-issuing the confirmed commitment + anchor child for a while;
+/// - RPC `-25` / "bad-txns-inputs-missingorspent" — for a persisted pending
+///   broadcast this nearly always means the tx (or a conflicting one over the
+///   same inputs) already confirmed; retrying can't do better. The sweep
+///   pipeline treats this as a SENTINEL, not proof: shared-input (subsidized)
+///   txs verify against chain truth before any descriptor is deleted
+///   (sweep.rs — a concurrently spent wallet input produces the same error).
 pub(crate) fn broadcast_error_is_benign(message: &str) -> bool {
     // Normalize case and bitcoind's hyphenated reject codes
-    // ("txn-already-in-mempool") to plain words before matching.
-    let message = message.to_lowercase().replace('-', " ");
+    // ("txn-already-in-mempool") to plain words before matching. The raw
+    // (lowercased) message is kept for the numeric RPC codes, whose minus
+    // sign must not be eaten by the hyphen normalization.
+    let raw = message.to_lowercase();
+    let message = raw.replace('-', " ");
     [
         "already in mempool",
         "already in the mempool",
         "already in block chain",
         "already known",
+        "already confirmed",
+        "insufficient fee, rejecting replacement",
+        "outputs already in utxo set",
+        "bad txns inputs missingorspent",
     ]
     .iter()
     .any(|benign| message.contains(benign))
+        || raw.contains("-25")
+        || raw.contains("-27")
+}
+
+// ---------------------------------------------------------------------------
+// Fee-sanity middleware (U11, adopted from the incident review)
+// ---------------------------------------------------------------------------
+
+/// The fee-sanity ceiling: no self-built broadcast may exceed this multiple
+/// of a fresh 3-block estimate (U11 — a real incident overpaid ~30x when the
+/// urgent sweep target answered a 1-block panic rate).
+pub(crate) const FEE_SANITY_MULTIPLIER: u32 = 5;
+
+/// Typed fee-sanity refusal (distinct `Display` per convention). The caller
+/// must NOT broadcast; sweep paths surface it as a failed-attempt state
+/// change, the CPFP path skips the bump (LDK re-yields next block).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FeeSanityError {
+    /// The transaction's effective rate exceeds 5x a fresh 3-block estimate.
+    Overpay {
+        effective_sat_per_kw: u64,
+        max_sat_per_kw: u64,
+    },
+}
+
+impl fmt::Display for FeeSanityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FeeSanityError::Overpay {
+                effective_sat_per_kw,
+                max_sat_per_kw,
+            } => write!(
+                f,
+                "fee-sanity refusal: effective rate {effective_sat_per_kw} sat/kW exceeds the \
+                 5x-of-3-block ceiling {max_sat_per_kw} sat/kW"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FeeSanityError {}
+
+/// The current fee-sanity ceiling in sat/kW: 5x the estimator's fresh
+/// 3-block answer ([`ConfirmationTarget::UrgentOnChainSweep`] — KTD-9 pins
+/// that variant to a 3-block target; `fees.rs` has the table test).
+pub(crate) fn fee_sanity_max_sat_per_kw(fee_estimator: &CachedFeeEstimator) -> u64 {
+    use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator as _};
+    u64::from(fee_estimator.get_est_sat_per_1000_weight(ConfirmationTarget::UrgentOnChainSweep))
+        * u64::from(FEE_SANITY_MULTIPLIER)
+}
+
+/// Refuses any transaction whose effective rate (`fee / weight`) exceeds
+/// `max_sat_per_kw` (see [`fee_sanity_max_sat_per_kw`]). Pure, applied where
+/// the fee IS computable — our own built txs: the sweep, subsidized-sweep,
+/// and CPFP paths (LDK-relayed txs like commitments carry no input values
+/// here and pre-commit their fees channel-side).
+pub(crate) fn check_fee_sanity(
+    fee_sats: u64,
+    tx_weight_wu: u64,
+    max_sat_per_kw: u64,
+) -> Result<(), FeeSanityError> {
+    if tx_weight_wu == 0 {
+        return Ok(());
+    }
+    let effective_sat_per_kw = fee_sats.saturating_mul(1000) / tx_weight_wu;
+    if effective_sat_per_kw > max_sat_per_kw {
+        return Err(FeeSanityError::Overpay {
+            effective_sat_per_kw,
+            max_sat_per_kw,
+        });
+    }
+    Ok(())
 }
 
 /// U10: the reconcile pass's chain queries go through the ONE configured
@@ -536,6 +629,21 @@ impl ChainSource {
         outcome
     }
 
+    /// Persists a transaction to the pending-broadcast store ahead of an
+    /// out-of-queue broadcast (the sweep engine's direct path — U11): a crash
+    /// between build and broadcast is redelivered by the startup drain.
+    pub(crate) fn persist_pending_broadcast(&self, tx: &Transaction) {
+        self.pending_broadcasts.persist(tx, unix_now().as_secs());
+    }
+
+    /// Whether the chain view KNOWS `txid` (mempool or confirmed) — the
+    /// sweep engine's sentinel verification (U11/KTD-8, PWA
+    /// `subsidized-sweep.ts:213-230`): an unreachable Esplora reads as
+    /// "unknown", never as proof.
+    pub(crate) async fn tx_known_to_chain(&self, txid: &Txid) -> bool {
+        matches!(self.esplora_client.get_tx(txid).await, Ok(Some(_)))
+    }
+
     /// Broadcast one queued package, tolerating already-known transactions.
     pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
         for tx in &package {
@@ -634,6 +742,13 @@ impl GossipSource {
 mod tests {
     use super::*;
 
+    /// U11 guard (KTD-9, the historic fund-burn class): the broadcaster maps
+    /// the FULL PWA sentinel list (`broadcaster.ts:33-49`) to success — the
+    /// already-known family, RPC `-27` (outputs already in UTXO set), and RPC
+    /// `-25` (inputs missing or spent: for a persisted pending broadcast this
+    /// nearly always means the tx, or a conflict over the same inputs,
+    /// already confirmed). The sweep path additionally verifies sentinel
+    /// outcomes against chain truth before deleting descriptors (sweep.rs).
     #[test]
     fn already_known_broadcast_errors_are_benign() {
         for message in [
@@ -641,6 +756,13 @@ mod tests {
             "txn-already-in-mempool",
             "Transaction already in the mempool",
             "TXN-ALREADY-KNOWN",
+            "txn-already-confirmed",
+            "insufficient fee, rejecting replacement",
+            "sendrawtransaction RPC error: {\"code\":-27,\"message\":\"Outputs already in UTXO set\"}",
+            "RPC error -27",
+            "sendrawtransaction RPC error: {\"code\":-25,\"message\":\"bad-txns-inputs-missingorspent\"}",
+            "bad-txns-inputs-missingorspent",
+            "RPC error -25",
         ] {
             assert!(
                 broadcast_error_is_benign(message),
@@ -653,8 +775,8 @@ mod tests {
     fn real_broadcast_failures_are_not_benign() {
         for message in [
             "sendrawtransaction RPC error: {\"code\":-26,\"message\":\"min relay fee not met\"}",
-            "bad-txns-inputs-missingorspent",
             "dust",
+            "mempool full",
             "",
         ] {
             assert!(
@@ -662,6 +784,55 @@ mod tests {
                 "expected fatal: {message}"
             );
         }
+    }
+
+    // ---------- fee-sanity middleware (U11) ----------
+
+    /// U11 guard (the ~30x overpay incident): a transaction priced at 30x
+    /// the fresh 3-block estimate is REFUSED with the typed error; a sanely
+    /// priced one passes. The ceiling reads the estimator's
+    /// `UrgentOnChainSweep` slot, which KTD-9 pins to a 3-block target
+    /// (`fees.rs::fee_table_matches_pwa_floors_and_targets`).
+    #[test]
+    fn fee_sanity_blocks_a_30x_overpay_and_passes_sane_fees() {
+        use std::collections::HashMap;
+        let estimator = CachedFeeEstimator::new();
+        // 3-block estimate: 100 sat/vB -> 25_000 sat/kW.
+        let estimates: HashMap<u16, f64> = [(1u16, 400.0), (3u16, 100.0), (6u16, 50.0)]
+            .into_iter()
+            .collect();
+        estimator.set_cache(cache_from_esplora_estimates(&estimates));
+        let max = fee_sanity_max_sat_per_kw(&estimator);
+        assert_eq!(max, 125_000, "5x the fresh 3-block estimate");
+
+        // 30x overpay fixture: a 1000-wu tx paying 750_000 sats/kW-worth of
+        // fee (30 x 25_000) must be blocked...
+        let weight_wu = 1_000u64;
+        let overpay_fee = 750_000u64 * weight_wu / 1000;
+        assert_eq!(
+            check_fee_sanity(overpay_fee, weight_wu, max),
+            Err(FeeSanityError::Overpay {
+                effective_sat_per_kw: 750_000,
+                max_sat_per_kw: 125_000,
+            })
+        );
+        // ...the typed error stays distinguishable in rendered form.
+        let err = check_fee_sanity(overpay_fee, weight_wu, max).unwrap_err();
+        assert!(err.to_string().contains("fee-sanity refusal"));
+
+        // A tx at exactly the 3-block rate passes (25_000 sats over 1000
+        // wu), as does one at the 5x boundary; one sat over is refused.
+        assert_eq!(check_fee_sanity(25_000, weight_wu, max), Ok(()));
+        assert_eq!(check_fee_sanity(125_000, weight_wu, max), Ok(()));
+        assert!(check_fee_sanity(125_001, weight_wu, max).is_err());
+    }
+
+    #[test]
+    fn fee_sanity_tolerates_a_zero_weight_probe() {
+        // Degenerate input must not divide by zero or block: no weight means
+        // no computable rate, and "not computable" never refuses (the
+        // middleware only applies where the rate IS computable).
+        assert_eq!(check_fee_sanity(1_000, 0, 1), Ok(()));
     }
 
     // ---------- pending broadcasts (U12/KTD-9) ----------

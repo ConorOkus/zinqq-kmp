@@ -6,6 +6,7 @@ use tokio::runtime::{Builder, Runtime};
 
 pub mod api;
 pub mod builder;
+mod bump;
 mod chain;
 pub mod channels;
 pub mod close_records;
@@ -25,6 +26,7 @@ pub mod recovery;
 pub mod restore;
 pub mod send;
 mod signer;
+pub mod sweep;
 mod types;
 mod util;
 pub mod vss;

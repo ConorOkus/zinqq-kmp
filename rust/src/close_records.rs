@@ -1010,7 +1010,6 @@ pub(crate) fn on_commitment_broadcast(
 /// broadcast sweep txid to every record whose channel contributed an output
 /// (attribution by the channelId persisted with each descriptor — never by
 /// "the sweep my event triggered").
-#[allow(dead_code)] // Wired by U11's sweep pipeline.
 pub(crate) fn record_sweep_tx(
     store: &Arc<CloseRecordStore>,
     txid: &str,
