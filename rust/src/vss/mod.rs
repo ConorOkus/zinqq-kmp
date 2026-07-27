@@ -39,7 +39,7 @@ pub use store::{DualWriteKvStore, VssBackedStore};
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::{BTreeSet, HashMap, HashSet};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use super::store::{BoxFuture, VersionedValue, VssTransport};
@@ -70,6 +70,10 @@ pub(crate) mod test_support {
         put_attempts: Mutex<BatchItems>,
         put_many_calls: Mutex<Vec<BatchItems>>,
         get_calls: Mutex<Vec<String>>,
+        /// `listKeyVersions` calls — how the startup tests prove silent
+        /// recovery reconciles against the probe result it already has instead
+        /// of re-listing the namespace.
+        list_calls: AtomicUsize,
     }
 
     impl MockTransport {
@@ -130,6 +134,18 @@ pub(crate) mod test_support {
                         .map(|(key, _, _)| key.clone()),
                 )
                 .collect()
+        }
+
+        /// TOTAL `getObject` calls (by plaintext or stored key — the mock's
+        /// obfuscation is the identity, so both land here). Lets a test assert
+        /// that a code path issues no fetch beyond the ones it must.
+        pub(crate) fn get_call_count(&self) -> usize {
+            self.get_calls.lock().unwrap().len()
+        }
+
+        /// TOTAL `listKeyVersions` calls.
+        pub(crate) fn list_call_count(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
         }
 
         pub(crate) fn get_calls_for(&self, key: &str) -> usize {
@@ -310,6 +326,7 @@ pub(crate) mod test_support {
         }
 
         fn list_key_versions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<(String, i64)>, VssError>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
             let result = if self.fail_list.load(Ordering::SeqCst) {
                 Err(VssError::Network {
                     message: "mock: list failure injected".to_string(),

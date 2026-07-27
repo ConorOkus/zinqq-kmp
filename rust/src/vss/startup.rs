@@ -11,12 +11,19 @@
 //!    - Empty → fresh wallet. Version-0 first writes are permitted ONLY
 //!      because the probe returned empty this session (`probe_empty`).
 //!    - Non-empty → **silent recovery** via U4's shared engine
-//!      (`crate::restore`): manifest → chunked parallel monitor downloads →
-//!      channel manager → known peers, EVERY blob validated by
-//!      deserialization BEFORE any local write, then ordered local writes
-//!      (CM before monitors — F3). ANY failure rolls back the partial local
-//!      writes and is FATAL ([`BuildError::VssRecoveryFailed`]) — never a
-//!      fall-through to fresh-wallet writes over an existing backup.
+//!      (`crate::restore`): manifest → manifest reconciliation against this
+//!      same probe result (remote monitor keys the manifest never listed are
+//!      identified by fetching them and ADOPTED, exactly as the explicit
+//!      Restore screen does — the PWA orphans such keys by design and a
+//!      fire-and-forget manifest write can leave a LIVE channel's monitor
+//!      unlisted) → chunked parallel monitor downloads → channel manager →
+//!      known peers, EVERY blob validated by deserialization BEFORE any local
+//!      write, then ordered local writes (CM before monitors — F3). ANY
+//!      failure — including an unexplained remote key that cannot be
+//!      identified — rolls back the partial local writes and is FATAL
+//!      ([`BuildError::VssRecoveryFailed`]) — never a fall-through to
+//!      fresh-wallet writes over an existing backup, and never a silently
+//!      omitted monitor.
 //! 2. **Local data + empty namespace** → migration: ONE transactional
 //!    `putObjects` batch (CM + all monitors + manifest + known peers at
 //!    version 0), versions seeded to 1. Failure is non-fatal: the session
@@ -202,6 +209,9 @@ pub(crate) fn establish_vss_state(
         }
         let state = silent_recovery(
             transport,
+            // The probe result is already in hand: reconciliation inside
+            // silent recovery reuses it instead of re-listing the namespace.
+            &listing,
             kv_store,
             keys_manager,
             signer_provider,
@@ -339,35 +349,84 @@ pub(crate) fn establish_vss_state(
 }
 
 /// Silent recovery (branch 1, non-empty namespace), delegating the
-/// download/validate/write mechanics to U4's shared restore engine
-/// (`crate::restore`): manifest → chunked parallel monitor downloads within
-/// the shared time budget, EVERY blob validated by deserialization BEFORE
-/// any local write → ordered local writes (CM before monitors, monitors,
-/// peers). ANY failure rolls back the partial local writes and returns
+/// reconcile/download/validate/write mechanics to U4's shared restore engine
+/// (`crate::restore`): manifest → manifest reconciliation against the ALREADY
+/// FETCHED `listKeyVersions` result (`adopt_unexplained_monitors`, the exact
+/// function and ordering the explicit Restore screen uses) → chunked parallel
+/// monitor downloads within the shared time budget, EVERY blob validated by
+/// deserialization BEFORE any local write → adopted monitors folded into the
+/// plan (`merge_adopted_monitors`, so they reach both the local writes and the
+/// returned [`VssStartupState::monitor_keys`]) → ordered local writes (CM
+/// before monitors, monitors, peers) → best-effort manifest backfill. ANY
+/// failure rolls back the partial local writes and returns
 /// [`BuildError::VssRecoveryFailed`] — never a fall-through to fresh-wallet
 /// writes.
+///
+/// Why reconciliation belongs here and not only on the Restore screen (the
+/// cross-client half of R4): the sibling PWA's manifest write is
+/// fire-and-forget (`writeManifest(): void`, never awaited —
+/// `zinq/src/ldk/traits/persist.ts:98`) and archiving a channel deliberately
+/// orphans the monitor's VSS key (ibid. 370-376, "orphaned VSS keys waste
+/// storage but do not affect fund safety"). So a PWA-created backup can hold
+/// monitor blobs `_monitor_keys` does not list, and the unlisted one is NOT
+/// necessarily archived — a fire-and-forget manifest write that never landed
+/// leaves a LIVE channel's monitor unlisted. This path used to skip the
+/// reconciliation entirely and therefore SILENTLY OMITTED such a monitor, then
+/// started the node anyway: strictly more dangerous than the explicit path's
+/// abort, and the difference was decided by which door the user walked
+/// through. Now both doors adopt the same set.
+///
+/// `listing` is the probe result `establish_vss_state` already has in hand
+/// (the same one branch 3 seeds versions from) — reconciliation adds no extra
+/// `listKeyVersions` round trip to startup.
 fn silent_recovery(
     transport: Arc<dyn VssTransport>,
+    listing: &[(String, i64)],
     kv_store: &Arc<FilesystemStore>,
     keys_manager: &Arc<KeysManager>,
     signer_provider: &Arc<WalletSignerProvider>,
     logger: &Arc<Logger>,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<VssStartupState, BuildError> {
-    let plan = runtime.block_on(async {
+    let prepared = runtime.block_on(async {
         let manifest = crate::restore::fetch_manifest(&*transport).await?;
-        crate::restore::download_and_validate(
+        let manifest_keys: Vec<String> = manifest
+            .as_ref()
+            .map(|(keys, _)| keys.clone())
+            .unwrap_or_default();
+        // Identify anything the manifest and the fixed key set do not explain
+        // BEFORE the bulk download, under the SAME time budget the explicit
+        // path gives this pass — a store full of unlisted keys must not turn a
+        // start into an unbounded wait.
+        let adopted = crate::restore::adopt_unexplained_monitors(
+            &*transport,
+            listing,
+            &manifest_keys,
+            keys_manager,
+            signer_provider,
+            crate::restore::RESTORE_DOWNLOAD_BUDGET,
+            logger,
+        )
+        .await?;
+        let mut plan = crate::restore::download_and_validate(
             &transport,
             manifest,
             keys_manager,
             signer_provider,
             crate::restore::RESTORE_DOWNLOAD_BUDGET,
         )
-        .await
+        .await?;
+        let adopted_count = crate::restore::merge_adopted_monitors(&mut plan, adopted, logger)?;
+        Ok::<_, crate::restore::RestoreError>((plan, adopted_count))
     });
-    let plan = match plan {
-        Ok(plan) => plan,
+    let (plan, adopted_count) = match prepared {
+        Ok(prepared) => prepared,
         Err(e) => {
+            // Includes the unidentifiable-unexplained-key verdict: where the
+            // explicit path reports `BackupInconsistent`, silent recovery's
+            // equivalent is refusing to start. Skipping the key and continuing
+            // would be exactly the fresh-over-backup outcome this branch
+            // exists to forbid.
             log_error!(
                 logger,
                 "Silent recovery against a non-empty namespace FAILED ({e}); refusing to start \
@@ -388,9 +447,23 @@ fn silent_recovery(
         return Err(BuildError::VssRecoveryFailed);
     }
 
+    // Durable from here on: the manifest backfill is a courtesy to the NEXT
+    // start (so it needs no identification pass), and a failure must never turn
+    // a finished recovery into a failed one — same best-effort contract, same
+    // trigger, as the explicit path.
+    if adopted_count > 0 {
+        runtime.block_on(crate::restore::backfill_manifest(
+            &*transport,
+            &plan.monitor_keys(),
+            plan.manifest_version.unwrap_or(0),
+            logger,
+        ));
+    }
+
     log_info!(
         logger,
-        "Silent recovery complete: {} monitor(s), channel_manager: {}, peers: {}",
+        "Silent recovery complete: {} monitor(s) ({adopted_count} adopted from unlisted remote \
+         key(s)), channel_manager: {}, peers: {}",
         plan.monitors.len(),
         plan.cm.is_some(),
         plan.peers.is_some()
