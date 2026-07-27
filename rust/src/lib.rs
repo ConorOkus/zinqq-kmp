@@ -23,6 +23,7 @@ pub mod onchain_send;
 pub mod payment;
 pub mod receive;
 pub mod recovery;
+mod replay;
 pub mod restore;
 pub mod send;
 mod signer;

@@ -136,7 +136,7 @@ impl CloseTxRole {
     }
 
     /// Whether this role marks the channel-closing transaction itself.
-    fn is_close(&self) -> bool {
+    pub(crate) fn is_close(&self) -> bool {
         matches!(self, CloseTxRole::Closing | CloseTxRole::Commitment)
     }
 }
@@ -1054,6 +1054,35 @@ pub(crate) trait ChainTruth: Send + Sync {
         &'a self,
         txid: &'a str,
     ) -> BoxFuture<'a, Result<Option<u32>, String>>;
+    /// The FULL transaction, `None` when the backend does not know it.
+    ///
+    /// Used only by [`crate::replay`]: LDK's
+    /// [`ChannelMonitor::get_spendable_outputs`] scans a transaction's OUTPUTS,
+    /// so a txid is not enough there. The reconcile pass never needs tx bodies
+    /// and never calls this.
+    ///
+    /// [`ChannelMonitor::get_spendable_outputs`]: lightning::chain::channelmonitor::ChannelMonitor::get_spendable_outputs
+    fn full_tx<'a>(
+        &'a self,
+        txid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<bitcoin::Transaction>, String>>;
+    /// Whether `txid:vout` is spent (mempool spends included) — the SPENT FLAG
+    /// itself, not "did we learn a spender txid".
+    ///
+    /// Deliberately distinct from [`ChainTruth::outspend`]: Esplora's outspend
+    /// response carries `spent: bool` and `txid: Option<Txid>` independently,
+    /// so a spent output whose spender txid is absent from the payload reads as
+    /// `None` through `outspend` — indistinguishable from unspent. Reconcile
+    /// wants the spender (it IS the discovered close tx) and can treat a
+    /// missing one as nothing found; [`crate::replay`]'s already-spent guard
+    /// must not, because reading "spent" as "unspent" is what re-tracks a swept
+    /// output and freezes the whole all-or-nothing sweep batch. An
+    /// indeterminate answer is an `Err`, never `false`.
+    fn outpoint_spent<'a>(
+        &'a self,
+        txid: &'a str,
+        vout: u32,
+    ) -> BoxFuture<'a, Result<bool, String>>;
 }
 
 /// Wallet receipt evidence (`reconcile.ts:69-76`): whether `txid` is
@@ -2029,6 +2058,22 @@ mod tests {
                 self.queries.fetch_add(1, Ordering::SeqCst);
                 Ok(self.heights.get(txid).copied())
             })
+        }
+        /// Reconcile needs neither tx bodies nor the bare spent flag (only
+        /// `crate::replay` does), so a call to either would be a regression in
+        /// the pass's query budget.
+        fn full_tx<'a>(
+            &'a self,
+            _txid: &'a str,
+        ) -> BoxFuture<'a, Result<Option<bitcoin::Transaction>, String>> {
+            unreachable!("the reconcile pass must not fetch transaction bodies")
+        }
+        fn outpoint_spent<'a>(
+            &'a self,
+            _txid: &'a str,
+            _vout: u32,
+        ) -> BoxFuture<'a, Result<bool, String>> {
+            unreachable!("the reconcile pass discovers spenders via outspend")
         }
     }
 

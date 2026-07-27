@@ -392,31 +392,12 @@ impl Node {
             }
         }
 
-        // U10: attach the VSS halves for the running session and seed both
-        // singletons from the remote (pull cross-device state into empty
-        // local stores; merges are idempotent so a late seed is safe).
+        // U10: attach the VSS halves for the running session. The remote seed
+        // (and the missed-descriptor replay that depends on it) is spawned
+        // further down, once the sweep engine exists.
         self.close_records
             .attach_vss(Arc::clone(&components.vss_store));
         self.recovery.attach_vss(Arc::clone(&components.vss_store));
-        {
-            let vss = Arc::clone(&components.vss_store);
-            let close_records = Arc::clone(&self.close_records);
-            let recovery = Arc::clone(&self.recovery);
-            runtime.spawn(async move {
-                if let Some((bytes, _)) = vss
-                    .fetch_versioned(crate::vss::store::CLOSE_RECORDS_VSS_KEY)
-                    .await
-                {
-                    close_records.seed_from_remote(&bytes);
-                }
-                if let Some((bytes, _)) = vss
-                    .fetch_versioned(crate::vss::store::FORCE_CLOSE_RECOVERY_VSS_KEY)
-                    .await
-                {
-                    recovery.seed_from_remote(&bytes);
-                }
-            });
-        }
 
         let chain_synced = Arc::new(AtomicBool::new(components.chain_synced_at_start));
         let liquidity_source = Arc::new(LiquiditySource::from_components(
@@ -516,6 +497,65 @@ impl Node {
             Arc::clone(&sweep_wake),
             stop_sender.subscribe(),
         );
+        // U10: seed both singletons from the remote (pull cross-device state
+        // into empty local stores; merges are idempotent so a late seed is
+        // safe), THEN run the once-per-boot missed-descriptor replay.
+        //
+        // The ordering is load-bearing in both directions. The replay is
+        // close-record-driven, and on a cross-client restore the records may
+        // arrive only with this VSS seed — so it must run after it. And it
+        // needs monitors already synced to tip, which `build()` did
+        // synchronously before `watch_channel` (`get_spendable_outputs` counts
+        // confirmations against the monitor's `best_block`) — so it cannot run
+        // any earlier than start. One shot per boot: restore, silent recovery,
+        // and plain restart all benefit, and a locally-created wallet that
+        // missed an event benefits identically. See `crate::replay`.
+        {
+            let vss = Arc::clone(&components.vss_store);
+            let close_records = Arc::clone(&self.close_records);
+            let recovery = Arc::clone(&self.recovery);
+            let chain_monitor = Arc::clone(&components.chain_monitor);
+            let chain_source = Arc::clone(&components.chain_source);
+            let logger = Arc::clone(&components.logger);
+            let engine = Arc::clone(&sweep_engine);
+            let wake = Arc::clone(&sweep_wake);
+            // Only a start whose initial chain sync SUCCEEDED may replay: a
+            // degraded start is only reachable with zero monitors (see
+            // `build()`), so this costs nothing real — it just keeps the
+            // "monitors are at tip" precondition explicit rather than implied.
+            let synced_at_start = components.chain_synced_at_start;
+            runtime.spawn(async move {
+                if let Some((bytes, _)) = vss
+                    .fetch_versioned(crate::vss::store::CLOSE_RECORDS_VSS_KEY)
+                    .await
+                {
+                    close_records.seed_from_remote(&bytes);
+                }
+                if let Some((bytes, _)) = vss
+                    .fetch_versioned(crate::vss::store::FORCE_CLOSE_RECOVERY_VSS_KEY)
+                    .await
+                {
+                    recovery.seed_from_remote(&bytes);
+                }
+                if !synced_at_start {
+                    return;
+                }
+                let summary = crate::replay::replay_missed_spendable_outputs(
+                    &close_records,
+                    &*chain_monitor,
+                    &*chain_source,
+                    &engine,
+                    &logger,
+                )
+                .await;
+                if summary.descriptors_tracked > 0 {
+                    // Same wake the `SpendableOutputs` event arm uses: the
+                    // existing engine, cadence, and `pending_sweep()` surface
+                    // do the rest — no second queue, no new banner.
+                    wake.notify_one();
+                }
+            });
+        }
         self.spawn_recovery_task(
             &runtime,
             Arc::clone(&sweep_engine) as Arc<dyn RecoverySweeper>,

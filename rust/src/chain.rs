@@ -420,6 +420,31 @@ impl crate::close_records::ChainTruth for ChainSource {
                 .map_err(|e| e.to_string())
         })
     }
+
+    fn full_tx<'a>(
+        &'a self,
+        txid: &'a str,
+    ) -> crate::vss::store::BoxFuture<'a, Result<Option<Transaction>, String>> {
+        Box::pin(async move {
+            let txid: Txid = txid.parse().map_err(|e| format!("bad txid: {e}"))?;
+            self.transaction_by_txid(&txid)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn outpoint_spent<'a>(
+        &'a self,
+        txid: &'a str,
+        vout: u32,
+    ) -> crate::vss::store::BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let txid: Txid = txid.parse().map_err(|e| format!("bad txid: {e}"))?;
+            self.outpoint_is_spent(&txid, vout)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
 }
 
 /// Esplora-backed chain source. `tx_sync` implements LDK's `Filter` and
@@ -596,6 +621,43 @@ impl ChainSource {
         } else {
             None
         })
+    }
+
+    /// Whether `txid:vout` is spent, straight off Esplora's `spent` flag
+    /// (mempool spends included) — the missed-descriptor replay's already-spent
+    /// guard ([`crate::replay`]). Distinct from [`ChainSource::output_spender`],
+    /// which answers "which tx spent it" and cannot distinguish "spent, spender
+    /// not reported" from "unspent"; here that difference decides whether an
+    /// already-swept output gets re-tracked into a sweep that can never
+    /// succeed. A missing outspend record is an ERROR, not a `false`: the
+    /// caller must skip, never track.
+    pub(crate) async fn outpoint_is_spent(
+        &self,
+        txid: &Txid,
+        vout: u32,
+    ) -> Result<bool, ChainError> {
+        self.esplora_client
+            .get_output_status(txid, u64::from(vout))
+            .await
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?
+            .map(|status| status.spent)
+            .ok_or_else(|| {
+                ChainError::EsploraUnreachable(format!("no outspend record for {txid}:{vout}"))
+            })
+    }
+
+    /// The full transaction body for `txid`, `None` when the backend does not
+    /// know it. Used by the missed-descriptor replay pass ([`crate::replay`]):
+    /// `ChannelMonitor::get_spendable_outputs` scans a transaction's outputs,
+    /// so the txid alone is not enough there.
+    pub(crate) async fn transaction_by_txid(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<Transaction>, ChainError> {
+        self.esplora_client
+            .get_tx(txid)
+            .await
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))
     }
 
     /// Current tip height (U10 reconcile).
