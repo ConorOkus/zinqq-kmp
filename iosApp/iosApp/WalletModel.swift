@@ -141,19 +141,10 @@ struct CloseDetailUi {
 /// as pure functions; this class only snapshots core queries.
 @MainActor
 final class WalletModel: ObservableObject {
-    struct Invoice: Equatable {
-        let bolt11: String
-        let expiryUnixSecs: UInt64
-    }
-
     @Published private(set) var running = false
     @Published private(set) var balanceMsat: UInt64 = 0
-    @Published private(set) var currentInvoice: Invoice?
     @Published private(set) var lastOutcome: String?
     @Published private(set) var syncBanner: String?
-    /// True while a receiveJit/send FFI call is in flight; the view disables
-    /// the Request Invoice / Pay buttons on it (R8: one coarse flag is fine).
-    @Published private(set) var busy = false
     /// Another client took over this seed's VSS namespace (U18; KTD-3, plan
     /// System-Wide Impact): set by `Event.Fenced` or a typed `Fenced` start
     /// failure, never cleared by an event — un-fencing is user-owned (restore
@@ -294,53 +285,6 @@ final class WalletModel: ObservableObject {
                 self?.lastOutcome = "Stop failed: \(error.localizedDescription)"
             }
             endAssertion()
-        }
-    }
-
-    // MARK: Intents
-
-    /// Requests a Megalith JIT invoice; the invoice arrives asynchronously as
-    /// InvoiceReady (or Lsps2Failed). Sats→msat is unit scaling only, not fee
-    /// math (R4).
-    func requestInvoice(amountSats: UInt64) {
-        guard let wallet, !busy else { return }
-        // Bound before scaling: `* 1_000` on an unchecked UInt64 would trap
-        // on absurd amounts. Reject instead of crashing.
-        guard amountSats > 0, amountSats <= UInt64.max / 1_000 else {
-            lastOutcome = "Amount out of range"
-            return
-        }
-        busy = true
-        lastOutcome = nil
-        Task { [weak self] in
-            do {
-                // receiveJit is a blocking FFI call — run off the MainActor.
-                try await Self.runBlockingFFI {
-                    try wallet.receiveJit(amountMsat: amountSats * 1_000)
-                }
-            } catch {
-                self?.lastOutcome = "Invoice request failed: \(error.localizedDescription)"
-            }
-            self?.busy = false
-        }
-    }
-
-    /// Passes the BOLT11 string straight to the core, which parses and
-    /// validates it (R4: no invoice parsing in Swift).
-    func sendPayment(bolt11: String) {
-        guard let wallet, !busy else { return }
-        let trimmed = bolt11.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        busy = true
-        lastOutcome = "Sending…"
-        Task { [weak self] in
-            do {
-                // send is a blocking FFI call — run off the MainActor.
-                try await Self.runBlockingFFI { try wallet.send(bolt11: trimmed) }
-            } catch {
-                self?.lastOutcome = "Send failed: \(error.localizedDescription)"
-            }
-            self?.busy = false
         }
     }
 
@@ -487,13 +431,14 @@ final class WalletModel: ObservableObject {
             syncBanner = "Chain sync failed — retrying…"
         case .syncCompleted:
             syncBanner = nil
-        case let .invoiceReady(bolt11, expiryUnixSecs):
-            currentInvoice = Invoice(bolt11: bolt11, expiryUnixSecs: expiryUnixSecs)
+        case .invoiceReady:
+            // The receive flow renders invoices from its own controller
+            // (U21); nothing to reduce here.
+            break
         case let .paymentReceived(_, amountMsat, skimmedFeeMsat):
             // Optimistic bookkeeping; the triggered refreshWalletData()
             // overwrites it with the authoritative balances() snapshot.
             balanceMsat += amountMsat
-            currentInvoice = nil
             if let skimmedFeeMsat {
                 lastOutcome = "Received \(amountMsat / 1_000) sats (LSP fee \(skimmedFeeMsat / 1_000) sats)"
             } else {
@@ -508,7 +453,6 @@ final class WalletModel: ObservableObject {
         case .channelReady:
             lastOutcome = "Channel ready"
         case let .lsps2Failed(reason):
-            currentInvoice = nil
             lastOutcome = "Invoice request failed: \(reason)"
         case .sweepStateChanged:
             // No direct state: the triggered refresh re-queries pendingSweep.

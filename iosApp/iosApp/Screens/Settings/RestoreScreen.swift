@@ -13,6 +13,7 @@ struct RestoreScreen: View {
     let onRestored: () -> Void
 
     @Environment(\.zinqqColors) private var colors
+    @Environment(\.scenePhase) private var scenePhase
     @State private var words: [String] = Array(repeating: "", count: restoreWordCount)
     @State private var confirming = false
     @State private var mnemonicValid = false
@@ -68,16 +69,13 @@ struct RestoreScreen: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 // 3-column grid of numbered inputs (Restore.tsx:183-200).
-                VStack(spacing: 8) {
-                    ForEach(
-                        Array(stride(from: 0, to: restoreWordCount, by: 3)), id: \.self
-                    ) { rowStart in
-                        HStack(spacing: 8) {
-                            ForEach(rowStart..<min(rowStart + 3, restoreWordCount), id: \.self) {
-                                wordField(index: $0)
-                            }
-                        }
-                    }
+                // The typed words render inside the secure capture layer
+                // (screenshots/recordings omit it — BackupScreen's shield),
+                // and the grid blanks the instant the scene leaves .active
+                // (BackupScreen's scenePhase hide), so app-switcher
+                // snapshots never contain typed words.
+                CaptureObscured {
+                    wordGrid.opacity(scenePhase == .active ? 1 : 0)
                 }
                 .padding(.top, 16)
 
@@ -93,6 +91,20 @@ struct RestoreScreen: View {
             .padding(.horizontal, 16)
             .padding(.top, 16)
             .padding(.bottom, 32)
+        }
+    }
+
+    private var wordGrid: some View {
+        VStack(spacing: 8) {
+            ForEach(
+                Array(stride(from: 0, to: restoreWordCount, by: 3)), id: \.self
+            ) { rowStart in
+                HStack(spacing: 8) {
+                    ForEach(rowStart..<min(rowStart + 3, restoreWordCount), id: \.self) {
+                        wordField(index: $0)
+                    }
+                }
+            }
         }
     }
 

@@ -1860,6 +1860,147 @@ mod tests {
         );
     }
 
+    // ---------- archive (archive_persisted_channel) ----------
+
+    /// `archive_persisted_channel` for a monitor the store persisted: the
+    /// local file moves monitors/ → archived_monitors/, the manifest no
+    /// longer lists the key, and the fire-and-forget remote delete removes
+    /// the monitor blob from VSS.
+    #[test]
+    fn archive_moves_local_file_prunes_manifest_and_deletes_remote() {
+        use std::str::FromStr as _;
+        let h = harness();
+        let txid_hex = "6f".repeat(32);
+        let vss_key = format!("{txid_hex}:0");
+        let name = format!("{txid_hex}_0");
+
+        // Persist a NEW monitor to full durability: remote blob + gating
+        // manifest + local file (the archive path's precondition).
+        h.store
+            .queue_monitor_write(monitor_write(0x6f, 1, b"closing-monitor"), true);
+        wait_until(&h.rt, || !h.completion.0.lock().unwrap().is_empty());
+        assert!(h.transport.value(&vss_key).is_some());
+        assert_eq!(
+            h.local.read(MON_NS, "", &name).unwrap(),
+            b"closing-monitor".to_vec()
+        );
+        assert_eq!(
+            parse_monitor_manifest(&h.transport.value(MONITOR_MANIFEST_KEY).unwrap().0).unwrap(),
+            vec![vss_key.clone()]
+        );
+
+        // A repeated-byte txid reads the same in display and raw order, so
+        // `MonitorName::to_string()` matches the persisted name exactly.
+        let monitor_name = MonitorName::V1Channel(lightning::chain::transaction::OutPoint {
+            txid: bitcoin::Txid::from_str(&txid_hex).unwrap(),
+            index: 0,
+        });
+        Persist::<lightning::sign::InMemorySigner>::archive_persisted_channel(
+            &*h.store,
+            monitor_name,
+        );
+
+        // Local (synchronous): monitors/{name} → archived_monitors/{name}.
+        assert_eq!(
+            h.local
+                .read(
+                    ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                    ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                    &name,
+                )
+                .unwrap(),
+            b"closing-monitor".to_vec()
+        );
+        assert!(
+            h.local.read(MON_NS, "", &name).is_err(),
+            "the live monitor file is removed after the archive move"
+        );
+
+        // Remote (fire-and-forget): the delete lands and the rewritten
+        // manifest no longer lists the key.
+        wait_until(&h.rt, || h.transport.value(&vss_key).is_none());
+        let (manifest_bytes, _) = h.transport.value(MONITOR_MANIFEST_KEY).unwrap();
+        let manifest: Vec<String> = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(
+            !manifest.contains(&vss_key),
+            "the manifest must not list the archived key"
+        );
+        assert!(
+            !h.store
+                .inner
+                .monitor_keys
+                .lock()
+                .unwrap()
+                .contains(&vss_key),
+            "the in-memory manifest set drops the key"
+        );
+        assert!(
+            !h.store
+                .inner
+                .versions
+                .lock()
+                .unwrap()
+                .contains_key(&vss_key),
+            "the version cache entry is dropped after the delete"
+        );
+    }
+
+    /// The defensive 'no VSS key recorded' branch: archiving a monitor that
+    /// never entered via `persist_new_channel`/`register_loaded_monitor`
+    /// still does the local move but issues NO remote traffic (fund-safe
+    /// orphaned storage, per the archive doc) and must not panic.
+    #[test]
+    fn archive_without_a_recorded_vss_key_skips_the_remote_delete() {
+        use std::str::FromStr as _;
+        let h = harness();
+        let txid_hex = "7a".repeat(32);
+        let vss_key = format!("{txid_hex}:0");
+        let name = format!("{txid_hex}_0");
+
+        // A local monitor file with no name → VSS key mapping, plus a remote
+        // blob that must survive (deriving the key would risk the wrong txid
+        // byte order).
+        h.local
+            .write(MON_NS, "", &name, b"orphan-monitor".to_vec())
+            .unwrap();
+        h.transport.seed(&vss_key, b"remote-monitor", 3);
+
+        let monitor_name = MonitorName::V1Channel(lightning::chain::transaction::OutPoint {
+            txid: bitcoin::Txid::from_str(&txid_hex).unwrap(),
+            index: 0,
+        });
+        Persist::<lightning::sign::InMemorySigner>::archive_persisted_channel(
+            &*h.store,
+            monitor_name,
+        );
+
+        // The local archive move still happens.
+        assert_eq!(
+            h.local
+                .read(
+                    ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                    ARCHIVED_CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                    &name,
+                )
+                .unwrap(),
+            b"orphan-monitor".to_vec()
+        );
+        assert!(h.local.read(MON_NS, "", &name).is_err());
+
+        // No remote delete, no manifest write — zero transport traffic.
+        settle(&h.rt, 50);
+        assert_eq!(
+            h.transport.value(&vss_key).unwrap(),
+            (b"remote-monitor".to_vec(), 3),
+            "the remote blob is left orphaned, never deleted"
+        );
+        assert_eq!(
+            h.transport.put_attempt_count(),
+            0,
+            "no manifest rewrite without a recorded VSS key"
+        );
+    }
+
     // ---------- manifest parsing ----------
 
     #[test]

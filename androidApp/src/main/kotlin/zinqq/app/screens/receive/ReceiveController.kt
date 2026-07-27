@@ -14,6 +14,7 @@ import uniffi.wallet_core.Event
 import uniffi.wallet_core.JitInvoice
 import uniffi.wallet_core.JitQuote
 import uniffi.wallet_core.ReceiveBundle
+import zinqq.app.screens.send.walletErrorMessage
 import zinqq.spike.NumpadKey
 import zinqq.spike.msatToSatCeil
 import zinqq.spike.numpadDigitReducer
@@ -147,8 +148,15 @@ class ReceiveController(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // The send flow's shared typed-error copy (iOS
+                // ReceiveController parity); the PWA's onchain-error fallback
+                // covers anything the mapping leaves blank.
                 _state.update {
-                    it.copy(loading = false, loadError = e.message ?: "Failed to load wallet")
+                    it.copy(
+                        loading = false,
+                        loadError = walletErrorMessage(e)
+                            .ifBlank { "Failed to load wallet" },
+                    )
                 }
             }
         }

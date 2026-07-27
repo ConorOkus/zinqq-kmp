@@ -1,5 +1,6 @@
 package zinqq.app.screens.settings
 
+import android.view.WindowManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,6 +21,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -30,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -62,6 +65,21 @@ fun RestoreScreen(
     var words by remember { mutableStateOf(List(RESTORE_WORD_COUNT) { "" }) }
     var confirming by remember { mutableStateOf(false) }
     var mnemonicValid by remember { mutableStateOf(false) }
+
+    // FLAG_SECURE exactly while typed seed words exist (mirrors BackupScreen,
+    // plan U17, R1): the word-entry grid AND the destructive-confirm step —
+    // any state still holding the typed words — must not appear in
+    // screenshots or recents thumbnails.
+    val activity = LocalContext.current.findActivity()
+    val hasTypedWords = words.any { it.isNotBlank() }
+    DisposableEffect(hasTypedWords) {
+        if (hasTypedWords) {
+            activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+        onDispose {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
 
     // Re-validate whenever the grid changes; `derive_debug_info` is the
     // exported BIP39 check (cheap key derivation, IO-dispatched).

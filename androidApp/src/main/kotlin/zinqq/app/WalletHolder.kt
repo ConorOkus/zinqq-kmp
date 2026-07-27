@@ -105,6 +105,14 @@ class WalletHolder(
 
     private var loopJob: Job? = null
 
+    // Serializes the foreground start/stop lifecycle (KTD-10): startNode()
+    // and stopNode() each chain onto the previous lifecycle job, so a rapid
+    // background/foreground flip can never run a stale stop() after a fresh
+    // start() — transitions apply strictly in the order the process
+    // lifecycle emitted them. Only mutated from the main thread
+    // (ProcessLifecycleOwner callbacks).
+    private var lifecycleJob: Job? = null
+
     init {
         // Keep the state's appearance mode mirroring the persisted selection.
         scope.launch {
@@ -211,19 +219,6 @@ class WalletHolder(
         scope.launch {
             val record = wallet.closeDetail(channelId)
             _state.update { it.copy(closeDetail = CloseDetailUi(channelId, record)) }
-        }
-    }
-
-    fun requestInvoice(amountSats: ULong) {
-        scope.launch {
-            try {
-                wallet.receiveJit(amountSats * 1_000uL)
-            } catch (e: Exception) {
-                // Generated WalletException: the Lsps2Failed event carries the
-                // same reason, but a typed failure must surface even if it beat
-                // the event loop.
-                _state.update { it.copy(lastOutcome = "Invoice request failed: ${e.message}") }
-            }
         }
     }
 
@@ -359,7 +354,11 @@ class WalletHolder(
         // restart); a foreground start racing it would make the core's
         // stopped-only restore() fail with AlreadyRunning.
         if (_state.value.restore is RestoreUi.InProgress) return
-        scope.launch {
+        // Capture the previous job in a local BEFORE reassigning: joining
+        // `lifecycleJob` from inside the new job would self-join forever.
+        val previous = lifecycleJob
+        lifecycleJob = scope.launch {
+            previous?.join()
             if (_state.value.restore is RestoreUi.InProgress) return@launch
             if (!startCore()) return@launch
             ensureEventLoop()
@@ -494,7 +493,9 @@ class WalletHolder(
     private fun stopNode() {
         // Runs on the process-scoped scope, so it survives the activity teardown
         // that races this call on a back-press exit.
-        scope.launch {
+        val previous = lifecycleJob
+        lifecycleJob = scope.launch {
+            previous?.join()
             try {
                 wallet.stop()
             } catch (_: Exception) {
