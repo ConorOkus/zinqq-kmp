@@ -3,9 +3,9 @@ import UIKit
 
 /// The PWA's Advanced (U22, R12; `Advanced.tsx`): the Node ID copy card with
 /// the 2,000 ms "Copied!" flash, then the Balance and Peers rows. The node id
-/// is cached on `WalletModel` (queried per refresh — `nodeId()` needs a
-/// running node); like the PWA's not-ready gate, the card simply doesn't
-/// render before the first successful start. Mirrors Android's
+/// is cached on `WalletModel` (fetched on refresh until cached — `nodeId()`
+/// needs a running node); like the PWA's not-ready gate, the card simply
+/// doesn't render before the first successful start. Mirrors Android's
 /// `AdvancedScreen`.
 struct AdvancedScreen: View {
     @ObservedObject var model: WalletModel
@@ -37,12 +37,7 @@ struct AdvancedScreen: View {
             }
         }
         // The PWA's 2,000 ms copied flash (Advanced.tsx:56-62).
-        .task(id: copied) {
-            if copied {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                copied = false
-            }
-        }
+        .autoReset($copied, afterMs: 2_000)
     }
 
     private func nodeIdCard(_ nodeId: String) -> some View {

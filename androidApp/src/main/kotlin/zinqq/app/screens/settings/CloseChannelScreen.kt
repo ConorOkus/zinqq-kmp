@@ -31,7 +31,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -40,6 +39,7 @@ import kotlinx.coroutines.launch
 import uniffi.wallet_core.ChannelView
 import uniffi.wallet_core.CloseEstimate
 import zinqq.app.R
+import zinqq.app.components.CenteredNote
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
 import zinqq.spike.formatBtc
@@ -194,32 +194,32 @@ private fun ConfirmBody(
                 .padding(top = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            FactRow(
+            SettingsFactRow(
                 label = "Peer",
                 value = reviewPeerDisplay(channel.counterpartyPubkey),
                 mono = true,
             )
-            FactRow(
+            SettingsFactRow(
                 label = "Channel Capacity",
                 value = formatBtc(channel.capacitySats.toLong()),
             )
-            FactRow(
+            SettingsFactRow(
                 label = "Your Balance",
                 value = formatBtc(msatToSatFloor(channel.outboundMsat.toLong())),
             )
-            FactRow(
+            SettingsFactRow(
                 label = "Remote Balance",
                 value = formatBtc(msatToSatFloor(channel.inboundMsat.toLong())),
             )
 
             HorizontalDivider(color = colors.darkBorder)
 
-            FactRow(
+            SettingsFactRow(
                 label = "You Get Back",
                 value = expectedBackLabel(estimate, estimateLoading),
             )
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                FactRow(
+                SettingsFactRow(
                     label = "Estimated Cost to You",
                     value = closeCostLabel(estimate, force, estimateLoading),
                 )
@@ -228,7 +228,7 @@ private fun ConfirmBody(
                 }
                 Text(text = ESTIMATE_CAVEAT, color = colors.onDarkMuted, fontSize = 12.sp)
             }
-            FactRow(
+            SettingsFactRow(
                 label = "Funds Available",
                 value = closeTimelineLabel(estimate, force),
             )
@@ -431,30 +431,6 @@ private fun ErrorBody(
             contentColor = colors.onCta,
             onClick = onTryAgain,
             modifier = Modifier.padding(top = if (failure.canForceClose) 12.dp else 32.dp),
-        )
-    }
-}
-
-@Composable
-private fun FactRow(label: String, value: String, mono: Boolean = false) {
-    val colors = ZinqqTheme.colors
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = label,
-            color = colors.onDarkMuted,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.Medium,
-            modifier = Modifier.weight(1f),
-        )
-        Text(
-            text = value,
-            color = colors.onDark,
-            fontSize = if (mono) 13.sp else 15.sp,
-            fontFamily = if (mono) FontFamily.Monospace else ZinqqTheme.fonts.sans,
-            fontWeight = FontWeight.SemiBold,
         )
     }
 }

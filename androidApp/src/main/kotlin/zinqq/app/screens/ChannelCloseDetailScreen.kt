@@ -18,8 +18,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,7 +31,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
 import uniffi.wallet_core.CloseInitiatorView
 import uniffi.wallet_core.CloseRecordView
 import uniffi.wallet_core.CloseStatusLabel
@@ -44,6 +41,8 @@ import zinqq.app.closeAmountText
 import zinqq.app.closeStatusLabel
 import zinqq.app.closeTxRoleLabel
 import zinqq.app.closeTypeLabel
+import zinqq.app.components.CenteredNote
+import zinqq.app.components.rememberCopiedFlash
 import zinqq.app.confirmationText
 import zinqq.app.explorerTxUrl
 import zinqq.app.formatCloseDate
@@ -86,8 +85,8 @@ fun ChannelCloseDetailScreen(
         ScreenHeader(title = "Channel Close", onBack = onBack, tint = colors.onDark)
 
         when {
-            detail == null -> CenteredDarkNote("Loading...")
-            detail.record == null -> CenteredDarkNote("Close record not found")
+            detail == null -> CenteredNote("Loading...")
+            detail.record == null -> CenteredNote("Close record not found")
             else -> CloseDetailBody(
                 record = detail.record,
                 needsDepositLink = needsDeposit(state.recoveryState, channelId),
@@ -234,14 +233,8 @@ private fun CloseTxRow(tx: CloseTxView, lastRow: Boolean) {
     val colors = ZinqqTheme.colors
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
-    var copied by remember { mutableStateOf(false) }
     // The PWA's 1,500ms "Copied" flash (ChannelCloseDetail.tsx:56-59).
-    LaunchedEffect(copied) {
-        if (copied) {
-            delay(1_500)
-            copied = false
-        }
-    }
+    var copied by rememberCopiedFlash(1_500)
 
     Column(
         modifier = Modifier

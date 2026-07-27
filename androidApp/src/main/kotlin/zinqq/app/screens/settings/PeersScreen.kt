@@ -43,6 +43,7 @@ import kotlinx.coroutines.launch
 import uniffi.wallet_core.ChannelStateLabel
 import uniffi.wallet_core.ChannelView
 import uniffi.wallet_core.PeerView
+import zinqq.app.components.CenteredNote
 import zinqq.app.theme.ZinqqTheme
 
 /**

@@ -10,13 +10,11 @@
 //! The timestamp is injectable ([`SignatureHeaderProvider::header_at`]) so
 //! cross-implementation vectors can pin the exact header string.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, SecretKey, SignOnly};
 
-use super::crypto::to_hex;
 use super::VssError;
+use crate::util::hex_str;
 
 /// The Nodana VSS Signature Authorizer domain separator. The trailing dots
 /// pad to exactly 64 bytes — do not modify (PWA `VSS_SIGNING_CONSTANT`).
@@ -49,11 +47,7 @@ impl SignatureHeaderProvider {
     /// The `authorization` header value for "now" (whole unix seconds, like
     /// the PWA's `Math.floor(Date.now() / 1000)`).
     pub fn header(&self) -> String {
-        let unix_seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is after the unix epoch")
-            .as_secs();
-        self.header_at(unix_seconds)
+        self.header_at(crate::util::unix_now().as_secs())
     }
 
     /// [`Self::header`] with the timestamp injected — used by the vector
@@ -78,7 +72,7 @@ impl SignatureHeaderProvider {
             .sign_ecdsa(&message, &self.secret_key)
             .serialize_compact();
 
-        format!("{}{}{timestamp}", to_hex(&pubkey), to_hex(&signature))
+        format!("{}{}{timestamp}", hex_str(&pubkey), hex_str(&signature))
     }
 }
 

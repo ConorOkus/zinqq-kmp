@@ -237,17 +237,18 @@ pub(crate) fn parse_monitor_manifest(bytes: &[u8]) -> Result<Vec<String>, String
             entries.len()
         ));
     }
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut keys: Vec<String> = Vec::new();
     for entry in entries {
         let key = entry
             .as_str()
             .filter(|key| is_valid_monitor_key(key))
             .ok_or_else(|| format!("invalid monitor key in manifest: {entry}"))?;
-        if !seen.iter().any(|existing| existing == key) {
-            seen.push(key.to_string());
+        if seen.insert(key) {
+            keys.push(key.to_string());
         }
     }
-    Ok(seen)
+    Ok(keys)
 }
 
 /// The PWA's monitor storage key: `hex(funding txid raw bytes):{index}`. The

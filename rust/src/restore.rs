@@ -760,7 +760,7 @@ pub(crate) fn run_restore(
     progress(STEP_STOPPING_WALLET);
     let marker = RestoreMarker {
         mnemonic: mnemonic.to_string(),
-        started_at_ms: now.as_millis() as u64,
+        started_at_ms: crate::util::now_ms(),
     };
     write_marker(&storage_dir, &marker).map_err(|e| RestoreError::LocalWriteFailed {
         detail: format!("restore marker write failed: {e}"),

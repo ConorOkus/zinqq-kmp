@@ -86,12 +86,7 @@ struct ScanScreen: View {
             }
         }
         // Invalid toast auto-clears after 3 s (PWA Scan.tsx:79-84).
-        .task(id: toastVisible) {
-            if toastVisible {
-                try? await Task.sleep(nanoseconds: invalidScanToastMs * 1_000_000)
-                toastVisible = false
-            }
-        }
+        .autoReset($toastVisible, afterMs: invalidScanToastMs)
     }
 
     /// Same precedence as Android's `when` block: permission banners first,

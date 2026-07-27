@@ -1478,7 +1478,7 @@ impl SweepEngine {
                 &self.close_records,
                 &txid.to_string(),
                 channels,
-                crate::util::unix_now().as_millis() as u64,
+                crate::util::now_ms(),
             );
         }
     }

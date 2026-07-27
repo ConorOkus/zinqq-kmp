@@ -28,12 +28,7 @@ struct RecoverFundsScreen: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(colors.dark.ignoresSafeArea())
         // The PWA's 1,500ms "Copied!" flash (RecoverFunds.tsx:20-21).
-        .task(id: copied) {
-            if copied {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                copied = false
-            }
-        }
+        .autoReset($copied, afterMs: 1_500)
     }
 
     private func recoveryBody(_ recovery: RecoveryStateView) -> some View {

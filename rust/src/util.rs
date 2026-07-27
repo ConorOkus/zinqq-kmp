@@ -14,6 +14,12 @@ pub(crate) fn unix_now() -> Duration {
         .expect("system time before UNIX epoch")
 }
 
+/// Milliseconds since the UNIX epoch as a `u64` — the crate-wide timestamp
+/// format for records and events.
+pub(crate) fn now_ms() -> u64 {
+    unix_now().as_millis() as u64
+}
+
 /// Lowercase hex of a byte slice (payment hashes/ids, channel ids) — the id
 /// format the payment store and the public events share (U5).
 pub(crate) fn hex_str(bytes: &[u8]) -> String {

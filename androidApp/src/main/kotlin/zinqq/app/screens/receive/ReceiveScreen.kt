@@ -52,6 +52,7 @@ import zinqq.app.components.BottomSheet
 import zinqq.app.components.Numpad
 import zinqq.app.components.QrView
 import zinqq.app.components.ResultTemplate
+import zinqq.app.components.rememberCopiedFlash
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
 import zinqq.spike.formatBtc
@@ -228,13 +229,7 @@ fun ReceiveScreen(
     // Copy bottom sheet (PWA Receive.tsx:1026-1039); 2,000 ms feedback.
     if (showSheet) {
         val clipboard = LocalClipboardManager.current
-        var copied by remember { mutableStateOf(false) }
-        LaunchedEffect(copied) {
-            if (copied) {
-                delay(COPY_FEEDBACK_MS)
-                copied = false
-            }
-        }
+        var copied by rememberCopiedFlash(COPY_FEEDBACK_MS)
         val value = copyValue(page, state.bip321Uri, state.offer)
         BottomSheet(open = true, onClose = { showSheet = false }) {
             Text(

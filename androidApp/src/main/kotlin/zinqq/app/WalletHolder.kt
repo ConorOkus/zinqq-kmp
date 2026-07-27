@@ -177,17 +177,20 @@ class WalletHolder(
             val recovery = wallet.recoveryState()
             val sweep = wallet.pendingSweep()
             // Cached across stops (U17): node_id() needs a running node, but
-            // the pubkey is stable for the wallet's lifetime.
-            val freshNodeId = try {
-                wallet.nodeId()
-            } catch (_: Exception) {
+            // the pubkey is stable for the wallet's lifetime, so fetch it only
+            // until it caches ([startRestore] clears it for the new wallet).
+            val freshNodeId = if (_state.value.nodeId == null) {
+                try {
+                    wallet.nodeId()
+                } catch (_: Exception) {
+                    null
+                }
+            } else {
                 null
             }
             _state.update { state ->
                 state.copy(
                     balances = balances ?: state.balances,
-                    balanceMsat = balances?.lightningMsat ?: state.balanceMsat,
-                    onchainSats = balances?.onchainTotalSats ?: state.onchainSats,
                     activity = activity ?: state.activity,
                     recoveryState = recovery,
                     pendingSweep = sweep,
@@ -460,8 +463,9 @@ class WalletHolder(
                 return@launch
             }
             // The restored wallet replaced the old one — any fence fell with
-            // it; a start failure still surfaces through startError on Home.
-            _state.update { it.copy(fenced = false) }
+            // it (a start failure still surfaces through startError on Home),
+            // and its node id must be re-fetched.
+            _state.update { it.copy(fenced = false, nodeId = null) }
             restartAfterRestore()
             _state.update { it.copy(restore = RestoreUi.Succeeded) }
         }

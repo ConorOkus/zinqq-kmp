@@ -120,7 +120,7 @@ impl KnownPeersStore {
         host: &str,
         port: u16,
     ) -> Result<(), lightning::io::Error> {
-        let snapshot = {
+        let bytes = {
             let mut map = self.map.lock().unwrap();
             map.insert(
                 pubkey.to_string(),
@@ -129,23 +129,19 @@ impl KnownPeersStore {
                     port,
                 },
             );
-            map.clone()
+            serialize_known_peers(&map)
         };
-        write_local_known_peers(&self.local, &snapshot)?;
-        self.sync_vss(&snapshot);
-        Ok(())
+        self.persist(bytes)
     }
 
     /// Removes a peer, persists locally, and schedules the LWW VSS write.
     pub(crate) fn remove(&self, pubkey: &str) -> Result<(), lightning::io::Error> {
-        let snapshot = {
+        let bytes = {
             let mut map = self.map.lock().unwrap();
             map.remove(pubkey);
-            map.clone()
+            serialize_known_peers(&map)
         };
-        write_local_known_peers(&self.local, &snapshot)?;
-        self.sync_vss(&snapshot);
-        Ok(())
+        self.persist(bytes)
     }
 
     /// The full saved-peer map.
@@ -184,9 +180,17 @@ impl KnownPeersStore {
         targets
     }
 
-    fn sync_vss(&self, snapshot: &BTreeMap<String, KnownPeer>) {
-        self.vss
-            .put_lww(KNOWN_PEERS_VSS_KEY, serialize_known_peers(snapshot));
+    /// Writes the pre-serialized map to the local mirror (failure surfaced),
+    /// then schedules the LWW VSS write with the same bytes.
+    fn persist(&self, bytes: Vec<u8>) -> Result<(), lightning::io::Error> {
+        self.local.write(
+            KNOWN_PEERS_PRIMARY_NAMESPACE,
+            KNOWN_PEERS_SECONDARY_NAMESPACE,
+            KNOWN_PEERS_LOCAL_KEY,
+            bytes.clone(),
+        )?;
+        self.vss.put_lww(KNOWN_PEERS_VSS_KEY, bytes);
+        Ok(())
     }
 }
 

@@ -44,6 +44,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import zinqq.app.R
+import zinqq.app.components.CenteredNote
 import zinqq.app.theme.ZinqqTheme
 
 /**

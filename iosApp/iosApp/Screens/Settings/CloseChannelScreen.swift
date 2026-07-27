@@ -96,16 +96,16 @@ struct CloseChannelScreen: View {
             ScreenHeader(title: "Close Channel", onBack: onBack, tint: colors.onDark)
             ScrollView {
                 VStack(spacing: 16) {
-                    factRow(
+                    SettingsFactRow(
                         label: "Peer",
                         value: reviewPeerDisplay(channel.counterpartyPubkey),
                         mono: true
                     )
-                    factRow(
+                    SettingsFactRow(
                         label: "Channel Capacity",
                         value: FormatKt.formatBtc(sats: Int64(bitPattern: channel.capacitySats))
                     )
-                    factRow(
+                    SettingsFactRow(
                         label: "Your Balance",
                         value: FormatKt.formatBtc(
                             sats: FormatKt.msatToSatFloor(
@@ -113,7 +113,7 @@ struct CloseChannelScreen: View {
                             )
                         )
                     )
-                    factRow(
+                    SettingsFactRow(
                         label: "Remote Balance",
                         value: FormatKt.formatBtc(
                             sats: FormatKt.msatToSatFloor(
@@ -124,12 +124,12 @@ struct CloseChannelScreen: View {
 
                     Divider().overlay(colors.darkBorder)
 
-                    factRow(
+                    SettingsFactRow(
                         label: "You Get Back",
                         value: expectedBackLabel(estimate, loading: estimateLoading)
                     )
                     VStack(alignment: .leading, spacing: 4) {
-                        factRow(
+                        SettingsFactRow(
                             label: "Estimated Cost to You",
                             value: closeCostLabel(estimate, force: force, loading: estimateLoading)
                         )
@@ -138,7 +138,7 @@ struct CloseChannelScreen: View {
                         }
                         note(estimateCaveat)
                     }
-                    factRow(
+                    SettingsFactRow(
                         label: "Funds Available",
                         value: closeTimelineLabel(estimate, force: force)
                     )
@@ -303,22 +303,6 @@ struct CloseChannelScreen: View {
         .padding(.horizontal, 32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(colors.dark.ignoresSafeArea())
-    }
-
-    private func factRow(label: String, value: String, mono: Bool = false) -> some View {
-        HStack {
-            Text(label)
-                .font(ZinqqFont.sans(14, weight: .medium))
-                .foregroundColor(colors.onDarkMuted)
-            Spacer()
-            Text(value)
-                .font(
-                    mono
-                        ? .system(size: 13, weight: .semibold, design: .monospaced)
-                        : ZinqqFont.sans(15, weight: .semibold)
-                )
-                .foregroundColor(colors.onDark)
-        }
     }
 
     private func methodButton(

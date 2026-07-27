@@ -46,11 +46,6 @@ impl std::fmt::Display for CryptoError {
 
 impl std::error::Error for CryptoError {}
 
-/// Lowercase hex, the PWA's byte-to-hex formatting.
-pub(crate) fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// `hex(HMAC-SHA256(encryption_key, plaintext_key))` — the PWA's
 /// `obfuscateKey`. Deterministic: the same plaintext key always maps to the
 /// same wire key, so both clients address the same server-side objects.
@@ -58,7 +53,7 @@ pub fn obfuscate_key(encryption_key: &[u8; 32], plaintext_key: &str) -> String {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(encryption_key)
         .expect("HMAC-SHA256 accepts keys of any length");
     mac.update(plaintext_key.as_bytes());
-    to_hex(&mac.finalize().into_bytes())
+    crate::util::hex_str(&mac.finalize().into_bytes())
 }
 
 /// The PWA's `vssEncrypt`: fresh random 12-byte nonce, then
@@ -150,7 +145,7 @@ pub(crate) mod tests {
     fn encrypted_blob_with_fixed_nonce_matches_the_pwa_vector_byte_for_byte() {
         let blob = encrypt_with_nonce(&VECTOR_ENC_KEY, &FIXED_NONCE, VECTOR_PLAINTEXT);
         assert_eq!(
-            to_hex(&blob),
+            crate::util::hex_str(&blob),
             EXPECTED_BLOB.split_whitespace().collect::<String>()
         );
     }
@@ -159,7 +154,7 @@ pub(crate) mod tests {
     fn empty_plaintext_blob_matches_the_pwa_vector() {
         // nonce + tag only: the smallest valid blob (28 bytes).
         let blob = encrypt_with_nonce(&VECTOR_ENC_KEY, &FIXED_NONCE, b"");
-        assert_eq!(to_hex(&blob), EXPECTED_EMPTY_BLOB);
+        assert_eq!(crate::util::hex_str(&blob), EXPECTED_EMPTY_BLOB);
         assert_eq!(blob.len(), NONCE_LEN + TAG_LEN);
         assert_eq!(decrypt(&VECTOR_ENC_KEY, &blob).unwrap(), Vec::<u8>::new());
     }

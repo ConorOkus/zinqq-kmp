@@ -63,6 +63,9 @@ sealed interface SendStep {
         val amountSats: ULong get() = if (digits.isEmpty()) 0uL else digits.toULong()
         val minSats: ULong? get() = lnurl?.minSats
         val maxSats: ULong? get() = lnurl?.maxSats
+
+        /** Whether this amount entry is for an on-chain target (max pill etc.). */
+        val isOnchain: Boolean get() = target.kind == ClassifiedKind.ONCHAIN
     }
 
     /** `ln-review`: BOLT11/BOLT12 review — To + Amount rows. */

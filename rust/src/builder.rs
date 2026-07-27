@@ -266,6 +266,21 @@ pub(crate) fn persist_channel_manager(
         .map_err(|_| BuildError::WriteFailed)
 }
 
+/// Reads an optional KVStore value: `Some(bytes)` if present, `None` on
+/// NotFound, and `BuildError::ReadFailed` on any other error.
+fn read_optional(
+    kv_store: &FilesystemStore,
+    primary_namespace: &str,
+    secondary_namespace: &str,
+    key: &str,
+) -> Result<Option<Vec<u8>>, BuildError> {
+    match kv_store.read(primary_namespace, secondary_namespace, key) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(BuildError::ReadFailed),
+    }
+}
+
 /// U4 startup integrity check (the missing mirror of the PWA's
 /// monitors-without-CM halt): every FUNDED channel the deserialized manager
 /// references must have a local monitor, or the state is a partial restore
@@ -521,27 +536,26 @@ pub(crate) fn build(
     vss_store.backfill_manifest_if_needed();
 
     // Network graph and scorer: reload if present, else start empty.
-    let network_graph = match kv_store.read(
+    let network_graph = match read_optional(
+        &kv_store,
         NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
         NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
         NETWORK_GRAPH_PERSISTENCE_KEY,
-    ) {
-        Ok(bytes) => Arc::new(
+    )? {
+        Some(bytes) => Arc::new(
             Graph::read(&mut Cursor::new(bytes), Arc::clone(&logger))
                 .map_err(|_| BuildError::ReadFailed)?,
         ),
-        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {
-            Arc::new(Graph::new(config.network, Arc::clone(&logger)))
-        }
-        Err(_) => return Err(BuildError::ReadFailed),
+        None => Arc::new(Graph::new(config.network, Arc::clone(&logger))),
     };
 
-    let scorer = match kv_store.read(
+    let scorer = match read_optional(
+        &kv_store,
         SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
         SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
         SCORER_PERSISTENCE_KEY,
-    ) {
-        Ok(bytes) => {
+    )? {
+        Some(bytes) => {
             let args = (
                 ProbabilisticScoringDecayParameters::default(),
                 Arc::clone(&network_graph),
@@ -551,14 +565,11 @@ pub(crate) fn build(
                 Scorer::read(&mut Cursor::new(bytes), args).map_err(|_| BuildError::ReadFailed)?,
             ))
         }
-        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {
-            Arc::new(Mutex::new(ProbabilisticScorer::new(
-                ProbabilisticScoringDecayParameters::default(),
-                Arc::clone(&network_graph),
-                Arc::clone(&logger),
-            )))
-        }
-        Err(_) => return Err(BuildError::ReadFailed),
+        None => Arc::new(Mutex::new(ProbabilisticScorer::new(
+            ProbabilisticScoringDecayParameters::default(),
+            Arc::clone(&network_graph),
+            Arc::clone(&logger),
+        ))),
     };
 
     let router = Arc::new(DefaultRouter::new(
@@ -577,15 +588,12 @@ pub(crate) fn build(
 
     // ChannelManager: restore if persisted, else fresh from genesis (the
     // initial sync below brings it to tip).
-    let cm_bytes = match kv_store.read(
+    let cm_bytes = read_optional(
+        &kv_store,
         CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
         CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
         CHANNEL_MANAGER_PERSISTENCE_KEY,
-    ) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => None,
-        Err(_) => return Err(BuildError::ReadFailed),
-    };
+    )?;
 
     // U4 integrity check, first half (the PWA's orphaned-monitors halt):
     // monitors with no manager mean channels whose state is lost — starting

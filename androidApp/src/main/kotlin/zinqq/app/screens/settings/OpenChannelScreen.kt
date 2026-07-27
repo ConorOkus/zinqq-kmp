@@ -20,7 +20,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -163,12 +162,12 @@ fun OpenChannelScreen(
                     .padding(top = 32.dp),
                 verticalArrangement = Arrangement.spacedBy(24.dp),
             ) {
-                ReviewRow(label = "Peer", value = reviewPeerDisplay(peerPubkey), mono = true)
-                ReviewRow(
+                SettingsFactRow(label = "Peer", value = reviewPeerDisplay(peerPubkey), mono = true)
+                SettingsFactRow(
                     label = "Channel Size",
                     value = formatBtc(current.amountSats.toLong()),
                 )
-                ReviewRow(
+                SettingsFactRow(
                     label = openFeeRateLabel(current.fee.feeRateSatPerVb),
                     value = "≈ ${formatBtc(current.fee.estimatedFeeSats.toLong())}",
                 )
@@ -258,30 +257,6 @@ fun OpenChannelScreen(
                 amountError = null
                 step = OpenStep.Amount
             },
-        )
-    }
-}
-
-@Composable
-private fun ReviewRow(label: String, value: String, mono: Boolean = false) {
-    val colors = ZinqqTheme.colors
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = label,
-            color = colors.onDarkMuted,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.Medium,
-            modifier = Modifier.weight(1f),
-        )
-        Text(
-            text = value,
-            color = colors.onDark,
-            fontSize = if (mono) 13.sp else 15.sp,
-            fontFamily = if (mono) FontFamily.Monospace else ZinqqTheme.fonts.sans,
-            fontWeight = FontWeight.SemiBold,
         )
     }
 }

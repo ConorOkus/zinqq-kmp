@@ -61,7 +61,7 @@ use crate::sweep::{
     SWEEP_TICK_INTERVAL,
 };
 use crate::types::{Logger, Sweeper};
-use crate::util::{hex_str, unix_now};
+use crate::util::{hex_str, now_ms, unix_now};
 
 /// Internal core events, mapped into the public FFI `Event` enum by the
 /// persisted event queue (the [`EventSink`] seam).
@@ -251,6 +251,22 @@ pub struct Node {
     sweep_store: Arc<SweepStore>,
 }
 
+/// Runs `fut` on the node runtime and blocks the calling (dispatcher) thread
+/// for the result — the receive_jit pattern: spawn on the node runtime, wait
+/// outside the state lock, so a concurrent `stop()` can't deadlock. `None`
+/// when the runtime shut down before replying (dropped sender), never a hang;
+/// each caller supplies its own shutdown fallback.
+fn spawn_and_wait<T: Send + 'static>(
+    handle: &tokio::runtime::Handle,
+    fut: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    handle.spawn(async move {
+        let _ = result_sender.send(fut.await);
+    });
+    result_receiver.blocking_recv().ok()
+}
+
 impl Node {
     /// Creates a stopped node handle for the given config, with core events
     /// going to the log only. The FFI surface uses [`Node::with_event_sink`]
@@ -369,10 +385,7 @@ impl Node {
                     }
                 }
             }
-            if let Err(e) = self
-                .payment_store
-                .reconcile_pending(&live_ids, unix_now().as_millis() as u64)
-            {
+            if let Err(e) = self.payment_store.reconcile_pending(&live_ids, now_ms()) {
                 log_error!(
                     components.logger,
                     "Payment-history startup reconcile failed: {e}"
@@ -548,13 +561,10 @@ impl Node {
         // Run the flow on the node runtime and wait outside the state lock,
         // so a concurrent stop() can't deadlock; a dropped runtime surfaces
         // as a closed channel, not a hang.
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        runtime_handle.spawn(async move {
-            let _ = result_sender.send(liquidity_source.receive_jit(amount_msat).await);
-        });
-        let result = result_receiver
-            .blocking_recv()
-            .unwrap_or(Err(Lsps2Error::Shutdown));
+        let result = spawn_and_wait(&runtime_handle, async move {
+            liquidity_source.receive_jit(amount_msat).await
+        })
+        .unwrap_or(Err(Lsps2Error::Shutdown));
 
         match result {
             Ok((invoice, expiry_unix_secs)) => {
@@ -598,13 +608,10 @@ impl Node {
     /// below-minimum is a review-screen state in the PWA, not an incident.
     pub fn jit_quote(&self, amount_msat: u64) -> Result<crate::receive::JitQuote, Lsps2Error> {
         let (liquidity_source, runtime_handle) = self.liquidity_handles()?;
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        runtime_handle.spawn(async move {
-            let _ = result_sender.send(liquidity_source.jit_quote(amount_msat).await);
-        });
-        result_receiver
-            .blocking_recv()
-            .unwrap_or(Err(Lsps2Error::Shutdown))
+        spawn_and_wait(&runtime_handle, async move {
+            liquidity_source.jit_quote(amount_msat).await
+        })
+        .unwrap_or(Err(Lsps2Error::Shutdown))
     }
 
     /// U7 phase B (F2 buy step): consumes the quote token, clamps the
@@ -620,13 +627,10 @@ impl Node {
         amount_msat: u64,
     ) -> Result<crate::receive::JitInvoice, Lsps2Error> {
         let (liquidity_source, runtime_handle) = self.liquidity_handles()?;
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        runtime_handle.spawn(async move {
-            let _ = result_sender.send(liquidity_source.jit_accept(quote_token, amount_msat).await);
-        });
-        let result = result_receiver
-            .blocking_recv()
-            .unwrap_or(Err(Lsps2Error::Shutdown));
+        let result = spawn_and_wait(&runtime_handle, async move {
+            liquidity_source.jit_accept(quote_token, amount_msat).await
+        })
+        .unwrap_or(Err(Lsps2Error::Shutdown));
 
         match result {
             Ok((invoice, expires_at_unix, opening_fee_msat)) => {
@@ -680,13 +684,10 @@ impl Node {
         if usable_inbound_msat >= crate::receive::MIN_JIT_RECEIVE_SATS * 1_000 {
             return crate::receive::MIN_JIT_RECEIVE_SATS;
         }
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        runtime_handle.spawn(async move {
-            let _ = result_sender.send(liquidity_source.min_receive_sats(refresh).await);
-        });
-        result_receiver
-            .blocking_recv()
-            .unwrap_or(crate::receive::MIN_JIT_RECEIVE_SATS)
+        spawn_and_wait(&runtime_handle, async move {
+            liquidity_source.min_receive_sats(refresh).await
+        })
+        .unwrap_or(crate::receive::MIN_JIT_RECEIVE_SATS)
     }
 
     /// A standard (non-JIT) BOLT11 invoice via the channel manager's
@@ -822,9 +823,8 @@ impl Node {
 
         let network = self.config.network;
         let attempt_logger = Arc::clone(&logger);
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        runtime_handle.spawn(async move {
-            let result = crate::receive::create_offer_with_retry(
+        let offer = spawn_and_wait(&runtime_handle, async move {
+            crate::receive::create_offer_with_retry(
                 || {
                     let build = || -> Result<String, String> {
                         let offer = channel_manager
@@ -845,10 +845,9 @@ impl Node {
                 },
                 &crate::receive::OFFER_RETRY_DELAYS,
             )
-            .await;
-            let _ = result_sender.send(result);
-        });
-        let offer = result_receiver.blocking_recv().ok().flatten()?;
+            .await
+        })
+        .flatten()?;
 
         // PWA parity (context.tsx:1663): the offer is exposed only once
         // persisted, so every later session serves the SAME offer string.
@@ -917,17 +916,7 @@ impl Node {
             parse_and_validate(bolt11, self.config.network, now, amount_override_msat)?;
         let payment_id_hex = hex_str(&payment_id_for(&invoice).0);
         let payment_hash_hex = hex_str(invoice.payment_hash().as_byte_array());
-        if let Err(e) = self.payment_store.record_pending(
-            &payment_id_hex,
-            PaymentDirection::Outbound,
-            amount_msat,
-            now.as_millis() as u64,
-        ) {
-            log_error!(
-                Logger,
-                "Failed to write the pending history row for {payment_id_hex}: {e}"
-            );
-        }
+        self.record_pending_outbound(&payment_id_hex, amount_msat, now_ms());
 
         let result = send_bolt11(
             &*channel_manager,
@@ -980,30 +969,17 @@ impl Node {
 
         let payment_id = PaymentId(keys_manager.get_secure_random_bytes());
         let payment_id_hex = hex_str(&payment_id.0);
-        if let Err(e) = self.payment_store.record_pending(
-            &payment_id_hex,
-            PaymentDirection::Outbound,
-            amount_msat,
-            now.as_millis() as u64,
-        ) {
-            log_error!(
-                Logger,
-                "Failed to write the pending history row for {payment_id_hex}: {e}"
-            );
-        }
+        self.record_pending_outbound(&payment_id_hex, amount_msat, now_ms());
 
         // LSP pre-connect for onion transport (PWA context.tsx:1032-1044):
         // without a connected LSP the invoice request cannot route. Run on
         // the node runtime, wait outside the state lock (receive_jit's
         // pattern). A connect failure fails the payment, like the PWA's
         // thrown connectAndTrack.
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        runtime_handle.spawn(async move {
-            let _ = result_sender.send(liquidity_source.ensure_lsp_connected().await);
-        });
-        let connected = result_receiver
-            .blocking_recv()
-            .unwrap_or(Err(Lsps2Error::Shutdown));
+        let connected = spawn_and_wait(&runtime_handle, async move {
+            liquidity_source.ensure_lsp_connected().await
+        })
+        .unwrap_or(Err(Lsps2Error::Shutdown));
 
         let result = match connected {
             Err(error) => Err(SendError::SendFailed(format!(
@@ -1028,6 +1004,23 @@ impl Node {
                 self.settle_attempt_failure(&payment_id_hex, None, &error);
                 Err(error)
             }
+        }
+    }
+
+    /// Shared U5/U6 dispatch writer: the PENDING history row for an outbound
+    /// attempt. History is informational, so a persist failure degrades
+    /// (logged) instead of blocking the send.
+    fn record_pending_outbound(&self, payment_id_hex: &str, amount_msat: u64, now_ms: u64) {
+        if let Err(e) = self.payment_store.record_pending(
+            payment_id_hex,
+            PaymentDirection::Outbound,
+            amount_msat,
+            now_ms,
+        ) {
+            log_error!(
+                Logger,
+                "Failed to write the pending history row for {payment_id_hex}: {e}"
+            );
         }
     }
 
@@ -1069,18 +1062,11 @@ impl Node {
         &self,
     ) -> Result<Vec<lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams>, Lsps2Error> {
         let (liquidity_source, runtime_handle) = self.liquidity_handles()?;
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        runtime_handle.spawn(async move {
-            let result = async {
-                liquidity_source.ensure_lsp_connected().await?;
-                liquidity_source.request_opening_params().await
-            }
-            .await;
-            let _ = result_sender.send(result);
-        });
-        result_receiver
-            .blocking_recv()
-            .unwrap_or(Err(Lsps2Error::Shutdown))
+        spawn_and_wait(&runtime_handle, async move {
+            liquidity_source.ensure_lsp_connected().await?;
+            liquidity_source.request_opening_params().await
+        })
+        .unwrap_or(Err(Lsps2Error::Shutdown))
     }
 
     /// Stops the node: signals every task, waits for the background processor
@@ -1464,29 +1450,24 @@ impl Node {
         // Run on the node runtime, wait outside the state lock (the
         // receive_jit pattern): a dropped runtime surfaces as a closed
         // channel, not a hang.
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        if node_id == self.config.lsp.node_id {
+        let result = if node_id == self.config.lsp.node_id {
             let liquidity_source = Arc::clone(&handles.liquidity_source);
-            handles.runtime_handle.spawn(async move {
-                let result = liquidity_source.ensure_lsp_connected().await.map_err(|e| {
+            spawn_and_wait(&handles.runtime_handle, async move {
+                liquidity_source.ensure_lsp_connected().await.map_err(|e| {
                     ChannelsError::ConnectFailed {
                         detail: e.to_string(),
                     }
-                });
-                let _ = result_sender.send(result);
-            });
+                })
+            })
         } else {
             let peer_manager = Arc::clone(&handles.peer_manager);
-            handles.runtime_handle.spawn(async move {
-                let _ = result_sender
-                    .send(channels::dial_peer(peer_manager, node_id, socket_addr).await);
-            });
-        }
-        result_receiver
-            .blocking_recv()
-            .unwrap_or(Err(ChannelsError::ConnectFailed {
-                detail: "the node is shutting down".to_string(),
-            }))?;
+            spawn_and_wait(&handles.runtime_handle, async move {
+                channels::dial_peer(peer_manager, node_id, socket_addr).await
+            })
+        };
+        result.unwrap_or(Err(ChannelsError::ConnectFailed {
+            detail: "the node is shutting down".to_string(),
+        }))?;
 
         // Persist AFTER a successful connect, best-effort surfaced as typed.
         handles
@@ -1772,8 +1753,9 @@ impl Node {
                                 // U11: channels with un-swept outputs block
                                 // completion — a partial sweep's receipt
                                 // must not complete the record early.
-                                &sweep_store.pending_channel_ids(),
-                                unix_now().as_millis() as u64,
+                                // Resolved lazily past the steady-state check.
+                                || sweep_store.pending_channel_ids(),
+                                now_ms(),
                                 &logger,
                             )
                             .await;
@@ -1913,7 +1895,7 @@ impl Node {
                         if tick_count.is_multiple_of(AUTO_RECOVER_EVERY_TICKS) {
                             recovery.maybe_auto_recover(
                                 &*sweeper,
-                                unix_now().as_millis() as u64,
+                                now_ms(),
                             ).await;
                         }
                     }
@@ -2159,7 +2141,7 @@ fn handle_ldk_event(
             logger,
             payment_hash,
             amount_msat,
-            unix_now().as_millis() as u64,
+            now_ms(),
             || liquidity_source.take_skim(&payment_hash),
         ),
         Event::ChannelPending {
@@ -2282,7 +2264,7 @@ fn handle_ldk_event(
                 &classification,
                 funding_txo,
                 last_local_balance_msat.map(|msat| msat / 1_000),
-                unix_now().as_millis() as u64,
+                now_ms(),
             );
             // U9 auto-forget: the LAST channel with a peer closing drops it
             // from known peers, so the reconnect loop stops dialing it (PWA
@@ -2372,7 +2354,7 @@ fn handle_ldk_event(
                 onchain_wallet.is_initial_scan_complete(),
                 || onchain_wallet.next_receive_address().ok(),
                 Some(channels_ctx.chain_source.onchain_send_fee_rate_sat_per_vb() as f64),
-                unix_now().as_millis() as u64,
+                now_ms(),
                 logger,
             );
             // U11 CPFP handling (KTD-9), AFTER the U10 observation: the
@@ -2770,12 +2752,7 @@ mod tests {
                 .record_pending(&stale, PaymentDirection::Outbound, 1_000, 1_000)
                 .unwrap();
             store
-                .record_pending(
-                    &young,
-                    PaymentDirection::Outbound,
-                    2_000,
-                    unix_now().as_millis() as u64,
-                )
+                .record_pending(&young, PaymentDirection::Outbound, 2_000, now_ms())
                 .unwrap();
         }
 

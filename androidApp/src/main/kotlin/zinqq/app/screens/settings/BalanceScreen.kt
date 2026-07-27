@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import zinqq.app.R
 import zinqq.app.WalletHolder
+import zinqq.app.components.CenteredNote
 import zinqq.app.theme.ZinqqTheme
 import zinqq.spike.formatBtc
 

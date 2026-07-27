@@ -40,9 +40,6 @@ sealed interface RestoreUi {
 
 /** Immutable screen state; only [reduce] and wallet-data refreshes produce new values. */
 data class UiState(
-    val nodeRunning: Boolean = false,
-    val balanceMsat: ULong = 0uL,
-    val onchainSats: ULong = 0uL,
     val currentInvoice: InvoiceUi? = null,
     val lastOutcome: String? = null,
     val syncBanner: String? = null,
@@ -80,10 +77,11 @@ data class UiState(
      */
     val startError: String? = null,
     /**
-     * This node's pubkey for the Advanced screen's copy card (U17): queried
-     * on every wallet-data refresh, kept cached across stops (`node_id()`
+     * This node's pubkey for the Advanced screen's copy card (U17): fetched
+     * on wallet-data refreshes until cached, kept across stops (`node_id()`
      * needs a running node) — the card simply doesn't render before the
-     * first successful start, like the PWA's not-ready gate.
+     * first successful start, like the PWA's not-ready gate. A restore
+     * clears it so the new wallet's id is re-fetched.
      */
     val nodeId: String? = null,
     /** The Restore flow's live phase (U17, F3); null = no restore running. */
@@ -108,21 +106,17 @@ fun shouldRefreshWalletData(event: Event): Boolean = when (event) {
 
 /**
  * Pure event-to-state reduction, unit-testable without Android or a wallet
- * instance. No Lightning logic lives here (R14): event fields pass through to
- * display, and the [Event.PaymentReceived] balance bump is optimistic
- * bookkeeping that the next authoritative `balances()` refresh overwrites.
+ * instance. No Lightning logic lives here (R14): event fields pass through
+ * to display.
  */
 fun reduce(state: UiState, event: Event): UiState =
     when (event) {
-        is Event.NodeStarted -> state.copy(nodeRunning = true)
-        is Event.NodeStopped -> state.copy(nodeRunning = false)
         is Event.SyncFailed -> state.copy(syncBanner = "Chain sync failed — retrying")
         is Event.SyncCompleted -> state.copy(syncBanner = null)
         is Event.InvoiceReady ->
             state.copy(currentInvoice = InvoiceUi(event.bolt11, event.expiryUnixSecs))
         is Event.PaymentReceived ->
             state.copy(
-                balanceMsat = state.balanceMsat + event.amountMsat,
                 currentInvoice = null,
                 lastOutcome = buildString {
                     append("Received ${event.amountMsat / 1_000uL} sats")

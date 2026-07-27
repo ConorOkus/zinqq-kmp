@@ -590,11 +590,7 @@ private struct CopySheet: View {
             }
             .padding(.top, 16)
             .accessibilityLabel("Copy")
-            .task(id: copied) {
-                guard copied else { return }
-                try? await Task.sleep(nanoseconds: copyFeedbackMs * 1_000_000)
-                copied = false
-            }
+            .autoReset($copied, afterMs: copyFeedbackMs)
         }
     }
 }

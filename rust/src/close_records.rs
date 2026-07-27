@@ -730,7 +730,7 @@ impl CloseRecordStore {
                 .ok()?;
             serde_json::from_slice(&bytes).ok()
         };
-        let now_ms = crate::util::unix_now().as_millis() as u64;
+        let now_ms = crate::util::now_ms();
         let records = read_map(RECORDS_LOCAL_KEY)
             .map(|raw| decode_records_map(&raw, now_ms))
             .unwrap_or_default();
@@ -794,18 +794,22 @@ impl CloseRecordStore {
             };
             records.insert(incoming.channel_id.clone(), merged);
         }
-        if let Err(e) = self.persist_records_locally() {
+        let bytes = self.encode_records();
+        if let Err(e) = self.persist_records_locally(bytes.clone()) {
             log_error!(self.logger, "Close-record local persist failed: {e}");
         }
-        self.sync_vss();
+        self.sync_vss(bytes);
     }
 
-    /// Encodes and writes the records map to the local mirror.
-    fn persist_records_locally(&self) -> Result<(), CloseRecordsError> {
-        let encoded = encode_records_map(&self.records.lock().unwrap());
-        let bytes = serde_json::to_vec(&encoded).map_err(|e| CloseRecordsError::Persist {
-            detail: format!("serialize: {e}"),
-        })?;
+    /// Encodes the records map once — the same bytes back the local mirror
+    /// write, the VSS put, and the 409-merge return value.
+    fn encode_records(&self) -> Vec<u8> {
+        serde_json::to_vec(&encode_records_map(&self.records.lock().unwrap()))
+            .expect("string-keyed records map serializes")
+    }
+
+    /// Writes the encoded records map to the local mirror.
+    fn persist_records_locally(&self, bytes: Vec<u8>) -> Result<(), CloseRecordsError> {
         self.kv_store
             .write(
                 CLOSE_RECORDS_PRIMARY_NAMESPACE,
@@ -821,11 +825,10 @@ impl CloseRecordStore {
     /// Schedules the best-effort VSS write with field-wise merge on 409
     /// (`store.ts:95-115`): the merge callback folds the remote map into the
     /// LOCAL store (base = local) and returns the merged bytes.
-    fn sync_vss(self: &Arc<Self>) {
+    fn sync_vss(self: &Arc<Self>, bytes: Vec<u8>) {
         let Some(vss) = self.vss.lock().unwrap().clone() else {
             return;
         };
-        let bytes = serde_json::to_vec(&encode_records_map(&self.records.lock().unwrap())).unwrap();
         let store = Arc::downgrade(self);
         vss.put_with_merge(
             CLOSE_RECORDS_VSS_KEY,
@@ -841,7 +844,7 @@ impl CloseRecordStore {
     /// remote (`store.ts:80-85` via `mergeMapInto`) — persists locally, and
     /// returns the merged bytes. Used by both the 409 path and init seeding.
     pub(crate) fn absorb_remote(&self, remote_bytes: &[u8]) -> Vec<u8> {
-        let now_ms = crate::util::unix_now().as_millis() as u64;
+        let now_ms = crate::util::now_ms();
         let remote_map = serde_json::from_slice::<Value>(remote_bytes)
             .map(|raw| decode_records_map(&raw, now_ms))
             .unwrap_or_default();
@@ -855,10 +858,11 @@ impl CloseRecordStore {
                 records.insert(channel_id, merged);
             }
         }
-        if let Err(e) = self.persist_records_locally() {
+        let bytes = self.encode_records();
+        if let Err(e) = self.persist_records_locally(bytes.clone()) {
             log_error!(self.logger, "Close-record local persist failed: {e}");
         }
-        serde_json::to_vec(&encode_records_map(&self.records.lock().unwrap())).unwrap()
+        bytes
     }
 
     /// Init seeding (`store.ts:147-164`): merge the remote snapshot in (the
@@ -1072,7 +1076,7 @@ pub(crate) async fn reconcile_close_records(
     chain: &dyn ChainTruth,
     wallet: &dyn WalletReceipts,
     open_channel_ids: &HashSet<String>,
-    pending_sweep_channels: &HashSet<String>,
+    pending_sweep_channels: impl Fn() -> HashSet<String>,
     now_ms: u64,
     logger: &Arc<Logger>,
 ) {
@@ -1085,6 +1089,10 @@ pub(crate) async fn reconcile_close_records(
     if pending_records.is_empty() && funding_map.is_empty() {
         return; // Steady state: zero network work.
     }
+    // U11: channels with un-swept outputs block completion. Resolved lazily
+    // — only a pass that got past the steady-state check pays the sweep
+    // store's KVStore list+read.
+    let pending_sweep_channels = pending_sweep_channels();
 
     // Tip fetch (uncounted): the PWA receives the tip from its sync callback.
     let tip_height = match chain.tip_height().await {
@@ -1153,7 +1161,7 @@ pub(crate) async fn reconcile_close_records(
             record,
             tip_changed,
             tip_height,
-            pending_sweep_channels,
+            &pending_sweep_channels,
             now_ms,
             &mut budget,
         )
@@ -1169,6 +1177,21 @@ pub(crate) async fn reconcile_close_records(
             break;
         }
     }
+}
+
+/// Consumes one budget unit and runs the chain query; an exhausted budget
+/// reads as `None` (never as evidence — the record stays stale and heals on
+/// a later pass). The budget is decremented BEFORE the query is awaited.
+async fn with_budget<T, F, Fut>(budget: &mut u32, query: F) -> Result<Option<T>, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, String>>,
+{
+    if *budget == 0 {
+        return Ok(None);
+    }
+    *budget -= 1;
+    query().await
 }
 
 /// Steps (a)-(c) for one record (reconcile.ts:160-324).
@@ -1192,33 +1215,25 @@ async fn reconcile_one_record(
     // broadcast commitment while the counterparty's superseded it. The
     // confirmed funding spend is ground truth; the merge unions by txid, so
     // re-discovering an already-recorded tx just fills its height in.
-    if !record.has_confirmed_close_tx() {
-        if let Some(txo) = &record.funding_txo {
-            let spend = if *budget > 0 {
-                *budget -= 1;
-                chain.outspend(&txo.txid, txo.vout).await?
-            } else {
-                None
-            };
-            if let Some(spender_txid) = spend {
-                let status = if *budget > 0 {
-                    *budget -= 1;
-                    chain.tx_confirmed_height(&spender_txid).await?
+    let undiscovered_txo = record
+        .funding_txo
+        .as_ref()
+        .filter(|_| !record.has_confirmed_close_tx());
+    if let Some(txo) = undiscovered_txo {
+        let spend = with_budget(budget, || chain.outspend(&txo.txid, txo.vout)).await?;
+        if let Some(spender_txid) = spend {
+            let status = with_budget(budget, || chain.tx_confirmed_height(&spender_txid)).await?;
+            facts.txs.push(CloseRecordTx {
+                txid: spender_txid,
+                role: if record.close_type == CloseType::Coop {
+                    CloseTxRole::Closing
                 } else {
-                    None
-                };
-                facts.txs.push(CloseRecordTx {
-                    txid: spender_txid,
-                    role: if record.close_type == CloseType::Coop {
-                        CloseTxRole::Closing
-                    } else {
-                        CloseTxRole::Commitment
-                    },
-                    fee_sats: None,
-                    confirmed_at_height: status,
-                });
-                changed = true;
-            }
+                    CloseTxRole::Commitment
+                },
+                fee_sats: None,
+                confirmed_at_height: status,
+            });
+            changed = true;
         }
     }
 
@@ -1228,12 +1243,7 @@ async fn reconcile_one_record(
             if tx.confirmed_at_height.is_some() {
                 continue;
             }
-            let status = if *budget > 0 {
-                *budget -= 1;
-                chain.tx_confirmed_height(&tx.txid).await?
-            } else {
-                None
-            };
+            let status = with_budget(budget, || chain.tx_confirmed_height(&tx.txid)).await?;
             if let Some(height) = status {
                 facts.txs.push(CloseRecordTx {
                     confirmed_at_height: Some(height),
@@ -2044,7 +2054,7 @@ mod tests {
             chain,
             wallet,
             open,
-            pending_sweeps,
+            || pending_sweeps.clone(),
             now_ms,
             &Arc::new(Logger),
         ));

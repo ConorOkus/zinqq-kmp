@@ -189,9 +189,10 @@ final class WalletModel: ObservableObject {
     /// cannot orphan a stopped node, and the screen re-attaches to whatever
     /// phase is current (Android's `UiState.restore` twin).
     @Published private(set) var restore: RestoreUi?
-    /// Cached `nodeId()` for the Advanced screen (U22): queried per refresh —
-    /// it needs a running node — but the pubkey is stable for the wallet's
-    /// lifetime, so it stays readable across stops.
+    /// Cached `nodeId()` for the Advanced screen (U22): fetched on refresh
+    /// until cached — it needs a running node — but the pubkey is stable for
+    /// the wallet's lifetime, so it stays readable across stops. A restore
+    /// clears it so the new wallet's id is re-fetched.
     @Published private(set) var nodeId: String?
     /// Fatal start failure — Home replaces its content with the PWA's
     /// "Something went wrong" state (`Home.tsx:29-42`).
@@ -362,8 +363,11 @@ final class WalletModel: ObservableObject {
             let recovery = try? await Self.runBlockingFFI { wallet.recoveryState() }
             let sweep = try? await Self.runBlockingFFI { wallet.pendingSweep() }
             // Cached across stops (U22): nodeId() needs a running node, but
-            // the pubkey is stable for the wallet's lifetime.
-            let freshNodeId = try? await Self.runBlockingFFI { try wallet.nodeId() }
+            // the pubkey is stable for the wallet's lifetime — fetch it only
+            // until it caches (startRestore clears it for the new wallet).
+            let freshNodeId = self?.nodeId == nil
+                ? (try? await Self.runBlockingFFI { try wallet.nodeId() })
+                : nil
             guard let self else { return }
             if let balances {
                 self.balances = balances
@@ -592,8 +596,10 @@ final class WalletModel: ObservableObject {
                 return
             }
             // The restored wallet replaced the old one — any fence fell with
-            // it; a start failure still surfaces through startError on Home.
+            // it (a start failure still surfaces through startError on Home),
+            // and its node id must be re-fetched.
             self.fenced = false
+            self.nodeId = nil
             await self.restartAfterRestore(wallet)
             self.restore = .succeeded
         }

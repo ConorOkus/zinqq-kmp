@@ -109,6 +109,31 @@ struct SettingsOutlineCta: View {
     }
 }
 
+/// Label/value fact row shared by the channel confirm/review screens.
+struct SettingsFactRow: View {
+    let label: String
+    let value: String
+    var mono: Bool = false
+
+    @Environment(\.zinqqColors) private var colors
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(ZinqqFont.sans(14, weight: .medium))
+                .foregroundColor(colors.onDarkMuted)
+            Spacer()
+            Text(value)
+                .font(
+                    mono
+                        ? .system(size: 13, weight: .semibold, design: .monospaced)
+                        : ZinqqFont.sans(15, weight: .semibold)
+                )
+                .foregroundColor(colors.onDark)
+        }
+    }
+}
+
 /// Centered muted note filling the remaining screen (Loading… etc.).
 struct CenteredSettingsNote: View {
     let text: String

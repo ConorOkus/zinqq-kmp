@@ -231,7 +231,7 @@ pub(crate) fn usable_inbound_msat(channels: &[ChannelView]) -> u64 {
 
 /// Whether any usable channel exists (`Receive.tsx:205` `hasUsable`).
 pub(crate) fn has_usable_channel(channels: &[ChannelView]) -> bool {
-    usable_inbound_msat(channels) > 0 || channels.iter().any(|channel| channel.usable)
+    channels.iter().any(|channel| channel.usable)
 }
 
 /// The PWA's capacity decision (`Receive.tsx:207`): with an amount, JIT is

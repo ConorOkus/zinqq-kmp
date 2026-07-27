@@ -54,7 +54,7 @@ func peersCountLabel(_ peers: [PeerView]) -> String {
 
 /// `{pubkey.slice(0, 16)}...{pubkey.slice(-8)}` (`Peers.tsx:226`).
 func peerDisplayId(_ pubkey: String) -> String {
-    String(pubkey.prefix(16)) + "..." + String(pubkey.suffix(8))
+    midTruncate(pubkey, head: 16, tail: 8, ellipsis: "...")
 }
 
 /// `Connected` / `Offline` (`Peers.tsx:233`).

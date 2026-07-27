@@ -2,7 +2,6 @@ package zinqq.app.screens.settings
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,8 +22,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import zinqq.app.nav.ScreenHeader
@@ -135,21 +134,27 @@ fun SettingsCta(
     }
 }
 
-/** Centered muted note filling the remaining screen (Loading… etc.). */
+/** Label/value fact row shared by the channel confirm/review screens. */
 @Composable
-fun CenteredNote(text: String, color: Color = ZinqqTheme.colors.onDarkMuted) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
+fun SettingsFactRow(label: String, value: String, mono: Boolean = false) {
+    val colors = ZinqqTheme.colors
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            text = text,
-            color = color,
+            text = label,
+            color = colors.onDarkMuted,
             fontSize = 14.sp,
-            textAlign = TextAlign.Center,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = value,
+            color = colors.onDark,
+            fontSize = if (mono) 13.sp else 15.sp,
+            fontFamily = if (mono) FontFamily.Monospace else ZinqqTheme.fonts.sans,
+            fontWeight = FontWeight.SemiBold,
         )
     }
 }

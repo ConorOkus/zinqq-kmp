@@ -3,7 +3,6 @@ package zinqq.app
 import uniffi.wallet_core.Event
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -15,7 +14,7 @@ class WalletUiStateTest {
     @Test
     fun invoiceReadyExposesQrPayloadAndExpiry() {
         val state = reduce(
-            UiState(nodeRunning = true),
+            UiState(),
             Event.InvoiceReady(bolt11 = BOLT11, expiryUnixSecs = 1_753_500_000uL),
         )
 
@@ -24,9 +23,9 @@ class WalletUiStateTest {
     }
 
     @Test
-    fun paymentReceivedBumpsBalanceReportsOutcomeAndClearsTheInvoice() {
+    fun paymentReceivedReportsOutcomeAndClearsTheInvoice() {
         val displaying = reduce(
-            UiState(nodeRunning = true, balanceMsat = 5_000uL),
+            UiState(),
             Event.InvoiceReady(bolt11 = BOLT11, expiryUnixSecs = 1_753_500_000uL),
         )
 
@@ -39,7 +38,6 @@ class WalletUiStateTest {
             ),
         )
 
-        assertEquals(255_000uL, state.balanceMsat)
         assertNull(state.currentInvoice)
         assertEquals("Received 250 sats (LSP fee 12 sats)", state.lastOutcome)
     }
@@ -47,7 +45,7 @@ class WalletUiStateTest {
     @Test
     fun paymentFailedShowsTheFailureReason() {
         val state = reduce(
-            UiState(nodeRunning = true),
+            UiState(),
             Event.PaymentFailed(paymentHash = PAYMENT_HASH, reason = "no route found"),
         )
 
@@ -56,23 +54,16 @@ class WalletUiStateTest {
 
     @Test
     fun syncFailureRaisesTheBannerAndSyncCompletionClearsIt() {
-        val degraded = reduce(UiState(nodeRunning = true), Event.SyncFailed)
+        val degraded = reduce(UiState(), Event.SyncFailed)
         assertEquals("Chain sync failed — retrying", degraded.syncBanner)
 
         assertNull(reduce(degraded, Event.SyncCompleted).syncBanner)
     }
 
     @Test
-    fun nodeLifecycleTogglesRunningState() {
-        val started = reduce(UiState(), Event.NodeStarted)
-        assertTrue(started.nodeRunning)
-        assertFalse(reduce(started, Event.NodeStopped).nodeRunning)
-    }
-
-    @Test
     fun fencedEventRaisesTheBlockingFencedFlag() {
         val state = reduce(
-            UiState(nodeRunning = true),
+            UiState(),
             Event.Fenced(detail = "vss 409: divergent channel_manager"),
         )
 
@@ -83,7 +74,7 @@ class WalletUiStateTest {
     fun noEventClearsTheFencedFlag() {
         // Un-fencing is user-owned (KTD-3, System-Wide Impact): restore or
         // quit — a node stop must not lower the fence.
-        val fenced = reduce(UiState(nodeRunning = true), Event.Fenced(detail = "409"))
+        val fenced = reduce(UiState(), Event.Fenced(detail = "409"))
 
         assertTrue(reduce(fenced, Event.NodeStopped).fenced)
         assertTrue(reduce(fenced, Event.SyncCompleted).fenced)

@@ -31,6 +31,7 @@ import zinqq.app.WalletHolder
 import zinqq.app.activityAmountText
 import zinqq.app.activityBadge
 import zinqq.app.activityTitle
+import zinqq.app.components.CenteredNote
 import zinqq.app.formatRelativeTime
 import zinqq.app.isAmountMuted
 import zinqq.app.showsLightningGlyph
@@ -70,8 +71,8 @@ fun ActivityScreen(
         )
 
         when {
-            transactions == null -> CenteredNote("Loading...")
-            transactions.isEmpty() -> CenteredNote("No transactions yet")
+            transactions == null -> CenteredNote("Loading...", color = colors.onFieldMuted)
+            transactions.isEmpty() -> CenteredNote("No transactions yet", color = colors.onFieldMuted)
             else -> LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
@@ -93,16 +94,6 @@ fun ActivityScreen(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun CenteredNote(text: String) {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(text = text, color = ZinqqTheme.colors.onFieldMuted, fontSize = 14.sp)
     }
 }
 

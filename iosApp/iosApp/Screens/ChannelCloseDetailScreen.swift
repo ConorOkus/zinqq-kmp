@@ -208,12 +208,7 @@ private struct CloseTxRow: View {
                 .padding(.leading, 8)
             }
             // The PWA's 1,500ms "Copied" flash (ChannelCloseDetail.tsx:56-59).
-            .task(id: copied) {
-                if copied {
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    copied = false
-                }
-            }
+            .autoReset($copied, afterMs: 1_500)
             if let fee = tx.feeSats?.int64Value {
                 Text("Fee: \(FormatKt.formatBtc(sats: fee))")
                     .font(ZinqqFont.sans(12))

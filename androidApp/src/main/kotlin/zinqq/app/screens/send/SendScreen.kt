@@ -43,13 +43,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import zinqq.app.components.Numpad
 import zinqq.app.components.ResultTemplate
+import zinqq.app.explorerTxUrl
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
 import zinqq.spike.formatBtc
 import zinqq.spike.msatToSatCeil
-
-/** The PWA's hard-coded explorer base for oc-success (`onchain/config`). */
-private const val EXPLORER_TX_BASE = "https://mempool.space/tx"
 
 /**
  * The Send screen (U15, F1, R5/R7 UI): the PWA's six-step machine rendered
@@ -142,7 +140,7 @@ fun SendScreen(
                                     context.startActivity(
                                         Intent(
                                             Intent.ACTION_VIEW,
-                                            Uri.parse("$EXPLORER_TX_BASE/$txid"),
+                                            Uri.parse(explorerTxUrl(txid)),
                                         ),
                                     )
                                 }
@@ -295,7 +293,7 @@ private fun AmountStepScreen(
     onBack: () -> Unit,
 ) {
     val colors = ZinqqTheme.colors
-    val isOnchain = step.target.kind == uniffi.wallet_core.ClassifiedKind.ONCHAIN
+    val isOnchain = step.isOnchain
     Column(
         modifier = Modifier
             .fillMaxSize()

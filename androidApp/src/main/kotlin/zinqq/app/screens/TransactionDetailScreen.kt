@@ -4,7 +4,6 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -31,6 +30,7 @@ import uniffi.wallet_core.ActivityKind
 import zinqq.app.R
 import zinqq.app.WalletHolder
 import zinqq.app.activityAmountText
+import zinqq.app.components.CenteredNote
 import zinqq.app.explorerTxUrl
 import zinqq.app.formatDetailDate
 import zinqq.app.formatDetailTime
@@ -72,8 +72,8 @@ fun TransactionDetailScreen(
         ScreenHeader(title = "Payment Details", onBack = onBack, tint = colors.onDark)
 
         when {
-            tx == null && transactions == null -> CenteredDarkNote("Loading...")
-            tx == null -> CenteredDarkNote("Transaction not found")
+            tx == null && transactions == null -> CenteredNote("Loading...")
+            tx == null -> CenteredNote("Transaction not found")
             closeChannelId != null -> Unit // redirecting
             else -> {
                 val isSent = tx.direction == ActivityDirection.SENT
@@ -137,16 +137,6 @@ fun TransactionDetailScreen(
                 }
             }
         }
-    }
-}
-
-@Composable
-internal fun CenteredDarkNote(text: String) {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(text = text, color = ZinqqTheme.colors.onDarkMuted, fontSize = 14.sp)
     }
 }
 

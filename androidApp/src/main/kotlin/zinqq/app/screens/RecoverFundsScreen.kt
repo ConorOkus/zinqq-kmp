@@ -18,11 +18,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -36,10 +33,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.delay
 import zinqq.app.R
 import zinqq.app.WalletHolder
+import zinqq.app.components.CenteredNote
 import zinqq.app.components.QrView
+import zinqq.app.components.rememberCopiedFlash
 import zinqq.app.midTruncate
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
@@ -69,19 +67,13 @@ fun RecoverFundsScreen(
         ScreenHeader(title = "Recover Funds", onBack = onBack, tint = colors.onDark)
 
         if (recovery == null) {
-            CenteredDarkNote("No recovery needed")
+            CenteredNote("No recovery needed")
             return@Column
         }
 
         val clipboard = LocalClipboardManager.current
-        var copied by remember { mutableStateOf(false) }
         // The PWA's 1,500ms "Copied!" flash (RecoverFunds.tsx:20-21).
-        LaunchedEffect(copied) {
-            if (copied) {
-                delay(1_500)
-                copied = false
-            }
-        }
+        var copied by rememberCopiedFlash(1_500)
 
         Column(
             modifier = Modifier

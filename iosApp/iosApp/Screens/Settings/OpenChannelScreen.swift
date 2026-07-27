@@ -143,12 +143,12 @@ struct OpenChannelScreen: View {
         VStack(spacing: 0) {
             ScreenHeader(title: "Review", onBack: { step = .amount }, tint: colors.onDark)
             VStack(spacing: 24) {
-                reviewRow(label: "Peer", value: reviewPeerDisplay(peerPubkey), mono: true)
-                reviewRow(
+                SettingsFactRow(label: "Peer", value: reviewPeerDisplay(peerPubkey), mono: true)
+                SettingsFactRow(
                     label: "Channel Size",
                     value: FormatKt.formatBtc(sats: Int64(bitPattern: amountSats))
                 )
-                reviewRow(
+                SettingsFactRow(
                     label: openFeeRateLabel(fee.feeRateSatPerVb),
                     value: "≈ \(FormatKt.formatBtc(sats: Int64(bitPattern: fee.estimatedFeeSats)))"
                 )
@@ -210,21 +210,5 @@ struct OpenChannelScreen: View {
         .padding(.horizontal, 32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(colors.dark.ignoresSafeArea())
-    }
-
-    private func reviewRow(label: String, value: String, mono: Bool = false) -> some View {
-        HStack {
-            Text(label)
-                .font(ZinqqFont.sans(14, weight: .medium))
-                .foregroundColor(colors.onDarkMuted)
-            Spacer()
-            Text(value)
-                .font(
-                    mono
-                        ? .system(size: 13, weight: .semibold, design: .monospaced)
-                        : ZinqqFont.sans(15, weight: .semibold)
-                )
-                .foregroundColor(colors.onDark)
-        }
     }
 }
