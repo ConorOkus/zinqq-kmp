@@ -103,6 +103,14 @@ struct WalletInner {
 /// The node's on-chain wallet.
 pub(crate) struct OnchainWallet {
     inner: Mutex<WalletInner>,
+    /// U10 Initial Scan flag (the PWA's `onchain/scan-state.ts`): set once
+    /// the FIRST successful chain sync of this process completes. Recovery
+    /// entry is gated on it — on a restore the wallet is empty BY
+    /// CONSTRUCTION until the scan lands, so "no UTXOs" is meaningless and
+    /// once fired a false Recover-Funds banner on every restore. Never set
+    /// on a failed scan. Per-process by design (a fresh wallet is built at
+    /// every `start()`), mirroring the PWA's per-session module flag.
+    initial_scan_complete: std::sync::atomic::AtomicBool,
     logger: Arc<Logger>,
 }
 
@@ -145,11 +153,14 @@ impl OnchainWallet {
 
         Ok(Self {
             inner: Mutex::new(WalletInner { wallet, persister }),
+            initial_scan_complete: std::sync::atomic::AtomicBool::new(false),
             logger,
         })
     }
 
     /// Syncs against Esplora: full scan on first use, incremental afterwards.
+    /// The first SUCCESSFUL pass marks the Initial Scan complete (U10 gate);
+    /// a failed scan never does.
     pub(crate) async fn sync(
         &self,
         client: &EsploraAsyncClient,
@@ -166,7 +177,7 @@ impl OnchainWallet {
             .latest_checkpoint()
             .height()
             == 0;
-        if needs_full_scan {
+        let result = if needs_full_scan {
             let request = self.inner.lock().unwrap().wallet.start_full_scan().build();
             let update = client
                 .full_scan(request, stop_gap, concurrency)
@@ -186,7 +197,46 @@ impl OnchainWallet {
                 .await
                 .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?;
             self.apply_update(update)
+        };
+        if result.is_ok() {
+            self.initial_scan_complete
+                .store(true, std::sync::atomic::Ordering::Release);
         }
+        result
+    }
+
+    /// Whether this process completed a successful chain scan yet (U10:
+    /// recovery entry is forbidden before this — no wallet-emptiness
+    /// decision before the Initial Scan, the plan's named invariant).
+    pub(crate) fn is_initial_scan_complete(&self) -> bool {
+        self.initial_scan_complete
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether any CONFIRMED UTXO exists — the CPFP pre-check
+    /// (PWA `event-handler.ts:711-721`).
+    pub(crate) fn has_confirmed_utxo(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet
+            .list_unspent()
+            .any(|utxo| utxo.chain_position.is_confirmed())
+    }
+
+    /// Whether `txid` (display hex) is CONFIRMED in this wallet — the
+    /// reconcile pass's receipt evidence (PWA `reconcile.ts:69-76`).
+    /// Unknown/unparsable txids are `false`: absence is never evidence.
+    pub(crate) fn tx_is_confirmed(&self, txid_hex: &str) -> bool {
+        let Ok(txid) = txid_hex.parse::<bitcoin::Txid>() else {
+            return false;
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet
+            .get_tx(txid)
+            .is_some_and(|tx| tx.chain_position.is_confirmed())
     }
 
     fn apply_update(&self, update: impl Into<bdk_wallet::Update>) -> Result<(), ChainError> {
@@ -491,6 +541,17 @@ fn facts_from(psbt: &Psbt) -> Result<BuiltTxFacts, TxBuildFailure> {
     })
 }
 
+/// U10: the reconcile pass's wallet-receipt evidence rides on the bdk
+/// wallet. This invariant relies on BDK's graph containing only SPK-tracked
+/// txs — nothing `insert_tx`es broadcast transactions, so a force-close
+/// commitment (spending the untracked 2-of-2 funding output) can never
+/// false-positive as a receipt.
+impl crate::close_records::WalletReceipts for OnchainWallet {
+    fn tx_confirmed_in_wallet(&self, txid: &str) -> bool {
+        self.tx_is_confirmed(txid)
+    }
+}
+
 impl ChangeDestinationSourceSync for OnchainWallet {
     fn get_change_destination_script(&self) -> Result<ScriptBuf, ()> {
         let mut inner = self.inner.lock().unwrap();
@@ -647,6 +708,29 @@ mod tests {
             script, next_script,
             "revealed address index was not persisted"
         );
+    }
+
+    /// U10: the CPFP pre-check counts only CONFIRMED UTXOs — unconfirmed
+    /// external receives must not suppress the recovery signal (they cannot
+    /// fund a CPFP), and a fresh wallet has not completed its Initial Scan.
+    #[test]
+    fn has_confirmed_utxo_ignores_unconfirmed_receives() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+        assert!(
+            !wallet.is_initial_scan_complete(),
+            "fresh wallet: no scan yet"
+        );
+        assert!(!wallet.has_confirmed_utxo(), "empty wallet");
+
+        crate::wallet::test_support::fund_untrusted_pending(&wallet, 50_000);
+        assert!(
+            !wallet.has_confirmed_utxo(),
+            "unconfirmed funds cannot pay for a CPFP"
+        );
+
+        crate::wallet::test_support::fund_confirmed(&wallet, 25_000);
+        assert!(wallet.has_confirmed_utxo());
     }
 
     #[test]

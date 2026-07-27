@@ -13,9 +13,12 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use crate::builder::{BuildError, KV_STORE_SUBDIR};
 use crate::channels::{ChannelView, ChannelsError, CloseEstimate, OpenFeeEstimate, PeerView};
+use crate::close_records::{
+    derive_close_status, CloseRecord, CloseTxRole, CloseType, Initiator, Resolution,
+};
 use crate::config::Config;
 use crate::events::{Event, EventQueue};
-use crate::history::{ActivityRow, PersistedPayment};
+use crate::history::{ActivityRow, CloseStatusLabel, PersistedPayment};
 use crate::keys::{self, KeysError};
 use crate::liquidity::Lsps2Error;
 use crate::node::Node;
@@ -85,6 +88,148 @@ pub struct Balances {
     pub onchain_spendable_sats: u64,
     /// Unconfirmed sats received from external wallets (untrusted pending).
     pub onchain_untrusted_pending_sats: u64,
+}
+
+/// A close record tx's role for the detail screen (U10). The names are the
+/// screen labels; they map 1:1 onto the PWA's `CloseTxRole` wire strings
+/// (`closing`/`commitment`/`anchor_cpfp`/`htlc_claim`/`sweep`); `Other`
+/// carries roles from newer schema versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CloseTxRoleView {
+    Closing,
+    Commitment,
+    FeeBump,
+    PaymentClaim,
+    SweepToWallet,
+    Other,
+}
+
+/// One transaction attached to a close (U10 detail screen): role, fee, and
+/// the live confirmation count against the last-known tip.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CloseTxView {
+    pub txid: String,
+    pub role: CloseTxRoleView,
+    pub fee_sats: Option<u64>,
+    pub confirmed_at_height: Option<u32>,
+    /// Confirmations vs the last-known tip; `None` while unconfirmed or the
+    /// tip is unknown.
+    pub confirmations: Option<u32>,
+}
+
+/// `'coop' | 'force' | 'unknown'` (U10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CloseTypeView {
+    Coop,
+    Force,
+    Unknown,
+}
+
+/// `'local' | 'remote' | 'unknown'` (U10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CloseInitiatorView {
+    Local,
+    Remote,
+    Unknown,
+}
+
+/// One close record for the detail screen (U10, R9): facts + the derived
+/// status label + per-tx roles with live confirmation counts.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CloseRecordView {
+    pub channel_id: String,
+    pub close_type: CloseTypeView,
+    pub initiator: CloseInitiatorView,
+    /// Human-readable closure description (PWA copy, verbatim).
+    pub closure_reason: Option<String>,
+    /// Derived per the PWA's `deriveCloseStatus` — never stored.
+    pub status: CloseStatusLabel,
+    /// LDK's last-known local balance at close — an estimate. `None` while
+    /// unknown: render "—", never a lying 0.
+    pub expected_amount_sats: Option<u64>,
+    pub timelock_blocks: Option<u32>,
+    /// Height at which timelocked funds become claimable.
+    pub claimable_at_height: Option<u32>,
+    /// Last-known tip height (for countdowns), `None` before the first
+    /// reconcile pass.
+    pub current_height: Option<u32>,
+    pub created_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+    /// `true` when the record resolved WITHOUT wallet receipt evidence
+    /// (rendered distinctly — never laundered into "complete").
+    pub resolved_unverified: bool,
+    pub funding_txid: Option<String>,
+    pub funding_vout: Option<u32>,
+    pub txs: Vec<CloseTxView>,
+}
+
+/// Recovery banner status (U10, R9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RecoveryStatusView {
+    NeedsRecovery,
+    SweepConfirmed,
+}
+
+/// The force-close recovery state for the banner/screen (U10, R9).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RecoveryStateView {
+    pub status: RecoveryStatusView,
+    /// Estimated stuck balance; `None` = unknown (render "Unknown").
+    pub stuck_balance_sat: Option<u64>,
+    pub deposit_address: String,
+    pub deposit_needed_sat: u64,
+    pub channel_ids: Vec<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+fn close_record_view(record: &CloseRecord, tip: Option<u32>) -> CloseRecordView {
+    CloseRecordView {
+        channel_id: record.channel_id.clone(),
+        close_type: match record.close_type {
+            CloseType::Coop => CloseTypeView::Coop,
+            CloseType::Force => CloseTypeView::Force,
+            CloseType::Unknown => CloseTypeView::Unknown,
+        },
+        initiator: match record.initiator {
+            Initiator::Local => CloseInitiatorView::Local,
+            Initiator::Remote => CloseInitiatorView::Remote,
+            Initiator::Unknown => CloseInitiatorView::Unknown,
+        },
+        closure_reason: record.closure_reason.clone(),
+        status: derive_close_status(record, tip),
+        expected_amount_sats: record.expected_amount_sats,
+        timelock_blocks: record.timelock_blocks,
+        claimable_at_height: record.claimable_at_height,
+        current_height: tip,
+        created_at_ms: record.created_at_ms,
+        completed_at_ms: record.completed_at_ms,
+        resolved_unverified: record.resolution == Some(Resolution::Unverified)
+            && record.completed_at_ms.is_some(),
+        funding_txid: record.funding_txo.as_ref().map(|txo| txo.txid.clone()),
+        funding_vout: record.funding_txo.as_ref().map(|txo| txo.vout),
+        txs: record
+            .txs
+            .iter()
+            .map(|tx| CloseTxView {
+                txid: tx.txid.clone(),
+                role: match tx.role {
+                    CloseTxRole::Closing => CloseTxRoleView::Closing,
+                    CloseTxRole::Commitment => CloseTxRoleView::Commitment,
+                    CloseTxRole::AnchorCpfp => CloseTxRoleView::FeeBump,
+                    CloseTxRole::HtlcClaim => CloseTxRoleView::PaymentClaim,
+                    CloseTxRole::Sweep => CloseTxRoleView::SweepToWallet,
+                    CloseTxRole::Other(_) => CloseTxRoleView::Other,
+                },
+                fee_sats: tx.fee_sats,
+                confirmed_at_height: tx.confirmed_at_height,
+                confirmations: match (tip, tx.confirmed_at_height) {
+                    (Some(tip), Some(height)) if tip >= height => Some(tip - height + 1),
+                    _ => None,
+                },
+            })
+            .collect(),
+    }
 }
 
 /// The input family a classified send input belongs to (U6, R5).
@@ -1272,6 +1417,38 @@ impl Wallet {
     /// always renders (the PWA's `estimateClose` contract).
     pub fn estimate_close(&self, channel_id: String) -> CloseEstimate {
         self.node.estimate_close(&channel_id)
+    }
+
+    /// The force-close recovery state (U10, R9), `None` when no recovery is
+    /// active. Readable while stopped (local-first store) so the banner can
+    /// render immediately at startup. Changes arrive as
+    /// [`Event::RecoveryStateChanged`]; re-read on every one.
+    pub fn recovery_state(&self) -> Option<RecoveryStateView> {
+        self.node.recovery_state().map(|state| RecoveryStateView {
+            status: match state.status {
+                crate::recovery::RecoveryStatus::NeedsRecovery => RecoveryStatusView::NeedsRecovery,
+                crate::recovery::RecoveryStatus::SweepConfirmed => {
+                    RecoveryStatusView::SweepConfirmed
+                }
+            },
+            stuck_balance_sat: state.stuck_balance_sat,
+            deposit_address: state.deposit_address,
+            deposit_needed_sat: state.deposit_needed_sat,
+            channel_ids: state.channel_ids,
+            created_at_ms: state.created_at,
+            updated_at_ms: state.updated_at,
+        })
+    }
+
+    /// One close record for the detail screen (U10, R9): the derived status
+    /// label plus per-tx roles (closing / commitment / fee bump / payment
+    /// claim / sweep-to-wallet) with confirmation counts against the
+    /// last-known tip. The activity LIST stays `list_activity` (one row per
+    /// close, KTD-7). Readable while stopped.
+    pub fn close_detail(&self, channel_id: String) -> Option<CloseRecordView> {
+        self.node
+            .close_record_with_tip(&channel_id)
+            .map(|(record, tip)| close_record_view(&record, tip))
     }
 }
 

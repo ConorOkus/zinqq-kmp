@@ -73,6 +73,14 @@ pub(crate) const MONITOR_MANIFEST_KEY: &str = "_monitor_keys";
 /// The VSS plaintext key of the whole-map known-peers blob.
 pub(crate) const KNOWN_PEERS_VSS_KEY: &str = "_known_peers";
 
+/// The close-records singleton map (U10, R9): the whole channelId → record
+/// map lives under ONE key because per-record keys can never be enumerated on
+/// restore (keys are HMAC-obfuscated) — PWA `close-records/store.ts:35`.
+pub(crate) const CLOSE_RECORDS_VSS_KEY: &str = "close_records";
+
+/// The force-close recovery state blob (U10, R9) — PWA `recovery-state.ts:8`.
+pub(crate) const FORCE_CLOSE_RECOVERY_VSS_KEY: &str = "force_close_recovery";
+
 /// The VSS plaintext key of the channel manager (PWA `CM_VSS_KEY`). The LOCAL
 /// key stays LDK's `("", "", "manager")` constants — only the remote name is
 /// PWA-shaped.
@@ -118,6 +126,11 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// A fetched `(plaintext bytes, server version)` pair, `None` when the key
 /// does not exist.
 pub(crate) type VersionedValue = Option<(Vec<u8>, i64)>;
+
+/// U10 field-wise merge callback: takes the remote bytes fetched on a 409,
+/// folds them into the caller's local store (base = local), returns the
+/// merged bytes to rewrite.
+pub(crate) type MergeFn = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
 /// The transport seam over the U2 wire client, at the PLAINTEXT level
 /// (obfuscation/encryption live below it, in the wire client). Tests inject a
@@ -756,6 +769,50 @@ impl Inner {
             Err(e) => log_error!(self.logger, "LWW write for {key} failed: {e}"),
         }
     }
+
+    /// Field-wise-merge write (U10/R3/KTD-3 close-records semantics, PWA
+    /// `close-records/store.ts:95-115`): put at the cached version; on 409
+    /// refetch the remote blob, hand it to `merge` (which folds remote facts
+    /// into the LOCAL store — direction base = local — and returns the merged
+    /// bytes), then rewrite at the server version. Best-effort — failures
+    /// log; local storage already has the record and the reconcile pass is
+    /// the designated healer for lost VSS writes.
+    async fn put_merge_attempt(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        merge: &(dyn Fn(&[u8]) -> Vec<u8> + Send + Sync),
+    ) {
+        let Some(remote) = self.remote.as_ref() else {
+            return;
+        };
+        if self.is_fenced() {
+            return;
+        }
+        let version = self.cached_version(key);
+        match remote.put(key, bytes, version).await {
+            Ok(new_version) => self.record_version(key, new_version),
+            Err(VssError::Conflict { .. }) => {
+                // Another device wrote first: fetch, field-wise merge, rewrite.
+                let (merged_bytes, server_version) = match remote.get(key).await {
+                    Ok(Some((remote_bytes, server_version))) => {
+                        (merge(&remote_bytes), server_version)
+                    }
+                    Ok(None) => (bytes.to_vec(), 0),
+                    Err(e) => {
+                        log_error!(self.logger, "Merge refetch for {key} failed: {e}");
+                        return;
+                    }
+                };
+                self.record_version(key, server_version);
+                match remote.put(key, &merged_bytes, server_version).await {
+                    Ok(new_version) => self.record_version(key, new_version),
+                    Err(e) => log_error!(self.logger, "Merged rewrite for {key} failed: {e}"),
+                }
+            }
+            Err(e) => log_error!(self.logger, "Merge write for {key} failed: {e}"),
+        }
+    }
 }
 
 /// The composite store: custom monitor [`Persist`] (async, VSS-first, gating)
@@ -948,6 +1005,73 @@ impl VssBackedStore {
         let key_owned = key.to_string();
         self.inner.enqueue(key.to_string(), async move {
             inner.put_lww_attempt(&key_owned, &bytes).await;
+        });
+    }
+
+    /// Field-wise-merge write for the close-records singleton (U10):
+    /// serialized on the key's chain like every other per-key write. `merge`
+    /// receives the remote bytes on a 409, folds them into the local store
+    /// (base = local, incoming = remote — the direction is normative, plan
+    /// U10) and returns the merged bytes to rewrite. Best-effort.
+    pub(crate) fn put_with_merge(&self, key: &str, bytes: Vec<u8>, merge: MergeFn) {
+        if self.inner.remote.is_none() {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        let key_owned = key.to_string();
+        self.inner.enqueue(key.to_string(), async move {
+            inner.put_merge_attempt(&key_owned, &bytes, &*merge).await;
+        });
+    }
+
+    /// One best-effort GET recording the server version on success (U10 init
+    /// seeding for `close_records` / `force_close_recovery`: the PWA fetches
+    /// each blob on init to seed its version ref and pull remote state into
+    /// an empty local store). `None` on absence, error, or no remote.
+    pub(crate) async fn fetch_versioned(&self, key: &str) -> Option<(Vec<u8>, i64)> {
+        let remote = self.inner.remote.as_ref()?;
+        match remote.get(key).await {
+            Ok(Some((bytes, version))) => {
+                self.inner.record_version(key, version);
+                Some((bytes, version))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log_error!(self.inner.logger, "Seed fetch for {key} failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Best-effort versioned delete (U10: clearing `force_close_recovery`
+    /// mirrors the PWA's `clearRecoveryState` VSS delete). Serialized on the
+    /// key's chain; the cached version resets to 0 either way (the PWA resets
+    /// its version ref only on success, but a stale non-zero version would
+    /// 409-retry the next write anyway — 0 re-seeds via the next fetch).
+    pub(crate) fn delete_best_effort(&self, key: &str) {
+        if self.inner.remote.is_none() {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        let key_owned = key.to_string();
+        self.inner.enqueue(key.to_string(), async move {
+            let Some(remote) = inner.remote.as_ref() else {
+                return;
+            };
+            if inner.is_fenced() {
+                return;
+            }
+            let version = inner.cached_version(&key_owned);
+            match remote.delete(&key_owned, version).await {
+                Ok(()) => inner.record_version(&key_owned, 0),
+                Err(e) => {
+                    log_error!(
+                        inner.logger,
+                        "Best-effort delete of {key_owned} failed: {e}"
+                    );
+                    inner.record_version(&key_owned, 0);
+                }
+            }
         });
     }
 

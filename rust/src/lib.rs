@@ -8,6 +8,7 @@ pub mod api;
 pub mod builder;
 mod chain;
 pub mod channels;
+pub mod close_records;
 pub mod config;
 pub mod events;
 mod fees;
@@ -20,6 +21,7 @@ pub mod node;
 pub mod onchain_send;
 pub mod payment;
 pub mod receive;
+pub mod recovery;
 pub mod restore;
 pub mod send;
 mod signer;
@@ -34,6 +36,7 @@ pub use channels::{
     ChannelStateLabel, ChannelView, ChannelsError, CloseEstimate, CloseFeePayer, OpenFeeEstimate,
     PeerAddressError, PeerView,
 };
+pub use close_records::{CloseRecord, CloseRecordsError};
 pub use config::{Config, LspConfig, PeerInfo};
 pub use events::Event;
 pub use history::{
@@ -45,6 +48,7 @@ pub use node::Node;
 pub use onchain_send::{DriftGuard, FeeEstimate, MaxSendEstimate, OnchainSendError};
 pub use payment::SendError;
 pub use receive::{JitInvoice, JitQuote, ReceiveBundle, ReceiveError, MIN_JIT_RECEIVE_SATS};
+pub use recovery::{RecoveryError, RecoveryState, RecoveryStatus};
 pub use restore::RestoreError;
 
 uniffi::setup_scaffolding!();

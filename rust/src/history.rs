@@ -399,19 +399,10 @@ pub struct CloseRecordSummary {
     pub absorbed_txids: Vec<String>,
 }
 
-/// Read seam for close records. U10's real store implements this;
-/// [`NoCloseRecords`] serves until then.
+/// Read seam for close records, implemented by U10's
+/// `close_records::CloseRecordStore`.
 pub(crate) trait CloseRecordSource: Send + Sync {
     fn summaries(&self) -> Vec<CloseRecordSummary>;
-}
-
-/// Default empty source used until U10 lands the close-record store.
-pub(crate) struct NoCloseRecords;
-
-impl CloseRecordSource for NoCloseRecords {
-    fn summaries(&self) -> Vec<CloseRecordSummary> {
-        Vec::new()
-    }
 }
 
 // ---------------------------------------------------------------------------

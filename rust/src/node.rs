@@ -34,13 +34,16 @@ use crate::channels::{
     self, ChannelEventContext, ChannelView, ChannelsError, CloseEstimate, FundingStore,
     OpenFeeEstimate, PeerView,
 };
+use crate::close_records::{
+    self, classify_closure_reason, CloseOutpoint, CloseRecord, CloseRecordStore, FundingTxoEntry,
+};
 use crate::config::{
     Config, FEE_UPDATE_INTERVAL, LIGHTNING_SYNC_INTERVAL, LSPS2_REQUEST_TIMEOUT,
     ONCHAIN_SYNC_INTERVAL, PEER_RECONNECT_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use crate::history::{
-    merge_activity, ActivityRow, CloseRecordSource, NoCloseRecords, PaymentDirection,
-    PaymentStatus, PaymentStore, PersistedPayment,
+    merge_activity, ActivityRow, CloseRecordSource, PaymentDirection, PaymentStatus, PaymentStore,
+    PersistedPayment,
 };
 use crate::liquidity::{LiquiditySource, Lsps2Error};
 use crate::lock::DataDirLock;
@@ -48,6 +51,10 @@ use crate::onchain_send::{self, OnchainSendError};
 use crate::payment::{
     describe_failure_reason, parse_and_validate, payment_id_for, resolve_amount, send_bolt11,
     send_bolt12, validate_offer, SendError,
+};
+use crate::recovery::{
+    self, NoSweeper, RecoveryState, RecoveryStore, RecoverySweeper, AUTO_RECOVER_EVERY_TICKS,
+    RECOVERY_TICK_INTERVAL,
 };
 use crate::types::{Logger, Sweeper};
 use crate::util::{hex_str, unix_now};
@@ -105,8 +112,9 @@ pub(crate) enum CoreEvent {
     /// The sweep pipeline's state changed (fired by U11).
     #[allow(dead_code)] // Placeholder until U11 fires it.
     SweepStateChanged,
-    /// Force-close recovery state changed (fired by U10).
-    #[allow(dead_code)] // Placeholder until U10 fires it.
+    /// Force-close recovery state changed (U10). Payload-less by design
+    /// (PWA parity): consumers re-read `recovery_state()` — a stale payload
+    /// resolving late would show yesterday's state.
     RecoveryStateChanged,
     /// Restore-from-seed progress (U4): the step strings match the PWA's
     /// Restore.tsx copy exactly.
@@ -227,9 +235,14 @@ pub struct Node {
     /// The persisted payment history (U5, R11). Like the event queue, it owns
     /// its own store handle, so rows are readable while the node is stopped.
     payment_store: Arc<PaymentStore>,
-    /// Close-record read seam for the activity merge — the default empty
-    /// source until U10 lands the real store.
-    close_records: Arc<dyn CloseRecordSource>,
+    /// U10 close records: local-first store + best-effort VSS singleton
+    /// (attached while running); the activity merge's close arm.
+    close_records: Arc<CloseRecordStore>,
+    /// U10 recovery state machine: local-first + best-effort VSS blob.
+    recovery: Arc<RecoveryStore>,
+    /// The auto-recover sweep attempt (U11 provides the real pipeline;
+    /// [`NoSweeper`] until then).
+    recovery_sweeper: Arc<dyn RecoverySweeper>,
 }
 
 impl Node {
@@ -247,13 +260,29 @@ impl Node {
         let kv_store = Arc::new(FilesystemStore::new(
             PathBuf::from(&config.storage_dir).join(KV_STORE_SUBDIR),
         ));
-        let payment_store = Arc::new(PaymentStore::new(kv_store, logger));
+        let payment_store = Arc::new(PaymentStore::new(
+            Arc::clone(&kv_store),
+            Arc::clone(&logger),
+        ));
+        // U10: both stores own their local handles (readable while stopped);
+        // the VSS halves attach at start().
+        let close_records = Arc::new(CloseRecordStore::new(
+            Arc::clone(&kv_store),
+            Arc::clone(&logger),
+        ));
+        let recovery = Arc::new(RecoveryStore::new(
+            kv_store,
+            Arc::clone(&event_sink),
+            logger,
+        ));
         Self {
             config,
             state: Mutex::new(None),
             event_sink,
             payment_store,
-            close_records: Arc::new(NoCloseRecords),
+            close_records,
+            recovery,
+            recovery_sweeper: Arc::new(NoSweeper),
         }
     }
 
@@ -344,6 +373,32 @@ impl Node {
             }
         }
 
+        // U10: attach the VSS halves for the running session and seed both
+        // singletons from the remote (pull cross-device state into empty
+        // local stores; merges are idempotent so a late seed is safe).
+        self.close_records
+            .attach_vss(Arc::clone(&components.vss_store));
+        self.recovery.attach_vss(Arc::clone(&components.vss_store));
+        {
+            let vss = Arc::clone(&components.vss_store);
+            let close_records = Arc::clone(&self.close_records);
+            let recovery = Arc::clone(&self.recovery);
+            runtime.spawn(async move {
+                if let Some((bytes, _)) = vss
+                    .fetch_versioned(crate::vss::store::CLOSE_RECORDS_VSS_KEY)
+                    .await
+                {
+                    close_records.seed_from_remote(&bytes);
+                }
+                if let Some((bytes, _)) = vss
+                    .fetch_versioned(crate::vss::store::FORCE_CLOSE_RECOVERY_VSS_KEY)
+                    .await
+                {
+                    recovery.seed_from_remote(&bytes);
+                }
+            });
+        }
+
         let chain_synced = Arc::new(AtomicBool::new(components.chain_synced_at_start));
         let liquidity_source = Arc::new(LiquiditySource::from_components(
             &components,
@@ -415,11 +470,14 @@ impl Node {
             Arc::clone(&liquidity_source),
             stop_sender.subscribe(),
         );
+        self.spawn_recovery_task(&runtime, stop_sender.subscribe());
         let bp_handle = spawn_background_processor(
             &runtime,
             &components,
             Arc::clone(&liquidity_source),
             Arc::clone(&self.payment_store),
+            Arc::clone(&self.close_records),
+            Arc::clone(&self.recovery),
             Arc::clone(&self.event_sink),
             bp_stop_sender.subscribe(),
         );
@@ -1009,6 +1067,12 @@ impl Node {
         let _ = runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(15), bp_handle).await });
 
+        // U10: detach the VSS halves so no close-record/recovery write is
+        // scheduled onto the runtime being dropped. Local persistence (the
+        // source of truth) keeps working while stopped.
+        self.close_records.detach_vss();
+        self.recovery.detach_vss();
+
         // The background processor already persisted on exit; this is the
         // belt-and-braces write for the paths where it never got to run.
         // Through the dual store: bounded VSS attempt, local write always.
@@ -1044,8 +1108,12 @@ impl Node {
         }
         crate::restore::run_restore(&self.config, mnemonic, &*self.event_sink, None)?;
         // The store dir was replaced wholesale; drop the in-memory rows the
-        // payment store cached from the OLD wallet.
+        // payment store cached from the OLD wallet — and likewise the close
+        // records and recovery banner (U10): the replaced wallet's state
+        // must not survive (or be re-persisted over) the restored one.
         self.payment_store.reset();
+        self.close_records.reset();
+        self.recovery.reset();
         Ok(())
     }
 
@@ -1128,6 +1196,23 @@ impl Node {
     /// the store owns its own KVStore handle, like the event queue.
     pub fn payment_detail(&self, payment_id: &str) -> Option<PersistedPayment> {
         self.payment_store.get(payment_id)
+    }
+
+    /// The current force-close recovery state (U10, R9), or `None` when no
+    /// recovery is active. Readable while stopped (local-first store).
+    pub fn recovery_state(&self) -> Option<RecoveryState> {
+        self.recovery.state()
+    }
+
+    /// One close record with the last-known tip height (U10) for the detail
+    /// screen's per-tx roles and live confirmation counts. Readable while
+    /// stopped.
+    pub(crate) fn close_record_with_tip(
+        &self,
+        channel_id: &str,
+    ) -> Option<(CloseRecord, Option<u32>)> {
+        let record = self.close_records.get(channel_id)?;
+        Some((record, self.close_records.last_tip_height()))
     }
 
     /// Total lightning balance in msat — the sum of every claimable channel
@@ -1559,6 +1644,7 @@ impl Node {
         let dual_kv_store = Arc::clone(&components.dual_kv_store);
         let logger = Arc::clone(&components.logger);
         let event_sink = Arc::clone(&self.event_sink);
+        let close_records = Arc::clone(&self.close_records);
 
         runtime.spawn(async move {
             let mut lightning_interval = tokio::time::interval(LIGHTNING_SYNC_INTERVAL);
@@ -1600,6 +1686,30 @@ impl Node {
                         // background processor.
                         if dual_kv_store.cm_dirty() {
                             dual_kv_store.retry_cm(channel_manager.encode()).await;
+                        }
+                        // U10: chain-truth reconcile for close records rides
+                        // the sync tick (the PWA's onSynced extension point).
+                        // Budgeted (8 first-party Esplora queries), zero-cost
+                        // in the no-pending-closes steady state.
+                        if now_synced {
+                            let open_ids: HashSet<String> = channel_manager
+                                .list_channels()
+                                .iter()
+                                .map(|details| hex_str(&details.channel_id.0))
+                                .collect();
+                            close_records::reconcile_close_records(
+                                &close_records,
+                                &*chain_source,
+                                &*onchain_wallet,
+                                &open_ids,
+                                // U11 seam: pending un-swept channels block
+                                // completion; empty until the sweep store
+                                // lands.
+                                &HashSet::new(),
+                                unix_now().as_millis() as u64,
+                                &logger,
+                            )
+                            .await;
                         }
                     }
                     _ = onchain_interval.tick() => {
@@ -1702,6 +1812,36 @@ impl Node {
                             log_error!(
                                 liquidity_source.logger(),
                                 "LSP reconnect attempt failed: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// U10 recovery ticks (PWA `context.tsx:1535-1553`): the exit reconcile
+    /// runs EVERY ~10 s tick (cheap — in-memory record lookups) so a false
+    /// "deposit needed" banner clears within a sync cycle of the close
+    /// record healing; the sweep-based auto-recovery runs every ~60 s.
+    fn spawn_recovery_task(&self, runtime: &Runtime, mut stop_receiver: watch::Receiver<()>) {
+        let recovery = Arc::clone(&self.recovery);
+        let close_records = Arc::clone(&self.close_records);
+        let sweeper = Arc::clone(&self.recovery_sweeper);
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(RECOVERY_TICK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick_count: u32 = 0;
+            loop {
+                tokio::select! {
+                    _ = stop_receiver.changed() => return,
+                    _ = interval.tick() => {
+                        recovery.maybe_clear_resolved(&close_records);
+                        tick_count = tick_count.wrapping_add(1);
+                        if tick_count.is_multiple_of(AUTO_RECOVER_EVERY_TICKS) {
+                            recovery.maybe_auto_recover(
+                                &*sweeper,
+                                unix_now().as_millis() as u64,
                             );
                         }
                     }
@@ -1827,13 +1967,20 @@ pub(crate) fn record_payment_claimed(
 /// THEN the public event — persist-then-ack), the U9 channel-open funding
 /// flow (FundingGenerationReady → persist-then-notify,
 /// FundingTxBroadcastSafe → broadcast, DiscardFunding → cleanup,
-/// ChannelClosed → auto-forget), and log-and-ack for the rest.
+/// ChannelClosed → auto-forget), the U10 close-record/recovery observations
+/// (ChannelPending → funding-txo safety net, ChannelClosed → close record,
+/// BumpTransaction → commitment fact + gated recovery entry), and
+/// log-and-ack for the rest. Every U10 observation is idempotent under
+/// event replay (LDK replays unresolved events on every restart).
+#[allow(clippy::too_many_arguments)]
 fn handle_ldk_event(
     event: Event,
     sweeper: &Sweeper,
     liquidity_source: &LiquiditySource,
     payment_store: &PaymentStore,
     channels_ctx: &ChannelEventContext,
+    close_records: &Arc<CloseRecordStore>,
+    recovery: &RecoveryStore,
     event_sink: &Arc<dyn EventSink>,
     logger: &Arc<Logger>,
 ) -> Result<(), ReplayEvent> {
@@ -1899,6 +2046,7 @@ fn handle_ldk_event(
         Event::ChannelPending {
             channel_id,
             former_temporary_channel_id,
+            funding_txo,
             ..
         } => {
             let channel_id_hex = hex_str(&channel_id.0);
@@ -1910,6 +2058,25 @@ fn handle_ldk_event(
                     .funding
                     .record_channel_id_map(&channel_id_hex, &hex_str(&temp_id.0));
             }
+            // U10 safety net (PWA `event-handler.ts:357-380`): if this
+            // channel later closes while the process is dying, reconcile
+            // recreates the record from this funding outpoint. to_self_delay
+            // is captured here too — unreadable once the channel closes.
+            let timelock_blocks = channels_ctx
+                .channel_manager
+                .list_channels()
+                .iter()
+                .find(|details| details.channel_id == channel_id)
+                .and_then(|details| details.force_close_spend_delay)
+                .map(u32::from);
+            close_records.record_funding_txo(
+                &channel_id_hex,
+                FundingTxoEntry {
+                    txid: funding_txo.txid.to_string(),
+                    vout: funding_txo.vout,
+                    timelock_blocks,
+                },
+            );
             event_sink.emit(CoreEvent::ChannelPending {
                 channel_id: channel_id_hex,
             });
@@ -1976,9 +2143,28 @@ fn handle_ldk_event(
             channel_id,
             reason,
             counterparty_node_id,
+            channel_funding_txo,
+            last_local_balance_msat,
             ..
         } => {
             let channel_id_hex = hex_str(&channel_id.0);
+            // U10 (PWA `event-handler.ts:397-430`): classify the closure
+            // reason and record the close. NO channel-capacity fallback for
+            // the balance (it would overstate the expected return by the
+            // whole capacity); unknown stays unknown.
+            let classification = classify_closure_reason(&reason);
+            let funding_txo = channel_funding_txo.map(|txo| CloseOutpoint {
+                txid: txo.txid.to_string(),
+                vout: u32::from(txo.index),
+            });
+            close_records::on_channel_closed(
+                close_records,
+                &channel_id_hex,
+                &classification,
+                funding_txo,
+                last_local_balance_msat.map(|msat| msat / 1_000),
+                unix_now().as_millis() as u64,
+            );
             // U9 auto-forget: the LAST channel with a peer closing drops it
             // from known peers, so the reconnect loop stops dialing it (PWA
             // `context.tsx:1233-1244`). Best-effort, never a replay.
@@ -2031,6 +2217,51 @@ fn handle_ldk_event(
             payment_hash,
             reason,
         ),
+        // U10: OBSERVE the bump event for close records + gated recovery
+        // entry; the CPFP handling itself is U11's
+        // (`BumpTransactionEventHandler` slots in after the observation).
+        // Acking here is safe: LDK re-yields bump events on each new block
+        // until the claim confirms, so U11's handler will still see the
+        // need. The observation is idempotent under replay.
+        Event::BumpTransaction(ref bump_event) => {
+            use lightning::events::bump_transaction::BumpTransactionEvent;
+            let (channel_id_hex, commitment) = match bump_event {
+                BumpTransactionEvent::ChannelClose {
+                    channel_id,
+                    commitment_tx,
+                    commitment_tx_fee_satoshis,
+                    ..
+                } => (
+                    hex_str(&channel_id.0),
+                    // Only the anchor path hands us the actual commitment tx.
+                    Some((
+                        commitment_tx.compute_txid().to_string(),
+                        *commitment_tx_fee_satoshis,
+                    )),
+                ),
+                BumpTransactionEvent::HTLCResolution { channel_id, .. } => {
+                    (hex_str(&channel_id.0), None)
+                }
+            };
+            let onchain_wallet = &channels_ctx.onchain_wallet;
+            recovery::observe_bump_transaction(
+                close_records,
+                recovery,
+                &channel_id_hex,
+                commitment,
+                onchain_wallet.has_confirmed_utxo(),
+                onchain_wallet.is_initial_scan_complete(),
+                || onchain_wallet.next_receive_address().ok(),
+                Some(channels_ctx.chain_source.onchain_send_fee_rate_sat_per_vb() as f64),
+                unix_now().as_millis() as u64,
+                logger,
+            );
+            log_info!(
+                logger,
+                "BumpTransaction observed for close records/recovery; CPFP handling lands in U11"
+            );
+            Ok(())
+        }
         // Per-path telemetry: the background processor already feeds these to
         // the scorer; the terminal outcome arrives as PaymentSent/Failed.
         Event::PaymentPathSuccessful { payment_hash, .. } => {
@@ -2051,11 +2282,14 @@ fn handle_ldk_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_background_processor(
     runtime: &Runtime,
     components: &NodeComponents,
     liquidity_source: Arc<LiquiditySource>,
     payment_store: Arc<PaymentStore>,
+    close_records: Arc<CloseRecordStore>,
+    recovery: Arc<RecoveryStore>,
     event_sink: Arc<dyn EventSink>,
     bp_stop_receiver: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
@@ -2096,6 +2330,8 @@ fn spawn_background_processor(
         let liquidity_source = Arc::clone(&liquidity_source);
         let payment_store = Arc::clone(&payment_store);
         let channels_ctx = Arc::clone(&channels_ctx);
+        let close_records = Arc::clone(&close_records);
+        let recovery = Arc::clone(&recovery);
         let event_sink = Arc::clone(&event_sink);
         let logger = Arc::clone(&event_logger);
         async move {
@@ -2105,6 +2341,8 @@ fn spawn_background_processor(
                 &liquidity_source,
                 &payment_store,
                 &channels_ctx,
+                &close_records,
+                &recovery,
                 &event_sink,
                 &logger,
             )

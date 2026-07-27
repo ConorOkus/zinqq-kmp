@@ -289,6 +289,46 @@ pub(crate) fn broadcast_error_is_benign(message: &str) -> bool {
     .any(|benign| message.contains(benign))
 }
 
+/// U10: the reconcile pass's chain queries go through the ONE configured
+/// (first-party) Esplora client — never a fallback: recurring outspend
+/// polling of channel outpoints through a third party would leak the user's
+/// IP + entire channel set (PWA `reconcile.ts:56-59`).
+impl crate::close_records::ChainTruth for ChainSource {
+    fn tip_height(&self) -> crate::vss::store::BoxFuture<'_, Result<u32, String>> {
+        Box::pin(async move {
+            ChainSource::tip_height(self)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn outspend<'a>(
+        &'a self,
+        txid: &'a str,
+        vout: u32,
+    ) -> crate::vss::store::BoxFuture<'a, Result<Option<String>, String>> {
+        Box::pin(async move {
+            let txid: Txid = txid.parse().map_err(|e| format!("bad txid: {e}"))?;
+            self.output_spender(&txid, vout)
+                .await
+                .map(|spender| spender.map(|txid| txid.to_string()))
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn tx_confirmed_height<'a>(
+        &'a self,
+        txid: &'a str,
+    ) -> crate::vss::store::BoxFuture<'a, Result<Option<u32>, String>> {
+        Box::pin(async move {
+            let txid: Txid = txid.parse().map_err(|e| format!("bad txid: {e}"))?;
+            self.tx_confirmation_height(&txid)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
 /// Esplora-backed chain source. `tx_sync` implements LDK's `Filter` and
 /// `Confirm`-driven sync; the shared `esplora_client` also serves the bdk
 /// wallet, fee estimates, and broadcasts (one esplora-client 0.12 stack).
@@ -423,6 +463,47 @@ impl ChainSource {
     /// confirmation targets from it directly).
     pub(crate) fn fee_estimator(&self) -> Arc<CachedFeeEstimator> {
         Arc::clone(&self.fee_estimator)
+    }
+
+    /// The raw txid hex of the transaction spending `txid:vout`, if any
+    /// (U10 reconcile step (a); Esplora reports unconfirmed spends too).
+    pub(crate) async fn output_spender(
+        &self,
+        txid: &Txid,
+        vout: u32,
+    ) -> Result<Option<Txid>, ChainError> {
+        let status = self
+            .esplora_client
+            .get_output_status(txid, u64::from(vout))
+            .await
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?;
+        Ok(status.and_then(|status| if status.spent { status.txid } else { None }))
+    }
+
+    /// The confirmation height of `txid`, `None` while unconfirmed (U10
+    /// reconcile step (b)).
+    pub(crate) async fn tx_confirmation_height(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<u32>, ChainError> {
+        let status = self
+            .esplora_client
+            .get_tx_status(txid)
+            .await
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?;
+        Ok(if status.confirmed {
+            status.block_height
+        } else {
+            None
+        })
+    }
+
+    /// Current tip height (U10 reconcile).
+    pub(crate) async fn tip_height(&self) -> Result<u32, ChainError> {
+        self.esplora_client
+            .get_height()
+            .await
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))
     }
 
     /// Broadcasts one transaction, mapping "already known" responses to the
