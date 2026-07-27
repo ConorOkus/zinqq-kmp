@@ -22,7 +22,9 @@ use crate::node::Node;
 use crate::onchain_send::{FeeEstimate, MaxSendEstimate, OnchainSendError};
 use crate::payment::SendError;
 use crate::restore::RestoreError;
+use crate::send::{self, Classified, HttpNameResolver, LnurlPayMetadata, ResolveError};
 use crate::types::Logger;
+use crate::util::unix_now;
 
 /// FFI-facing configuration. Network is fixed to mainnet; the mnemonic is
 /// auto-created in `storage_dir` on first start (U1, R1 — restore-from-words
@@ -84,6 +86,211 @@ pub struct Balances {
     pub onchain_untrusted_pending_sats: u64,
 }
 
+/// The input family a classified send input belongs to (U6, R5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ClassifiedKind {
+    /// A validated mainnet BOLT11 invoice — dispatch via `send_bolt11`.
+    Bolt11,
+    /// A validated mainnet BOLT12 offer — dispatch via `pay_offer`.
+    Bolt12,
+    /// An unresolved BIP353 name — resolve via `resolve_input`.
+    Bip353,
+    /// A resolved LNURL-pay Lightning Address (`resolve_input` output only).
+    Lnurl,
+    /// A mainnet on-chain address — dispatch via `send_onchain`.
+    Onchain,
+    /// Unusable input; `error` carries the PWA's message verbatim.
+    Invalid,
+}
+
+/// A classified send input, flattened for the shells (U6). Exactly the
+/// fields the send screens render: amounts, description, expiry/network
+/// failures as `error`, and the preserved BIP321 on-chain fallback (AE5).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ClassifiedView {
+    pub kind: ClassifiedKind,
+    /// The BOLT11 string to hand back to `send_bolt11` (kind = Bolt11).
+    pub bolt11: Option<String>,
+    /// The BOLT12 offer string to hand back to `pay_offer` (kind = Bolt12).
+    pub offer: Option<String>,
+    /// Embedded Lightning amount; `None` means the shells collect one.
+    pub amount_msat: Option<u64>,
+    /// Invoice/offer description for the review screen.
+    pub description: Option<String>,
+    /// On-chain address (kind = Onchain).
+    pub address: Option<String>,
+    /// BIP321 `amount` in sats, when the on-chain arm is the target.
+    pub amount_sats: Option<u64>,
+    /// BIP353 name halves (kind = Bip353).
+    pub bip353_user: Option<String>,
+    pub bip353_domain: Option<String>,
+    /// AE5: a BIP321 URI's mainnet on-chain address, preserved as the
+    /// ordered fallback even when `lno`/`lightning` won the preference.
+    pub onchain_fallback_address: Option<String>,
+    /// The BIP321 URI's `amount` in sats regardless of the preferred arm.
+    pub uri_amount_sats: Option<u64>,
+    /// The PWA's classification error string, verbatim (kind = Invalid).
+    pub error: Option<String>,
+}
+
+/// A resolved LNURL-pay target (U6): everything the amount screen and the
+/// invoice fetch need (LUD-16 min/max, skip-amount flag, LUD-06 metadata
+/// commitment).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LnurlPayView {
+    pub user: String,
+    pub domain: String,
+    pub callback: String,
+    pub min_sendable_msat: u64,
+    pub max_sendable_msat: u64,
+    /// Bounds in sats: min rounded UP, max rounded DOWN (PWA parity).
+    pub min_sats: u64,
+    pub max_sats: u64,
+    /// `min_sats == max_sats` — fixed-amount LNURL, the shells skip the
+    /// numpad and call `fetch_lnurl_invoice(min_sendable_msat)` directly.
+    pub skip_amount_entry: bool,
+    pub description: String,
+    /// Hex sha256 of the raw LUD-06 metadata; pass back to
+    /// `fetch_lnurl_invoice` for the KTD-6 `description_hash` check.
+    pub expected_description_hash_hex: Option<String>,
+}
+
+/// `resolve_input`'s result: the (possibly re-)classified input, plus the
+/// LNURL metadata when resolution landed on a Lightning Address.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ResolvedView {
+    pub classified: ClassifiedView,
+    pub lnurl: Option<LnurlPayView>,
+}
+
+fn empty_view(kind: ClassifiedKind) -> ClassifiedView {
+    ClassifiedView {
+        kind,
+        bolt11: None,
+        offer: None,
+        amount_msat: None,
+        description: None,
+        address: None,
+        amount_sats: None,
+        bip353_user: None,
+        bip353_domain: None,
+        onchain_fallback_address: None,
+        uri_amount_sats: None,
+        error: None,
+    }
+}
+
+/// Flattens a [`Classified`] into the FFI view (BIP321 wrappers flatten to
+/// their preferred arm, with the fallback fields preserved).
+fn classified_view(classified: &Classified) -> ClassifiedView {
+    let mut view = empty_view(ClassifiedKind::Invalid);
+    if let Classified::Bip321 {
+        onchain_fallback,
+        amount_sats,
+        ..
+    } = classified
+    {
+        view.onchain_fallback_address = onchain_fallback.clone();
+        view.uri_amount_sats = *amount_sats;
+    }
+    match classified.effective() {
+        Classified::Bolt11 {
+            raw,
+            amount_msat,
+            description,
+        } => {
+            view.kind = ClassifiedKind::Bolt11;
+            view.bolt11 = Some(raw.clone());
+            view.amount_msat = *amount_msat;
+            view.description = description.clone();
+        }
+        Classified::Bolt12 {
+            raw,
+            amount_msat,
+            description,
+        } => {
+            view.kind = ClassifiedKind::Bolt12;
+            view.offer = Some(raw.clone());
+            view.amount_msat = *amount_msat;
+            view.description = description.clone();
+        }
+        Classified::Bip353 { user, domain, .. } => {
+            view.kind = ClassifiedKind::Bip353;
+            view.bip353_user = Some(user.clone());
+            view.bip353_domain = Some(domain.clone());
+        }
+        Classified::Lnurl { metadata, .. } => {
+            view.kind = ClassifiedKind::Lnurl;
+            view.description = Some(metadata.description.clone());
+        }
+        Classified::Onchain {
+            address,
+            amount_sats,
+        } => {
+            view.kind = ClassifiedKind::Onchain;
+            view.address = Some(address.clone());
+            view.amount_sats = *amount_sats;
+        }
+        Classified::Invalid { reason } => {
+            view.kind = ClassifiedKind::Invalid;
+            view.error = Some(reason.clone());
+        }
+        // effective() never returns the wrapper itself.
+        Classified::Bip321 { .. } => unreachable!("effective() unwraps Bip321"),
+    }
+    view
+}
+
+fn lnurl_view(metadata: &LnurlPayMetadata) -> LnurlPayView {
+    LnurlPayView {
+        user: metadata.user.clone(),
+        domain: metadata.domain.clone(),
+        callback: metadata.callback.clone(),
+        min_sendable_msat: metadata.min_sendable_msat,
+        max_sendable_msat: metadata.max_sendable_msat,
+        min_sats: metadata.min_sats(),
+        max_sats: metadata.max_sats(),
+        skip_amount_entry: metadata.skip_amount_entry(),
+        description: metadata.description.clone(),
+        expected_description_hash_hex: metadata
+            .expected_description_hash
+            .as_ref()
+            .map(|hash| crate::util::hex_str(hash)),
+    }
+}
+
+fn lnurl_metadata_from_view(view: &LnurlPayView) -> Result<LnurlPayMetadata, WalletError> {
+    let expected_description_hash = match &view.expected_description_hash_hex {
+        None => None,
+        Some(hex) => {
+            let bytes = parse_hex_32(hex).ok_or_else(|| WalletError::ResolveFailed {
+                detail: "invalid expected_description_hash_hex".to_string(),
+            })?;
+            Some(bytes)
+        }
+    };
+    Ok(LnurlPayMetadata {
+        domain: view.domain.clone(),
+        user: view.user.clone(),
+        callback: view.callback.clone(),
+        min_sendable_msat: view.min_sendable_msat,
+        max_sendable_msat: view.max_sendable_msat,
+        description: view.description.clone(),
+        expected_description_hash,
+    })
+}
+
+fn parse_hex_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Typed FFI errors (Kotlin `WalletException`).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Error)]
 pub enum WalletError {
@@ -131,9 +338,22 @@ pub enum WalletError {
     /// `send()` with an invoice for a different network (this wallet pays
     /// mainnet invoices only); `network` names the invoice's network.
     WrongNetwork { network: String },
-    /// `send()` with an amountless invoice — the spike sends fixed-amount
-    /// invoices only, and there is no amount argument to supply one.
+    /// An amountless invoice/offer sent without an amount (U6: supply
+    /// `amount_msat` for amountless requests).
     AmountlessInvoice,
+    /// An `amount_msat` override supplied for an invoice/offer that already
+    /// carries an amount (U6).
+    AmountOverrideNotAllowed,
+    /// `pay_offer()` with an offer string that failed to parse or verify
+    /// (U6).
+    InvalidOffer { detail: String },
+    /// `pay_offer()` with an offer that is already expired (U6).
+    OfferExpired,
+    /// `pay_offer()` with an offer for a different network (U6).
+    OfferWrongNetwork,
+    /// `resolve_input()`/`fetch_lnurl_invoice()` failed; `detail` is the
+    /// PWA's user-facing resolution error, verbatim (U6, R5).
+    ResolveFailed { detail: String },
     /// `send()` of an invoice whose payment is already pending — paying again
     /// would risk paying twice, so the original attempt owns the outcome.
     DuplicatePayment,
@@ -227,10 +447,22 @@ impl std::fmt::Display for WalletError {
                 "the invoice is for the {network} network, this wallet only pays bitcoin \
                  (mainnet) invoices"
             ),
+            // The PWA's copy, verbatim (context.tsx:981).
             WalletError::AmountlessInvoice => write!(
                 f,
-                "the invoice has no amount; amountless invoices are not supported"
+                "Amount is required for invoices without an embedded amount"
             ),
+            WalletError::AmountOverrideNotAllowed => {
+                write!(f, "{}", SendError::AmountOverrideNotAllowed)
+            }
+            WalletError::InvalidOffer { detail } => {
+                write!(f, "invalid bolt12 offer: {detail}")
+            }
+            WalletError::OfferExpired => write!(f, "{}", SendError::OfferExpired),
+            WalletError::OfferWrongNetwork => write!(f, "{}", SendError::OfferWrongNetwork),
+            // The resolution taxonomy already carries the PWA's exact
+            // user-facing strings — render them untouched.
+            WalletError::ResolveFailed { detail } => write!(f, "{detail}"),
             WalletError::DuplicatePayment => {
                 write!(f, "a payment for this invoice is already pending")
             }
@@ -418,6 +650,15 @@ impl From<OnchainSendError> for WalletError {
     }
 }
 
+impl From<ResolveError> for WalletError {
+    fn from(error: ResolveError) -> Self {
+        // The Display strings ARE the PWA's user-facing copy (send.rs).
+        WalletError::ResolveFailed {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<SendError> for WalletError {
     fn from(error: SendError) -> Self {
         match error {
@@ -428,6 +669,10 @@ impl From<SendError> for WalletError {
                 network: found.to_string(),
             },
             SendError::AmountMissing => WalletError::AmountlessInvoice,
+            SendError::AmountOverrideNotAllowed => WalletError::AmountOverrideNotAllowed,
+            SendError::InvalidOffer(detail) => WalletError::InvalidOffer { detail },
+            SendError::OfferExpired => WalletError::OfferExpired,
+            SendError::OfferWrongNetwork => WalletError::OfferWrongNetwork,
             SendError::DuplicatePayment => WalletError::DuplicatePayment,
             // Attempt failures: the same reason string the queued
             // Event::PaymentFailed carries.
@@ -593,17 +838,100 @@ impl Wallet {
             })
     }
 
+    /// Pays a fixed-amount mainnet BOLT11 invoice (compat shim for the
+    /// spike-era surface; new callers use [`Wallet::send_bolt11`]).
+    pub fn send(&self, bolt11: String) -> Result<(), WalletError> {
+        self.send_bolt11(bolt11, None)
+    }
+
     /// Pays a mainnet BOLT11 invoice; the outcome arrives as
     /// [`Event::PaymentSuccessful`] / [`Event::PaymentFailed`]. Blocking
     /// (route computation): call from a background dispatcher.
     ///
-    /// Idempotent across restarts (U5): the payment id is derived from the
-    /// invoice's payment hash, so re-sending an in-flight invoice fails with
+    /// `amount_msat` is the U6 amount override: REQUIRED for amountless
+    /// invoices, REJECTED ([`WalletError::AmountOverrideNotAllowed`]) when
+    /// the invoice already carries an amount. Idempotent across restarts
+    /// (U5): the payment id is derived from the invoice's payment hash, so
+    /// re-sending an in-flight invoice fails with
     /// [`WalletError::DuplicatePayment`] instead of paying twice. Invalid
-    /// invoices (malformed / expired / wrong network / amountless) each fail
-    /// with a distinct typed error before anything is attempted.
-    pub fn send(&self, bolt11: String) -> Result<(), WalletError> {
-        self.node.send_payment(&bolt11).map_err(WalletError::from)
+    /// invoices (malformed / expired / wrong network) each fail with a
+    /// distinct typed error before anything is attempted.
+    pub fn send_bolt11(&self, bolt11: String, amount_msat: Option<u64>) -> Result<(), WalletError> {
+        self.node
+            .send_payment(&bolt11, amount_msat)
+            .map_err(WalletError::from)
+    }
+
+    /// Pays a mainnet BOLT12 offer (U6, R5): 32-byte random payment id,
+    /// optional payer note on the invoice request, LSP pre-connect for the
+    /// onion transport, retry ×3. `amount_msat` follows the same override
+    /// matrix as [`Wallet::send_bolt11`]. The outcome arrives as
+    /// [`Event::PaymentSuccessful`] / [`Event::PaymentFailed`] and settles
+    /// the pending history row by payment id. Blocking (LSP dial): call from
+    /// a background dispatcher.
+    pub fn pay_offer(
+        &self,
+        offer: String,
+        amount_msat: Option<u64>,
+        payer_note: Option<String>,
+    ) -> Result<(), WalletError> {
+        self.node
+            .pay_offer(&offer, amount_msat, payer_note)
+            .map_err(WalletError::from)
+    }
+
+    /// Classifies a send input (U6, R5): the PWA's dispatch order, network
+    /// and expiry checks, and error strings, verbatim. Pure and synchronous;
+    /// works with the node stopped.
+    pub fn classify_input(&self, input: String) -> ClassifiedView {
+        classified_view(&send::classify(&input))
+    }
+
+    /// Classifies AND resolves a send input (U6, R5): BIP353 names resolve
+    /// over DNSSEC-verified DoH (5 s budget) with an LNURL-pay fallback on a
+    /// miss (fresh 5 s budget); other inputs pass through classification
+    /// unchanged. The returned view is directly dispatchable except for
+    /// LNURL, which carries min/max bounds and the skip-amount flag for the
+    /// amount screen. Async: the network work runs on the core runtime.
+    pub async fn resolve_input(&self, input: String) -> Result<ResolvedView, WalletError> {
+        let task = crate::runtime().spawn(async move {
+            let classified = send::classify(&input);
+            send::resolve(classified, &HttpNameResolver::new(), unix_now()).await
+        });
+        let resolved = task
+            .await
+            .expect("wallet-core runtime task panicked")
+            .map_err(WalletError::from)?;
+        let lnurl = match &resolved {
+            Classified::Lnurl { metadata, .. } => Some(lnurl_view(metadata)),
+            _ => None,
+        };
+        Ok(ResolvedView {
+            classified: classified_view(&resolved),
+            lnurl,
+        })
+    }
+
+    /// Fetches the final BOLT11 invoice from a resolved LNURL-pay target for
+    /// `amount_msat` (U6): bounds-checked against the LUD-16 window, then
+    /// validated per KTD-6 (re-classified, amount match, `description_hash`
+    /// commitment). Returns the invoice's classified view — hand its
+    /// `bolt11` to [`Wallet::send_bolt11`] with NO amount override.
+    pub async fn fetch_lnurl_invoice(
+        &self,
+        lnurl: LnurlPayView,
+        amount_msat: u64,
+    ) -> Result<ClassifiedView, WalletError> {
+        let metadata = lnurl_metadata_from_view(&lnurl)?;
+        let task = crate::runtime().spawn(async move {
+            send::fetch_lnurl_invoice(&HttpNameResolver::new(), &metadata, amount_msat, unix_now())
+                .await
+        });
+        let classified = task
+            .await
+            .expect("wallet-core runtime task panicked")
+            .map_err(WalletError::from)?;
+        Ok(classified_view(&classified))
     }
 
     /// Awaits the front event WITHOUT removing it (Kotlin `suspend`). The
@@ -897,6 +1225,104 @@ mod tests {
                 &bitcoin::secp256k1::PublicKey::from_str(MEGALITH_LSP_NODE_ID).unwrap()
             ),
             "the Megalith seed survives an LSP override"
+        );
+    }
+
+    /// U6: the FFI view flattens a BIP321 wrapper to its preferred arm while
+    /// preserving the ordered on-chain fallback (AE5) and the URI amount.
+    #[test]
+    fn classified_view_flattens_bip321_and_preserves_the_fallback() {
+        let classified = Classified::Bip321 {
+            preferred: Box::new(Classified::Bolt12 {
+                raw: "lno1abc".to_string(),
+                amount_msat: Some(25_000),
+                description: Some("offer".to_string()),
+            }),
+            onchain_fallback: Some("bc1qexample".to_string()),
+            amount_sats: Some(100_000),
+        };
+        let view = classified_view(&classified);
+        assert_eq!(view.kind, ClassifiedKind::Bolt12);
+        assert_eq!(view.offer.as_deref(), Some("lno1abc"));
+        assert_eq!(view.amount_msat, Some(25_000));
+        assert_eq!(
+            view.onchain_fallback_address.as_deref(),
+            Some("bc1qexample")
+        );
+        assert_eq!(view.uri_amount_sats, Some(100_000));
+        assert_eq!(view.bolt11, None);
+        assert_eq!(view.error, None);
+    }
+
+    #[test]
+    fn classified_view_carries_the_pwa_error_string_verbatim() {
+        let view = classified_view(&crate::send::classify("definitely not a payment"));
+        assert_eq!(view.kind, ClassifiedKind::Invalid);
+        assert_eq!(view.error.as_deref(), Some("Unrecognized payment format"));
+    }
+
+    #[test]
+    fn classified_view_maps_bip353_and_onchain_fields() {
+        let view = classified_view(&crate::send::classify("alice@example.com"));
+        assert_eq!(view.kind, ClassifiedKind::Bip353);
+        assert_eq!(view.bip353_user.as_deref(), Some("alice"));
+        assert_eq!(view.bip353_domain.as_deref(), Some("example.com"));
+
+        let view = classified_view(&crate::send::classify(
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+        ));
+        assert_eq!(view.kind, ClassifiedKind::Onchain);
+        assert_eq!(
+            view.address.as_deref(),
+            Some("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+        );
+    }
+
+    /// U6: the LNURL view round-trips through the FFI record (hash included)
+    /// and carries the PWA's ceil/floor bounds and skip-amount flag.
+    #[test]
+    fn lnurl_view_round_trips_and_carries_the_skip_flag() {
+        let metadata = LnurlPayMetadata {
+            domain: "example.com".to_string(),
+            user: "alice".to_string(),
+            callback: "https://example.com/cb".to_string(),
+            min_sendable_msat: 1_001,
+            max_sendable_msat: 2_999,
+            description: "Pay alice".to_string(),
+            expected_description_hash: Some([0xab; 32]),
+        };
+        let view = lnurl_view(&metadata);
+        assert_eq!(view.min_sats, 2, "ceil");
+        assert_eq!(view.max_sats, 2, "floor");
+        assert!(view.skip_amount_entry);
+        assert_eq!(
+            view.expected_description_hash_hex.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        assert_eq!(lnurl_metadata_from_view(&view).unwrap(), metadata);
+
+        let mut bad = view;
+        bad.expected_description_hash_hex = Some("zz".to_string());
+        assert!(matches!(
+            lnurl_metadata_from_view(&bad),
+            Err(WalletError::ResolveFailed { .. })
+        ));
+    }
+
+    /// U6: resolution errors surface with the PWA string as the message.
+    #[test]
+    fn resolve_errors_map_to_resolve_failed_with_the_pwa_string() {
+        let err = WalletError::from(ResolveError::NotFound {
+            raw: "alice@example.com".to_string(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "No Lightning Address or BIP 353 record found for alice@example.com"
+        );
+        let err = WalletError::from(ResolveError::CallbackDomainMismatch);
+        assert_eq!(
+            err.to_string(),
+            "Lightning Address callback domain mismatch"
         );
     }
 

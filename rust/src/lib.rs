@@ -20,6 +20,7 @@ pub mod node;
 pub mod onchain_send;
 pub mod payment;
 pub mod restore;
+pub mod send;
 mod signer;
 mod types;
 mod util;
@@ -51,7 +52,7 @@ uniffi::setup_scaffolding!();
 /// runtime explicitly instead of relying on
 /// `#[uniffi::export(async_runtime = "tokio")]`, which is ignored on
 /// trait-object async methods (mozilla/uniffi-rs#2576).
-fn runtime() -> &'static Runtime {
+pub(crate) fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         Builder::new_multi_thread()

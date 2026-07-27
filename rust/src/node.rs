@@ -20,6 +20,7 @@ use lightning::events::{Event, PaymentFailureReason, ReplayEvent};
 use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::log_error;
 use lightning::log_info;
+use lightning::sign::EntropySource as _;
 use lightning::types::payment::PaymentHash;
 use lightning::util::logger::Logger as _;
 use lightning::util::ser::Writeable as _;
@@ -45,7 +46,8 @@ use crate::liquidity::{LiquiditySource, Lsps2Error};
 use crate::lock::DataDirLock;
 use crate::onchain_send::{self, OnchainSendError};
 use crate::payment::{
-    describe_failure_reason, parse_and_validate, payment_id_for, send_bolt11, SendError,
+    describe_failure_reason, parse_and_validate, payment_id_for, resolve_amount, send_bolt11,
+    send_bolt12, validate_offer, SendError,
 };
 use crate::types::{Logger, Sweeper};
 use crate::util::{hex_str, unix_now};
@@ -490,7 +492,11 @@ impl Node {
     /// `PaymentFailed` here AND returned as a typed error. Validation
     /// failures and duplicates only return the typed error: nothing was
     /// attempted (or the original attempt still owns the outcome).
-    pub fn send_payment(&self, bolt11: &str) -> Result<(), SendError> {
+    pub fn send_payment(
+        &self,
+        bolt11: &str,
+        amount_override_msat: Option<u64>,
+    ) -> Result<(), SendError> {
         let channel_manager = {
             let state_lock = self.state.lock().unwrap();
             let state = state_lock.as_ref().ok_or(SendError::NotRunning)?;
@@ -504,13 +510,16 @@ impl Node {
         // a later PaymentSent/PaymentFailed event. Validation failures write
         // nothing (nothing was attempted). History is informational, so a
         // persist failure degrades (logged) instead of blocking the send.
-        let invoice = parse_and_validate(bolt11, self.config.network, now)?;
+        // U6: the amount override (for amountless invoices) resolves here,
+        // so the row records the amount actually being sent.
+        let (invoice, amount_msat) =
+            parse_and_validate(bolt11, self.config.network, now, amount_override_msat)?;
         let payment_id_hex = hex_str(&payment_id_for(&invoice).0);
         let payment_hash_hex = hex_str(invoice.payment_hash().as_byte_array());
         if let Err(e) = self.payment_store.record_pending(
             &payment_id_hex,
             PaymentDirection::Outbound,
-            invoice.amount_milli_satoshis().unwrap_or(0),
+            amount_msat,
             now.as_millis() as u64,
         ) {
             log_error!(
@@ -519,32 +528,137 @@ impl Node {
             );
         }
 
-        match send_bolt11(&*channel_manager, bolt11, self.config.network, now) {
+        let result = send_bolt11(
+            &*channel_manager,
+            bolt11,
+            self.config.network,
+            now,
+            amount_override_msat,
+        );
+        match result {
             Ok(_payment_id) => Ok(()),
             Err(error) => {
-                if error.is_attempt_failure() {
-                    // LDK abandoned synchronously without an event: settle the
-                    // row and push the public failure ourselves, row first
-                    // (the row must never lag the event it explains).
-                    if let Err(e) = self.payment_store.settle(
-                        &payment_id_hex,
-                        PaymentStatus::Failed,
-                        None,
-                        Some(error.to_string()),
-                    ) {
-                        log_error!(
-                            Logger,
-                            "Failed to settle the history row for {payment_id_hex}: {e}"
-                        );
-                    }
-                    self.event_sink.emit(CoreEvent::PaymentFailed {
-                        payment_hash: Some(payment_hash_hex),
-                        reason: error.to_string(),
-                    });
-                }
+                self.settle_attempt_failure(&payment_id_hex, Some(payment_hash_hex), &error);
                 Err(error)
             }
         }
+    }
+
+    /// Pays a mainnet BOLT12 offer (U6, R5). Blocking (LSP dial + offer
+    /// machinery): call from a background dispatcher.
+    ///
+    /// PWA `sendBolt12Payment` parity (`context.tsx:1026-1091`): the LSP is
+    /// connected first so invoice-request onion messages can route, the
+    /// payment id is 32 random bytes (BOLT12 payments have no payment hash
+    /// until the invoice arrives), `payer_note` rides the invoice request,
+    /// and retries are ×3. The pending history row is keyed by that random
+    /// payment id; `PaymentSent`/`PaymentFailed` settle it by the same id
+    /// (U5's row-key rule prefers `payment_id` when present).
+    pub fn pay_offer(
+        &self,
+        offer_str: &str,
+        amount_override_msat: Option<u64>,
+        payer_note: Option<String>,
+    ) -> Result<(), SendError> {
+        let (channel_manager, keys_manager, liquidity_source, runtime_handle) = {
+            let state_lock = self.state.lock().unwrap();
+            let state = state_lock.as_ref().ok_or(SendError::NotRunning)?;
+            (
+                Arc::clone(&state.components.channel_manager),
+                Arc::clone(&state.components.keys_manager),
+                Arc::clone(&state.liquidity_source),
+                state.runtime.handle().clone(),
+            )
+        };
+        let now = unix_now();
+
+        // Validation failures return before anything is attempted or
+        // recorded (same contract as send_payment).
+        let (_offer, embedded_msat) = validate_offer(offer_str, self.config.network, now)?;
+        let amount_msat = resolve_amount(embedded_msat, amount_override_msat)?;
+
+        let payment_id = PaymentId(keys_manager.get_secure_random_bytes());
+        let payment_id_hex = hex_str(&payment_id.0);
+        if let Err(e) = self.payment_store.record_pending(
+            &payment_id_hex,
+            PaymentDirection::Outbound,
+            amount_msat,
+            now.as_millis() as u64,
+        ) {
+            log_error!(
+                Logger,
+                "Failed to write the pending history row for {payment_id_hex}: {e}"
+            );
+        }
+
+        // LSP pre-connect for onion transport (PWA context.tsx:1032-1044):
+        // without a connected LSP the invoice request cannot route. Run on
+        // the node runtime, wait outside the state lock (receive_jit's
+        // pattern). A connect failure fails the payment, like the PWA's
+        // thrown connectAndTrack.
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        runtime_handle.spawn(async move {
+            let _ = result_sender.send(liquidity_source.ensure_lsp_connected().await);
+        });
+        let connected = result_receiver
+            .blocking_recv()
+            .unwrap_or(Err(Lsps2Error::Shutdown));
+
+        let result = match connected {
+            Err(error) => Err(SendError::SendFailed(format!(
+                "could not connect to the LSP for BOLT12 onion messaging: {error}"
+            ))),
+            Ok(()) => send_bolt12(
+                &*channel_manager,
+                offer_str,
+                self.config.network,
+                now,
+                amount_override_msat,
+                payer_note,
+                payment_id,
+            )
+            .map(|_amount| ()),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // No payment hash yet: BOLT12 failures before an invoice
+                // arrives carry None (events.rs PaymentFailed contract).
+                self.settle_attempt_failure(&payment_id_hex, None, &error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Shared U5/U6 handling for synchronous attempt failures: LDK abandoned
+    /// without queueing an event, so settle the row and push the public
+    /// failure ourselves, row first (the row must never lag the event it
+    /// explains). Validation failures and duplicates skip this — nothing was
+    /// attempted (or the original attempt owns the outcome).
+    fn settle_attempt_failure(
+        &self,
+        payment_id_hex: &str,
+        payment_hash_hex: Option<String>,
+        error: &SendError,
+    ) {
+        if !error.is_attempt_failure() {
+            return;
+        }
+        if let Err(e) = self.payment_store.settle(
+            payment_id_hex,
+            PaymentStatus::Failed,
+            None,
+            Some(error.to_string()),
+        ) {
+            log_error!(
+                Logger,
+                "Failed to settle the history row for {payment_id_hex}: {e}"
+            );
+        }
+        self.event_sink.emit(CoreEvent::PaymentFailed {
+            payment_hash: payment_hash_hex,
+            reason: error.to_string(),
+        });
     }
 
     /// Test-only: one real `lsps2.get_info` round-trip (the plan's live
@@ -2161,7 +2275,7 @@ mod tests {
         let invoice = signed_mainnet_invoice();
         let payment_id_hex = "42".repeat(32); // bolt11: payment id == hash
         assert_eq!(
-            node.send_payment(&invoice.to_string()),
+            node.send_payment(&invoice.to_string(), None),
             Err(SendError::RouteNotFound)
         );
 
@@ -2179,7 +2293,7 @@ mod tests {
 
         // Validation failures never touch the store.
         assert!(matches!(
-            node.send_payment("junk"),
+            node.send_payment("junk", None),
             Err(SendError::InvalidInvoice(_))
         ));
         let feed = node.list_activity().unwrap();
