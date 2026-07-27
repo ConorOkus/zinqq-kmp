@@ -540,7 +540,14 @@ impl ChainSource {
         // silent recovery starts from an empty changeset over another client's
         // address history and needs the wider gap; a wallet this device created
         // keeps the cheap steady-state value.
-        let stop_gap = if wallet.is_cold_restore() {
+        //
+        // This is the ONLY consumer of the per-boot flag, and the reason a loose
+        // per-boot flag is acceptable at all: guessing "wide" wrongly costs one
+        // scan, once, on a wallet that will never full-scan again. The
+        // steady-state sync window deliberately does NOT read it — see
+        // `OnchainWallet::revealed_range_from_wide_scan`, which records what
+        // this scan actually did.
+        let stop_gap = if wallet.wide_gap_first_scan() {
             BDK_COLD_RESTORE_STOP_GAP
         } else {
             BDK_CLIENT_STOP_GAP

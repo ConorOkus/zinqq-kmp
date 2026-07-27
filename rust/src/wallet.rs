@@ -33,6 +33,26 @@ pub(crate) const BDK_WALLET_PRIMARY_NAMESPACE: &str = "bdk_wallet";
 pub(crate) const BDK_WALLET_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const BDK_WALLET_CHANGESET_KEY: &str = "changeset";
 
+/// Durable record that the full scan which PRODUCED this wallet's revealed
+/// range ran at the WIDE cold-restore stop gap — the one fact the steady-state
+/// low-end sync window needs (see
+/// [`OnchainWallet::revealed_range_from_wide_scan`]). A dedicated key rather
+/// than something smuggled into the bdk `ChangeSet`: the changeset's shape is
+/// bdk's, not ours, and this is our own bookkeeping.
+///
+/// Local-only, exactly like the changeset it sits beside: it describes what
+/// THIS device's scan revealed, and a wallet recovered onto another device
+/// re-derives it there by running its own (wide) first scan. It also shares the
+/// changeset's LIFETIME for free — `restore::clear_local_wallet_state` removes
+/// the whole `store/` directory, so a restore can never leave this marker
+/// describing a revealed range that no longer exists.
+pub(crate) const BDK_WALLET_WIDE_SCAN_KEY: &str = "wide_scan_range";
+
+/// The byte written under [`BDK_WALLET_WIDE_SCAN_KEY`]. Presence is the signal;
+/// the payload exists only so a human reading the file sees something
+/// deliberate.
+const WIDE_SCAN_MARKER: &[u8] = b"1";
+
 /// Persists the bdk wallet as a single merged JSON `ChangeSet` under the
 /// shared KVStore. Simpler than per-component keys and plenty for a spike; the
 /// changeset is small until the wallet actually holds on-chain history.
@@ -98,6 +118,49 @@ impl WalletPersister for KVStoreWalletPersister {
     }
 }
 
+/// Reads the durable [`BDK_WALLET_WIDE_SCAN_KEY`] marker (see
+/// [`OnchainWallet::range_from_wide_scan`]).
+///
+/// ABSENT means CHEAP, and that is a positive statement, not a fallback: the
+/// marker is written by the only code path that can produce an inherited
+/// interior, so a wallet with no marker has no interior to lose. Defaulting the
+/// other way would hand the 200-wide window to every wallet that ever booted
+/// with a persisted channel manager — precisely the ~10x steady-state
+/// regression this split exists to remove.
+///
+/// UNREADABLE (any error other than not-found) means WIDE. A key that exists
+/// but cannot be read is a marker we most likely wrote, and mis-reading it
+/// cheap would silently stop querying an interior another client vended:
+/// invisible funds, versus a slower sync. The asymmetry is deliberate — absence
+/// is evidence, an I/O failure is not.
+///
+/// One residual, stated because it is the only way this default can be wrong:
+/// a wallet whose wide full scan ran under a build that PREDATES this marker
+/// has an inherited interior and no marker, so it narrows to the cheap window.
+/// That is not a risk worth defaulting wide for here — the cold-restore stop gap
+/// and the wide window were both introduced in this same unreleased series
+/// (`d013386`, `74366f0`), so no shipped build ever produced a 200-gap range,
+/// and a restore onto a fresh install runs its own first full scan under this
+/// code and records the marker then.
+fn read_wide_scan_marker(kv_store: &FilesystemStore, logger: &Logger) -> bool {
+    match kv_store.read(
+        BDK_WALLET_PRIMARY_NAMESPACE,
+        BDK_WALLET_SECONDARY_NAMESPACE,
+        BDK_WALLET_WIDE_SCAN_KEY,
+    ) {
+        Ok(_) => true,
+        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            log_error!(
+                logger,
+                "Could not read the wide-scan marker ({e}); assuming this wallet's range came \
+                 from a cold-restore scan and keeping the wide sync window"
+            );
+            true
+        }
+    }
+}
+
 struct WalletInner {
     wallet: PersistedWallet<KVStoreWalletPersister>,
     persister: KVStoreWalletPersister,
@@ -114,15 +177,42 @@ pub(crate) struct OnchainWallet {
     /// on a failed scan. Per-process by design (a fresh wallet is built at
     /// every `start()`), mirroring the PWA's per-session module flag.
     initial_scan_complete: std::sync::atomic::AtomicBool,
-    /// Set by `builder::build` when this boot loaded pre-existing LDK state —
-    /// a U4 restore, a `vss::startup` silent recovery, or an existing install's
-    /// restart. Only the FIRST full scan of such a wallet consults it (see
-    /// [`ChainSource::sync_onchain_wallet`]): a cross-client cold start has an
-    /// empty bdk changeset, so it needs more stop-gap headroom than a wallet
-    /// this device created itself.
+    /// PER-BOOT, gates ONE decision: the STOP GAP of this wallet's first full
+    /// scan (see [`ChainSource::sync_onchain_wallet`]). Set by `builder::build`
+    /// when this boot loaded pre-existing LDK state — a U4 restore, a
+    /// `vss::startup` silent recovery, or an existing install's plain restart —
+    /// because such a boot MIGHT be running over an address history this device
+    /// did not produce, and a cross-client cold start has an empty bdk
+    /// changeset with no way to tell.
+    ///
+    /// OVER-BREADTH IS HARMLESS HERE and that is why the test is so loose: a
+    /// wallet full-scans exactly once (`needs_full_scan` is false forever
+    /// after), so the cost of guessing "wide" wrongly is bounded by one scan.
+    /// It is NOT harmless for anything that runs every tick — see
+    /// [`OnchainWallet::range_from_wide_scan`], which is the durable fact the
+    /// steady-state sync uses instead.
     ///
     /// [`ChainSource::sync_onchain_wallet`]: crate::chain::ChainSource::sync_onchain_wallet
-    cold_restore: std::sync::atomic::AtomicBool,
+    wide_gap_first_scan: std::sync::atomic::AtomicBool,
+    /// DURABLE, gates ONE decision: the low-end window width of every
+    /// [`OnchainWallet::bounded_sync_request`], forever (see that method for
+    /// why the window has to match the gap that produced the range).
+    ///
+    /// The claim is a fact about THIS WALLET'S REVEALED RANGE, not about this
+    /// boot: "the full scan that produced the range ran at
+    /// [`BDK_COLD_RESTORE_STOP_GAP`], so the range may contain up to 200 unpaid
+    /// indices another client vended". That inherited interior does not
+    /// evaporate on the next restart, so the flag cannot be per-boot — it is
+    /// loaded from [`BDK_WALLET_WIDE_SCAN_KEY`] at construction and written the
+    /// first time a wide full scan SUCCEEDS.
+    ///
+    /// Distinct from [`OnchainWallet::wide_gap_first_scan`] on purpose: that one
+    /// is true on essentially every boot after the very first (a persisted
+    /// channel manager is enough), so using it here made every established
+    /// wallet — restored or not — pay the 200-wide window on every 120 s tick,
+    /// ~10x the intended steady-state cost and a silent defeat of the bound
+    /// this whole request exists to enforce.
+    range_from_wide_scan: std::sync::atomic::AtomicBool,
     /// EXTERNAL indices that a KTD-4 deterministic close destination lands on
     /// (`BE(channel_keys_id[0..4]) mod 10_000`), pinned into every incremental
     /// sync by [`OnchainWallet::bounded_sync_request`].
@@ -147,6 +237,10 @@ pub(crate) struct OnchainWallet {
     /// its destination either already received (→ it is a USED spk, and used
     /// spks are always in the sync set) or never will.
     destination_indexes: Mutex<BTreeSet<u32>>,
+    /// The same store the changeset persists through, held directly for the
+    /// [`BDK_WALLET_WIDE_SCAN_KEY`] marker: that record is ours, not bdk's, so
+    /// it does not travel through [`KVStoreWalletPersister`].
+    kv_store: Arc<FilesystemStore>,
     logger: Arc<Logger>,
 }
 
@@ -164,7 +258,7 @@ impl OnchainWallet {
     ) -> Result<Self, BuildError> {
         let descriptor = descriptor.to_string();
         let change_descriptor = change_descriptor.to_string();
-        let mut persister = KVStoreWalletPersister::new(kv_store);
+        let mut persister = KVStoreWalletPersister::new(Arc::clone(&kv_store));
 
         let wallet_opt = BdkWallet::load()
             .descriptor(KeychainKind::External, Some(descriptor.clone()))
@@ -187,26 +281,83 @@ impl OnchainWallet {
                 })?,
         };
 
+        let range_from_wide_scan = read_wide_scan_marker(&kv_store, &logger);
+
         Ok(Self {
             inner: Mutex::new(WalletInner { wallet, persister }),
             initial_scan_complete: std::sync::atomic::AtomicBool::new(false),
-            cold_restore: std::sync::atomic::AtomicBool::new(false),
+            wide_gap_first_scan: std::sync::atomic::AtomicBool::new(false),
+            range_from_wide_scan: std::sync::atomic::AtomicBool::new(range_from_wide_scan),
             destination_indexes: Mutex::new(BTreeSet::new()),
+            kv_store,
             logger,
         })
     }
 
-    /// Marks this boot as a cold restore / recovery (see
-    /// [`OnchainWallet::cold_restore`]).
-    pub(crate) fn mark_cold_restore(&self) {
-        self.cold_restore
+    /// Marks this BOOT as one that loaded pre-existing LDK state, so its first
+    /// full scan takes the wide stop gap (see
+    /// [`OnchainWallet::wide_gap_first_scan`] — per-boot, one decision only).
+    pub(crate) fn mark_wide_gap_first_scan(&self) {
+        self.wide_gap_first_scan
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Whether this boot loaded pre-existing LDK state, which widens the stop
-    /// gap of the first full scan.
-    pub(crate) fn is_cold_restore(&self) -> bool {
-        self.cold_restore.load(std::sync::atomic::Ordering::Acquire)
+    /// Whether the FIRST FULL SCAN of this wallet should run at the wide
+    /// cold-restore stop gap. Read only by
+    /// [`crate::chain::ChainSource::sync_onchain_wallet`]; never a steady-state
+    /// input (that is [`OnchainWallet::revealed_range_from_wide_scan`]).
+    pub(crate) fn wide_gap_first_scan(&self) -> bool {
+        self.wide_gap_first_scan
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this wallet's REVEALED RANGE was produced by a wide (cold
+    /// restore) full scan, i.e. whether it may carry an inherited interior of
+    /// vended-but-unpaid addresses. Durable across restarts; the only input to
+    /// the low-end window of [`OnchainWallet::bounded_sync_request`].
+    pub(crate) fn revealed_range_from_wide_scan(&self) -> bool {
+        self.range_from_wide_scan
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records — durably — that a full scan at `stop_gap` succeeded over this
+    /// wallet, so every later boot keeps watching whatever interior that scan
+    /// may have revealed.
+    ///
+    /// Only a gap WIDER than [`ONCHAIN_SYNC_KEYCHAIN_WINDOW`] is worth
+    /// recording: that is exactly the condition under which the scan could
+    /// reveal unpaid indices the cheap steady-state window would not reach.
+    /// Phrasing the test on the gap the scan ACTUALLY used (rather than on
+    /// [`OnchainWallet::wide_gap_first_scan`], which merely predicted it) keeps
+    /// the marker's meaning true by construction, and makes it self-correcting
+    /// if either constant ever moves.
+    ///
+    /// Idempotent, and deliberately best-effort: a failed marker write is
+    /// logged and leaves the flag set for THIS process, so the current session
+    /// still watches the interior. The residual — a marker write that fails and
+    /// is never retried, because the wallet never full-scans again — is the same
+    /// class of risk as the changeset write beside it and is bounded by the fact
+    /// that the scan itself just persisted successfully through that same store.
+    fn record_wide_scan_range(&self, stop_gap: usize) {
+        if stop_gap <= ONCHAIN_SYNC_KEYCHAIN_WINDOW
+            || self
+                .range_from_wide_scan
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        if let Err(e) = self.kv_store.write(
+            BDK_WALLET_PRIMARY_NAMESPACE,
+            BDK_WALLET_SECONDARY_NAMESPACE,
+            BDK_WALLET_WIDE_SCAN_KEY,
+            WIDE_SCAN_MARKER.to_vec(),
+        ) {
+            log_error!(
+                self.logger,
+                "Failed to persist the wide-scan marker ({e}); this session still watches the \
+                 inherited interior, but a restart would fall back to the narrow sync window"
+            );
+        }
     }
 
     /// Registers `index` as a KTD-4 deterministic close destination that every
@@ -239,7 +390,8 @@ impl OnchainWallet {
         stop_gap: usize,
         concurrency: usize,
     ) -> Result<bool, ChainError> {
-        let result = if self.needs_full_scan() {
+        let full_scan = self.needs_full_scan();
+        let result = if full_scan {
             let request = self.inner.lock().unwrap().wallet.start_full_scan().build();
             let update = client
                 .full_scan(request, stop_gap, concurrency)
@@ -257,6 +409,14 @@ impl OnchainWallet {
         if result.is_ok() {
             self.initial_scan_complete
                 .store(true, std::sync::atomic::Ordering::Release);
+            if full_scan {
+                // SUCCESS ONLY, and only for the full scan: the marker's claim
+                // is "the revealed range you now see was produced at this gap".
+                // A failed or timed-out scan applied nothing and revealed
+                // nothing, so recording it would widen every future sync on the
+                // strength of a scan that never happened.
+                self.record_wide_scan_range(stop_gap);
+            }
         }
         result
     }
@@ -337,9 +497,9 @@ impl OnchainWallet {
                 .filter(|(keychain_index, _)| tracked.is_used(keychain_index))
                 .map(|(keychain_index, spk)| (*keychain_index, spk.clone())),
         );
-        // The low-end window must be as wide as the stop gap that produced this
-        // wallet's revealed range, NOT merely as wide as our own vending needs.
-        // A cold restore's one full scan (gap
+        // The low-end window must be as wide as the stop gap that ACTUALLY
+        // produced this wallet's revealed range, NOT merely as wide as our own
+        // vending needs. A cold restore's one full scan (gap
         // [`BDK_COLD_RESTORE_STOP_GAP`]) reveals well past the other client's
         // last USED index, so the revealed interior is full of addresses that
         // client vended and displayed but was never paid to — see that
@@ -350,7 +510,16 @@ impl OnchainWallet {
         // worse than the unbounded request this bounding replaced. A wallet
         // whose range this device produced itself only ever vends from the
         // lowest unused index, so it keeps the cheap window.
-        let low_window = if self.is_cold_restore() {
+        //
+        // THE DURABLE FACT, NOT THE PER-BOOT INTENT: this reads
+        // `revealed_range_from_wide_scan`, never `wide_gap_first_scan`. The
+        // latter is true on essentially every boot after the very first (a
+        // persisted channel manager alone sets it), so reading it here charged
+        // ~10x the intended cost to every established wallet on every tick,
+        // forever — the whole 804 s regression this method exists to fix,
+        // reintroduced at one tenth the magnitude. Over-breadth is affordable
+        // for a once-per-wallet scan and not for a 120 s loop.
+        let low_window = if self.revealed_range_from_wide_scan() {
             BDK_COLD_RESTORE_STOP_GAP
         } else {
             ONCHAIN_SYNC_KEYCHAIN_WINDOW
@@ -1065,6 +1234,16 @@ pub(crate) mod test_support {
     pub(crate) fn tx_count(onchain: &OnchainWallet) -> usize {
         onchain.inner.lock().unwrap().wallet.transactions().count()
     }
+
+    /// The bookkeeping a SUCCESSFUL full scan at `stop_gap` performs, without
+    /// the scan: `OnchainWallet::sync`'s success path calls exactly this (see
+    /// [`OnchainWallet::record_wide_scan_range`]), and the scan itself needs
+    /// Esplora, which no test here is allowed to reach. Everything the marker
+    /// decision depends on — the gap comparison and the durable write — runs for
+    /// real.
+    pub(crate) fn record_completed_full_scan(onchain: &OnchainWallet, stop_gap: usize) {
+        onchain.record_wide_scan_range(stop_gap);
+    }
 }
 
 #[cfg(test)]
@@ -1072,6 +1251,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::config::BDK_CLIENT_STOP_GAP;
 
     fn fresh_store() -> (tempfile::TempDir, Arc<FilesystemStore>) {
         let dir = tempfile::tempdir().unwrap();
@@ -1279,11 +1459,17 @@ mod tests {
     /// payment there would never be seen by any sync. That is silent fund
     /// invisibility, and strictly worse than the unbounded request this bounding
     /// replaced, so the low window widens to the gap that produced the range.
+    ///
+    /// The seam moved with the fix: what widens the window is no longer "this
+    /// boot looked like a restore" but "a wide full scan SUCCEEDED over this
+    /// wallet", which is what actually produces the interior.
     #[test]
     fn a_cold_restore_keeps_watching_the_interior_another_client_vended() {
         let (_dir, store) = fresh_store();
         let wallet = test_wallet(store, Network::Bitcoin).unwrap();
-        wallet.mark_cold_restore();
+        wallet.mark_wide_gap_first_scan();
+        test_support::record_completed_full_scan(&wallet, BDK_COLD_RESTORE_STOP_GAP);
+        assert!(wallet.revealed_range_from_wide_scan());
 
         // History at the low indices, as a restored PWA wallet has ...
         test_support::fund_confirmed(&wallet, 25_000);
@@ -1319,10 +1505,21 @@ mod tests {
     /// The contrast that shows the widening is gated: a wallet whose revealed
     /// range THIS device produced never inherits a foreign interior, so it keeps
     /// the cheap window and does not pay for 200 scripts per tick.
+    ///
+    /// The per-boot flag is SET here on purpose. That is the state of every
+    /// established install on every restart (`builder::build` sets it from a
+    /// merely-persisted channel manager), and reading it for the steady-state
+    /// window is the ~10x cost regression this test now pins shut: intent to
+    /// scan wide is not evidence of having scanned wide.
     #[test]
     fn a_locally_created_wallet_keeps_the_cheap_low_window() {
         let (_dir, store) = fresh_store();
         let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+        wallet.mark_wide_gap_first_scan();
+        assert!(
+            !wallet.revealed_range_from_wide_scan(),
+            "no scan has run, so no range provenance was recorded"
+        );
         test_support::fund_confirmed(&wallet, 25_000);
         test_support::fund_confirmed(&wallet, 10_000);
         wallet
@@ -1338,6 +1535,60 @@ mod tests {
             spks.len(),
             2 + 20 + 20,
             "the steady-state bound is unchanged"
+        );
+    }
+
+    /// The durable half of the split: the wide window is a property of the
+    /// wallet's RANGE, so it must survive the process that scanned. A restart
+    /// re-reads the marker rather than re-deriving it from boot conditions
+    /// (which no longer say anything about the range).
+    ///
+    /// Also pins the negative: a NARROW full scan (`BDK_CLIENT_STOP_GAP`, what a
+    /// wallet this device created gets) records nothing, because it cannot have
+    /// revealed past the cheap window.
+    #[test]
+    fn a_wide_full_scan_marker_is_persisted_and_reloaded() {
+        let (_dir, store) = fresh_store();
+
+        // A narrow scan is not evidence of an inherited interior.
+        let local = test_wallet(Arc::clone(&store), Network::Bitcoin).unwrap();
+        test_support::record_completed_full_scan(&local, BDK_CLIENT_STOP_GAP);
+        assert!(
+            !local.revealed_range_from_wide_scan(),
+            "a 20-gap scan cannot reveal past the 20-wide steady-state window"
+        );
+        drop(local);
+
+        // The cold-restore scan that actually produced the range does record.
+        let restored = test_wallet(Arc::clone(&store), Network::Bitcoin).unwrap();
+        assert!(!restored.revealed_range_from_wide_scan());
+        test_support::record_completed_full_scan(&restored, BDK_COLD_RESTORE_STOP_GAP);
+        test_support::fund_confirmed(&restored, 25_000);
+        test_support::fund_confirmed(&restored, 10_000);
+        restored
+            .destination_script_for_index(OBSERVED_DESTINATION_INDEX)
+            .unwrap();
+        let inherited = restored.peek_external_script(100);
+        assert!(restored.sync_request_spks().contains(&inherited));
+        drop(restored);
+
+        // Restart: nothing marks this boot, and the wallet still watches the
+        // interior its scan revealed.
+        let reloaded = test_wallet(store, Network::Bitcoin).unwrap();
+        assert!(
+            reloaded.revealed_range_from_wide_scan(),
+            "the marker must outlive the process that scanned"
+        );
+        let spks = reloaded.sync_request_spks();
+        assert!(
+            spks.contains(&inherited),
+            "a restart must not silently un-watch an inherited interior"
+        );
+        // Still bounded: 2 used + 200 lowest unused + 20 highest revealed.
+        assert!(
+            spks.len() < 300,
+            "the wide window is wider, not unbounded, got {}",
+            spks.len()
         );
     }
 

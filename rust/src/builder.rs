@@ -738,8 +738,18 @@ pub(crate) fn build(
     // A restore / silent recovery inherits an EMPTY bdk changeset over another
     // client's address history, so its one full scan gets the wider cold-restore
     // stop gap (`BDK_COLD_RESTORE_STOP_GAP`).
+    //
+    // THIS TEST IS DELIBERATELY LOOSE and gates the STOP GAP ONLY.
+    // `had_local_channel_manager` is true on every boot after the very first, so
+    // this fires for plain restarts too — acceptable, because a wallet
+    // full-scans exactly once and a needlessly wide one-time scan costs a few
+    // hundred script queries. It must NOT be used for anything recurring: the
+    // steady-state sync window reads the durable
+    // `OnchainWallet::revealed_range_from_wide_scan` marker, recorded only when
+    // a wide scan actually succeeds, precisely so a restart does not inherit a
+    // 200-wide window it has no interior to justify.
     if vss_recovered || !channel_monitors.is_empty() || had_local_channel_manager {
-        onchain_wallet.mark_cold_restore();
+        onchain_wallet.mark_wide_gap_first_scan();
     }
 
     // Initial chain sync of manager AND monitors — BEFORE watch_channel.
@@ -1298,6 +1308,59 @@ mod tests {
                 .join(crate::keys::RESTORE_IN_PROGRESS_FILE_NAME)
                 .exists(),
             "the marker clears after recovery is durable"
+        );
+    }
+
+    /// The integration point of the on-chain sync-cost fix, exercised through
+    /// `build`'s REAL decision rather than by calling the wallet's mark method:
+    /// a plain restart of a locally-created wallet — no restore, no VSS
+    /// recovery, no monitors, just a persisted channel manager — must keep the
+    /// CHEAP steady-state sync window.
+    ///
+    /// `build` sets the per-boot `wide_gap_first_scan` flag here (its condition
+    /// includes `cm_bytes.is_some()`, true on every boot after the very first),
+    /// and that is fine for the one-time full scan's stop gap. What must NOT
+    /// follow is a 200-wide low window on every 120 s tick forever: that is the
+    /// ~10x cost regression, and it is what happened while both decisions read
+    /// one flag. The durable marker is absent because no wide scan ever
+    /// succeeded here (this suite is offline by construction), which is exactly
+    /// the state of every established install on restart.
+    #[test]
+    fn a_restart_over_a_persisted_manager_keeps_the_cheap_sync_window() {
+        let dir = tempfile::tempdir().unwrap();
+        create_local_wallet(dir.path());
+
+        let rt = test_runtime();
+        let components = build(
+            &offline_config(dir.path(), "http://127.0.0.1:1".to_string()),
+            &rt,
+            test_sink(),
+        )
+        .expect("a restart over a persisted manager starts degraded");
+        let wallet = &components.onchain_wallet;
+
+        assert!(
+            wallet.wide_gap_first_scan(),
+            "build's own condition fires on a persisted manager — the premise of this test"
+        );
+        assert!(
+            !wallet.revealed_range_from_wide_scan(),
+            "no wide scan ever succeeded, so the steady-state window must stay cheap"
+        );
+
+        // And observably so, on the wallet shape that made the cost visible: one
+        // closed channel's KTD-4 destination drags `last_revealed` to 5 030.
+        crate::wallet::test_support::fund_confirmed(wallet, 25_000);
+        wallet.destination_script_for_index(5_030).unwrap();
+        let spks = wallet.sync_request_spks();
+        assert!(
+            !spks.contains(&wallet.peek_external_script(100)),
+            "a mere restart must not watch a 200-wide low window it has no interior to justify"
+        );
+        assert_eq!(
+            spks.len(),
+            1 + 20 + 20,
+            "1 used + 20 lowest unused + 20 highest revealed: the intended steady-state bound"
         );
     }
 
