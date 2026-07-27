@@ -13,6 +13,11 @@ import SwiftUI
 struct AppShell: View {
     @ObservedObject var model: WalletModel
     @State private var path: [Route] = []
+    /// The Scan screen's raw decode, handed to Send exactly like the PWA's
+    /// `location.state` / Android's savedStateHandle (U20, R13): a raw
+    /// string, cleared by any navigation that leaves Send, and re-classified
+    /// from scratch by the Send screen — never a parsed object.
+    @State private var scannedInput: String?
 
     private var current: Route { path.last ?? .home }
 
@@ -61,6 +66,10 @@ struct AppShell: View {
     /// Destination-based navigation (KTD-11): the stack becomes the route's
     /// declared backTo chain, exactly like the PWA's `backTo` links.
     private func navigate(_ route: Route) {
+        // The scan handoff is consumed by exactly one Send visit (U20):
+        // navigating anywhere else clears it, so a later Home → Send entry
+        // starts fresh.
+        if route != .send { scannedInput = nil }
         path = route.backChain
     }
 
@@ -76,9 +85,23 @@ struct AppShell: View {
         case .receive:
             PlaceholderScreen(title: "Receive", route: route, onNavigate: navigate)
         case .send:
-            PlaceholderScreen(title: "Send", route: route, onNavigate: navigate)
+            SendScreen(
+                port: model,
+                scannedInput: scannedInput,
+                onDone: { navigate(.home) },
+                onBackToHome: { navigate(.home) }
+            )
         case .scan:
-            PlaceholderScreen(title: "Scan", route: route, onNavigate: navigate)
+            ScanScreen(
+                port: model,
+                onScanned: { raw in
+                    // Replace Scan with Send and hand over the raw string
+                    // (Android's savedStateHandle handoff, R13).
+                    scannedInput = raw
+                    navigate(.send)
+                },
+                onClose: { navigate(Route.scan.backTo ?? .home) }
+            )
         case .activity:
             ActivityScreen(
                 model: model,

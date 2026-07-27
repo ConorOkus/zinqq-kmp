@@ -185,6 +185,14 @@ final class WalletModel: ObservableObject {
     private var wallet: Wallet?
     private var startRequested = false
 
+    // MARK: Live event rebroadcast (U20)
+
+    /// U20: live rebroadcast of core events so the send flow can await its
+    /// payment outcome (F1). No replay — a subscriber must exist before the
+    /// dispatch it cares about (the durable queue in the core is the real
+    /// record); Android's `WalletHolder._events` twin.
+    private let eventsSubject = PassthroughSubject<WalletEvent, Never>()
+
     // MARK: Blocking FFI dispatch
 
     /// Runs a blocking Wallet FFI call off the MainActor — rust/src/api.rs
@@ -428,9 +436,12 @@ final class WalletModel: ObservableObject {
     }
 
     /// Reduce + conditional wallet-data refresh; internal so tests can drive
-    /// the same path the event loop takes.
+    /// the same path the event loop takes. Rebroadcast AFTER the reduce so
+    /// subscribers (the send flow's outcome await, U20) observe state and
+    /// event in order — same ordering as Android's `WalletHolder`.
     func handle(_ event: WalletEvent) {
         reduce(event)
+        eventsSubject.send(event)
         if shouldRefreshWalletData(event) { refreshWalletData() }
     }
 
@@ -524,5 +535,123 @@ final class WalletModel: ObservableObject {
         values.isExcludedFromBackup = true
         try dir.setResourceValues(values)
         return dir
+    }
+}
+
+// MARK: - SendPort (U20, R14)
+
+/// Thin passthroughs to the core's send FFI, mirroring Android's
+/// `WalletHolder` SendPort section: blocking calls hop off the MainActor via
+/// `runBlockingFFI`; `resolveInput`/`fetchLnurlInvoice` are already suspend
+/// bindings exported as async.
+extension WalletModel: SendPort {
+    private func requireWallet() throws -> Wallet {
+        guard let wallet else { throw SendPortError.walletUnavailable }
+        return wallet
+    }
+
+    func classify(_ input: String) async throws -> ClassifiedView {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { wallet.classifyInput(input: input) }
+    }
+
+    func resolve(_ input: String) async throws -> ResolvedView {
+        try await requireWallet().resolveInput(input: input)
+    }
+
+    func fetchLnurlInvoice(
+        _ lnurl: LnurlPayView,
+        amountMsat: UInt64
+    ) async throws -> ClassifiedView {
+        try await requireWallet().fetchLnurlInvoice(lnurl: lnurl, amountMsat: amountMsat)
+    }
+
+    func sendBolt11(_ bolt11: String, amountMsat: UInt64?) async throws {
+        let wallet = try requireWallet()
+        try await Self.runBlockingFFI {
+            try wallet.sendBolt11(
+                bolt11: bolt11,
+                amountMsat: amountMsat.map { KotlinULong(unsignedLongLong: $0) }
+            )
+        }
+    }
+
+    func payOffer(_ offer: String, amountMsat: UInt64?) async throws {
+        let wallet = try requireWallet()
+        try await Self.runBlockingFFI {
+            try wallet.payOffer(
+                offer: offer,
+                amountMsat: amountMsat.map { KotlinULong(unsignedLongLong: $0) },
+                payerNote: nil
+            )
+        }
+    }
+
+    func estimateOnchainFee(address: String, amountSats: UInt64) async throws -> FeeEstimate {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.estimateOnchainFee(address: address, amountSats: amountSats)
+        }
+    }
+
+    func estimateMaxSendable(address: String) async throws -> MaxSendEstimate {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.estimateMaxSendable(address: address)
+        }
+    }
+
+    func sendOnchain(
+        address: String,
+        amountSats: UInt64,
+        expectedAmountSats: UInt64,
+        expectedFeeSats: UInt64
+    ) async throws -> String {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.sendOnchain(
+                address: address,
+                amountSats: amountSats,
+                expectedAmountSats: expectedAmountSats,
+                expectedFeeSats: expectedFeeSats
+            )
+        }
+    }
+
+    func sendOnchainMax(
+        address: String,
+        expectedAmountSats: UInt64,
+        expectedFeeSats: UInt64
+    ) async throws -> String {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.sendOnchainMax(
+                address: address,
+                expectedAmountSats: expectedAmountSats,
+                expectedFeeSats: expectedFeeSats
+            )
+        }
+    }
+
+    /// A fresh subscription per access: the sink registers synchronously at
+    /// stream creation, so subscribing BEFORE dispatch cannot miss an
+    /// instant outcome (Android's `_events.asSharedFlow()` twin; F1).
+    var walletEvents: AsyncStream<WalletEvent> {
+        let subject = eventsSubject
+        return AsyncStream { continuation in
+            let cancellable = subject.sink { continuation.yield($0) }
+            continuation.onTermination = { _ in cancellable.cancel() }
+        }
+    }
+
+    func lightningCapacityMsat() -> UInt64 {
+        balances?.lightningMsat ?? 0
+    }
+
+    /// The PWA's onchainBalance is confirmed + trusted pending
+    /// (`Send.tsx:164-165`) = total − untrusted pending, both core-computed.
+    func onchainBalanceSats() -> UInt64 {
+        guard let balances else { return 0 }
+        return balances.onchainTotalSats - balances.onchainUntrustedPendingSats
     }
 }
