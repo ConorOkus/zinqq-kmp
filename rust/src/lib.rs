@@ -17,6 +17,7 @@ pub mod liquidity;
 mod lock;
 pub mod node;
 pub mod payment;
+pub mod restore;
 mod signer;
 mod types;
 mod util;
@@ -34,6 +35,7 @@ pub use history::{
 pub use liquidity::Lsps2Error;
 pub use node::Node;
 pub use payment::SendError;
+pub use restore::RestoreError;
 
 uniffi::setup_scaffolding!();
 

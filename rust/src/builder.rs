@@ -11,6 +11,7 @@
 //! monitors → `watch_channel` each monitor. Only then may peers connect and
 //! the background processor run.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::Cursor;
@@ -23,6 +24,7 @@ use lightning::chain::channelmonitor::ChannelMonitor;
 use lightning::chain::{BestBlock, Confirm, Watch};
 use lightning::ln::channelmanager::{ChainParameters, ChannelManagerReadArgs};
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler};
+use lightning::ln::types::ChannelId;
 use lightning::log_error;
 use lightning::log_info;
 use lightning::routing::router::DefaultRouter;
@@ -94,10 +96,22 @@ pub enum BuildError {
     /// overwriting would destroy access to the existing wallet's funds (R1:
     /// the mnemonic file is write-once).
     MnemonicExists,
-    /// No mnemonic exists but the restore-in-progress marker does (U4):
-    /// auto-generating fresh words now would silently abandon the wallet
-    /// being restored, so the start is refused.
+    /// The restore-in-progress marker exists and the restore cannot proceed
+    /// here (U4): either no mnemonic exists (auto-generating fresh words
+    /// would silently abandon the wallet being restored) or VSS is disabled
+    /// (the voided local state can never be recovered), so the start is
+    /// refused.
     RestoreInProgress,
+    /// Channel monitors exist locally but no channel manager does: channels
+    /// exist but their state is lost. Starting fresh would silently discard
+    /// channel funds, so the start halts (U4 — the PWA's orphaned-monitors
+    /// halt).
+    OrphanedMonitors,
+    /// The restored channel manager references a funded channel with no
+    /// local monitor — a partial restore. Booting would run channels without
+    /// their fund-safety state, so the start halts (U4 — the missing mirror
+    /// of the orphaned-monitors check).
+    MissingChannelMonitor,
     /// The on-chain wallet could not be set up.
     WalletSetupFailed,
     /// A persisted channel monitor is unreadable or corrupt.
@@ -152,7 +166,15 @@ impl fmt::Display for BuildError {
             }
             BuildError::MnemonicExists => "a mnemonic already exists; refusing to overwrite it",
             BuildError::RestoreInProgress => {
-                "a restore is in progress; refusing to generate a fresh mnemonic"
+                "a restore is in progress; it must complete before the node can start"
+            }
+            BuildError::OrphanedMonitors => {
+                "channel monitors exist but the channel manager is missing; refusing to start \
+                 with channel state lost"
+            }
+            BuildError::MissingChannelMonitor => {
+                "the channel manager references a channel with no local monitor; refusing to \
+                 start against a partial restore"
             }
             BuildError::WalletSetupFailed => "failed to set up the on-chain wallet",
             BuildError::InvalidMonitorData => "persisted channel monitor data is unreadable",
@@ -249,9 +271,28 @@ pub(crate) fn persist_channel_manager(
         .map_err(|_| BuildError::WriteFailed)
 }
 
+/// U4 startup integrity check (the missing mirror of the PWA's
+/// monitors-without-CM halt): every FUNDED channel the deserialized manager
+/// references must have a local monitor, or the state is a partial restore
+/// and booting it is not fund-safe. Channels still awaiting funding
+/// legitimately have no monitor yet and must be filtered out by the caller.
+pub(crate) fn check_channel_monitor_coverage(
+    funded_channels: impl IntoIterator<Item = ChannelId>,
+    monitored: &HashSet<ChannelId>,
+) -> Result<(), BuildError> {
+    for channel_id in funded_channels {
+        if !monitored.contains(&channel_id) {
+            return Err(BuildError::MissingChannelMonitor);
+        }
+    }
+    Ok(())
+}
+
 /// Builds the VSS wire transport for `config`, or `None` when VSS is
 /// disabled. Tests inject an in-process transport via the config override.
-fn make_vss_transport(
+/// Shared with U4's restore flow, which derives keys from the ENTERED
+/// mnemonic rather than the stored one.
+pub(crate) fn make_vss_transport(
     config: &Config,
     keys: &WalletKeys,
 ) -> Result<Option<Arc<dyn VssTransport>>, BuildError> {
@@ -286,6 +327,13 @@ pub(crate) fn build(
     let storage_dir = PathBuf::from(&config.storage_dir);
     fs::create_dir_all(&storage_dir).map_err(|_| BuildError::WriteFailed)?;
 
+    // U4 crash-prefix resume, BEFORE the fence check and the mnemonic load:
+    // when the restore marker carries a restore context, adopt its mnemonic
+    // (redoing the interrupted clear — which also lifts a stale fence — if
+    // it never completed). The marker itself stays until recovery is
+    // durable, so `establish_vss_state` below resumes silent recovery.
+    crate::restore::prepare_marker_resume(&storage_dir, &logger)?;
+
     // U3 (KTD-3): the durable fenced flag survives restarts and blocks the
     // start until the user wipes and restores — no automatic un-fence.
     if storage_dir.join(FENCED_FLAG_FILE_NAME).exists() {
@@ -303,6 +351,21 @@ pub(crate) fn build(
 
     // Built before `keys` is scrubbed; consumed by the VSS phase below.
     let vss_transport = make_vss_transport(config, &keys)?;
+
+    // U4: the marker voids local LDK state; without a VSS transport nothing
+    // can recover it, so booting (against a possibly-partial set) is refused.
+    if vss_transport.is_none()
+        && storage_dir
+            .join(crate::keys::RESTORE_IN_PROGRESS_FILE_NAME)
+            .exists()
+    {
+        log_error!(
+            logger,
+            "Restore marker present but VSS is disabled: the restore cannot resume; refusing \
+             to start"
+        );
+        return Err(BuildError::RestoreInProgress);
+    }
 
     let kv_store = Arc::new(FilesystemStore::new(storage_dir.join(KV_STORE_SUBDIR)));
 
@@ -519,12 +582,59 @@ pub(crate) fn build(
 
     // ChannelManager: restore if persisted, else fresh from genesis (the
     // initial sync below brings it to tip).
-    let channel_manager: Arc<ChannelManager> = match kv_store.read(
+    let cm_bytes = match kv_store.read(
         CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
         CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
         CHANNEL_MANAGER_PERSISTENCE_KEY,
     ) {
-        Ok(bytes) => {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(BuildError::ReadFailed),
+    };
+
+    // U4 integrity check, first half (the PWA's orphaned-monitors halt):
+    // monitors with no manager mean channels whose state is lost — starting
+    // fresh would silently discard channel funds.
+    if cm_bytes.is_none() && !channel_monitors.is_empty() {
+        log_error!(
+            logger,
+            "Found {} channel monitor(s) but no channel manager; refusing to start",
+            channel_monitors.len()
+        );
+        return Err(BuildError::OrphanedMonitors);
+    }
+
+    let make_fresh_manager = || -> Result<Arc<ChannelManager>, BuildError> {
+        let chain_params = ChainParameters {
+            network: config.network,
+            best_block: BestBlock::from_network(config.network),
+        };
+        let channel_manager = Arc::new(ChannelManager::new(
+            Arc::clone(&fee_estimator),
+            Arc::clone(&chain_monitor),
+            Arc::clone(&broadcaster),
+            Arc::clone(&router),
+            Arc::clone(&message_router),
+            Arc::clone(&logger),
+            Arc::clone(&keys_manager),
+            Arc::clone(&keys_manager),
+            Arc::clone(&signer_provider),
+            user_config.clone(),
+            chain_params,
+            cur_time.as_secs() as u32,
+        ));
+        // Persist immediately so the next start always takes the restore
+        // path, even if the background processor never got to run. Goes
+        // through the dual store: on a fresh VSS-enabled wallet this is
+        // the first remote CM write (version 0, authorized by the empty
+        // probe this session — KTD-3).
+        persist_channel_manager(&channel_manager, &dual_kv_store)?;
+        log_info!(logger, "Created fresh channel manager.");
+        Ok(channel_manager)
+    };
+
+    let channel_manager: Arc<ChannelManager> = match cm_bytes {
+        Some(bytes) => {
             let monitor_refs = channel_monitors
                 .iter()
                 .map(|(_, monitor)| monitor)
@@ -539,48 +649,61 @@ pub(crate) fn build(
                 Arc::clone(&router),
                 Arc::clone(&message_router),
                 Arc::clone(&logger),
-                user_config,
+                user_config.clone(),
                 monitor_refs,
             );
-            let (_block_hash, channel_manager) =
-                <(BlockHash, ChannelManager)>::read(&mut Cursor::new(bytes), read_args).map_err(
-                    |e| {
-                        log_error!(logger, "Failed to deserialize channel manager: {e}");
-                        BuildError::ReadFailed
-                    },
-                )?;
-            log_info!(logger, "Restored channel manager from disk.");
-            Arc::new(channel_manager)
+            match <(BlockHash, ChannelManager)>::read(&mut Cursor::new(bytes), read_args) {
+                Ok((_block_hash, channel_manager)) => {
+                    log_info!(logger, "Restored channel manager from disk.");
+                    let channel_manager = Arc::new(channel_manager);
+                    // U4 integrity check, second half (the missing mirror):
+                    // a manager referencing a funded channel with no local
+                    // monitor is a partial restore — hard halt, never a
+                    // silent start.
+                    let monitored: HashSet<ChannelId> = channel_monitors
+                        .iter()
+                        .map(|(_, monitor)| monitor.channel_id())
+                        .collect();
+                    let funded = channel_manager
+                        .list_channels()
+                        .into_iter()
+                        .filter(|details| details.funding_txo.is_some())
+                        .map(|details| details.channel_id);
+                    check_channel_monitor_coverage(funded, &monitored).inspect_err(|_| {
+                        log_error!(
+                            logger,
+                            "The channel manager references a funded channel with no local \
+                             monitor; refusing to start against a partial set"
+                        );
+                    })?;
+                    channel_manager
+                }
+                Err(e) if channel_monitors.is_empty() => {
+                    // U4 stale-manager defense (PWA init.ts parity): a CM
+                    // that fails deserialization with ZERO monitors (e.g. a
+                    // stale blob that survived a clear race) is discarded
+                    // for a fresh one — no channels means no funds at risk,
+                    // and crashing would brick the wallet.
+                    log_error!(
+                        logger,
+                        "Channel manager deserialization failed with no monitors ({e}); \
+                         discarding the stale manager and creating fresh"
+                    );
+                    let _ = kv_store.remove(
+                        CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+                        CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+                        CHANNEL_MANAGER_PERSISTENCE_KEY,
+                        false,
+                    );
+                    make_fresh_manager()?
+                }
+                Err(e) => {
+                    log_error!(logger, "Failed to deserialize channel manager: {e}");
+                    return Err(BuildError::ReadFailed);
+                }
+            }
         }
-        Err(e) if e.kind() == lightning::io::ErrorKind::NotFound => {
-            let chain_params = ChainParameters {
-                network: config.network,
-                best_block: BestBlock::from_network(config.network),
-            };
-            let channel_manager = Arc::new(ChannelManager::new(
-                Arc::clone(&fee_estimator),
-                Arc::clone(&chain_monitor),
-                Arc::clone(&broadcaster),
-                Arc::clone(&router),
-                Arc::clone(&message_router),
-                Arc::clone(&logger),
-                Arc::clone(&keys_manager),
-                Arc::clone(&keys_manager),
-                Arc::clone(&signer_provider),
-                user_config,
-                chain_params,
-                cur_time.as_secs() as u32,
-            ));
-            // Persist immediately so the next start always takes the restore
-            // path, even if the background processor never got to run. Goes
-            // through the dual store: on a fresh VSS-enabled wallet this is
-            // the first remote CM write (version 0, authorized by the empty
-            // probe this session — KTD-3).
-            persist_channel_manager(&channel_manager, &dual_kv_store)?;
-            log_info!(logger, "Created fresh channel manager.");
-            channel_manager
-        }
-        Err(_) => return Err(BuildError::ReadFailed),
+        None => make_fresh_manager()?,
     };
 
     // Initial chain sync of manager AND monitors — BEFORE watch_channel.
@@ -1171,6 +1294,26 @@ mod tests {
                 .join(crate::keys::RESTORE_IN_PROGRESS_FILE_NAME)
                 .exists(),
             "the marker clears after recovery is durable"
+        );
+    }
+
+    /// U4 integrity mirror: a funded channel without a monitor is the typed
+    /// hard halt; full coverage passes. (The wiring in `build` filters to
+    /// funded channels and feeds the loaded monitors' channel ids; the
+    /// end-to-end partial-restore path needs a real funded channel, which
+    /// only the U23 cross-client drill produces.)
+    #[test]
+    fn channel_monitor_coverage_check_halts_on_a_missing_monitor() {
+        let id_a = ChannelId([0xaa; 32]);
+        let id_b = ChannelId([0xbb; 32]);
+        let monitored: HashSet<ChannelId> = [id_a].into_iter().collect();
+
+        check_channel_monitor_coverage([id_a], &monitored).expect("full coverage passes");
+        check_channel_monitor_coverage([], &monitored)
+            .expect("monitors without funded channels are the orphan check's job, not this one");
+        assert_eq!(
+            check_channel_monitor_coverage([id_a, id_b], &monitored).unwrap_err(),
+            BuildError::MissingChannelMonitor
         );
     }
 

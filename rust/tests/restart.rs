@@ -208,14 +208,19 @@ fn kv_store_round_trips_under_ldk_persist_key_constants() {
     }
 }
 
+/// U4 stale-manager defense (PWA `init.ts` parity): a channel manager that
+/// fails deserialization while ZERO monitors exist (e.g. a stale CM that
+/// survived a clear race) is DISCARDED and replaced with a fresh manager —
+/// no channels means no funds at risk, and crashing would brick the wallet.
 #[test]
-fn corrupt_channel_manager_data_fails_start_with_typed_error() {
+fn corrupt_channel_manager_with_zero_monitors_is_discarded_for_a_fresh_one() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
 
-    // Create valid persisted state first.
+    // Create valid persisted state first (zero channels/monitors).
     let node = Node::new(config.clone());
     node.start().unwrap();
+    let node_id = node.node_id().unwrap();
     node.stop().unwrap();
     drop(node);
 
@@ -231,7 +236,46 @@ fn corrupt_channel_manager_data_fails_start_with_typed_error() {
         .unwrap();
 
     let node = Node::new(config);
-    assert_eq!(node.start().unwrap_err(), BuildError::ReadFailed);
+    node.start()
+        .expect("a stale CM with zero monitors must be discarded, not a crash");
+    assert!(node.is_running());
+    assert_eq!(
+        node.node_id().unwrap(),
+        node_id,
+        "the identity comes from the untouched mnemonic"
+    );
+    node.stop().unwrap();
+
+    // The garbage blob was replaced by a freshly persisted manager.
+    let replaced = store
+        .read(
+            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_KEY,
+        )
+        .unwrap();
+    assert_ne!(replaced, b"not a channel manager".to_vec());
+}
+
+/// U4: a restore marker with VSS disabled can never resume (the backup is
+/// unreachable), and local LDK state is void while the marker exists — so
+/// the start is refused even though a mnemonic is present. The node must
+/// never boot against a possibly-partial set.
+#[test]
+fn restore_marker_with_vss_disabled_refuses_start_even_with_a_mnemonic() {
+    let dir = tempfile::tempdir().unwrap();
+    // A valid mnemonic exists (BIP39 test vector #0)...
+    std::fs::write(
+        dir.path().join(MNEMONIC_FILE_NAME),
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon about",
+    )
+    .unwrap();
+    // ...but so does the restore marker: local state is void.
+    std::fs::write(dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME), b"").unwrap();
+
+    let node = Node::new(test_config(dir.path()));
+    assert_eq!(node.start().unwrap_err(), BuildError::RestoreInProgress);
     assert!(!node.is_running());
 }
 

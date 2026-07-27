@@ -200,6 +200,13 @@ impl PaymentStore {
         }
     }
 
+    /// Drops the in-memory rows. Called by U4's restore after it wiped the
+    /// store dir: the cached rows belong to the REPLACED wallet and must not
+    /// survive (or be re-persisted over) the restored one.
+    pub(crate) fn reset(&self) {
+        self.rows.lock().unwrap().clear();
+    }
+
     /// Serializes and writes one row under its payment id. Called under the
     /// rows lock, BEFORE the in-memory map is updated — memory never runs
     /// ahead of disk, so a failed persist leaves the row replayable.

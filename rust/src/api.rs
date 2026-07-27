@@ -19,6 +19,7 @@ use crate::keys::{self, KeysError};
 use crate::liquidity::Lsps2Error;
 use crate::node::Node;
 use crate::payment::SendError;
+use crate::restore::RestoreError;
 use crate::types::Logger;
 
 /// FFI-facing configuration. Network is fixed to mainnet; the mnemonic is
@@ -103,6 +104,19 @@ pub enum WalletError {
     Fenced,
     /// A mnemonic that is not a valid BIP39 English 12-word mnemonic (U1).
     InvalidMnemonic,
+    /// `restore()` found no backup on VSS for the entered words (U4, F3).
+    /// Local state was untouched.
+    NoBackupFound,
+    /// `restore()` found remote keys the backup's manifest cannot explain —
+    /// restoring could drop fund-safety state, so it aborted before any
+    /// write (U4).
+    BackupInconsistent { detail: String },
+    /// `restore()` failed for another reason (download, validation, or a
+    /// local write); `detail` says where. If the failure happened after the
+    /// durable marker was written, the next `start()` resumes the restore.
+    RestoreFailed { detail: String },
+    /// `reveal_mnemonic()` before any wallet exists.
+    NoMnemonic,
     /// `event_handled()` with no event pending — an ack without a handle.
     NoPendingEvent,
     /// The LSPS2 JIT flow failed; `reason` is the same distinct reason the
@@ -147,6 +161,16 @@ impl std::fmt::Display for WalletError {
                 f,
                 "the mnemonic is not a valid BIP39 English 12-word mnemonic"
             ),
+            // The PWA's Restore.tsx error copy, verbatim (R12 copy parity).
+            WalletError::NoBackupFound => write!(
+                f,
+                "No backup found for this wallet. Make sure you entered the correct seed phrase."
+            ),
+            WalletError::BackupInconsistent { detail } => {
+                write!(f, "backup inconsistent: {detail}")
+            }
+            WalletError::RestoreFailed { detail } => write!(f, "Restore failed: {detail}"),
+            WalletError::NoMnemonic => write!(f, "no wallet mnemonic exists yet"),
             WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
             WalletError::Lsps2 { reason } => write!(f, "LSPS2 request failed: {reason}"),
             WalletError::InvalidInvoice { detail } => {
@@ -191,6 +215,27 @@ impl From<KeysError> for WalletError {
         match error {
             KeysError::InvalidMnemonic => WalletError::InvalidMnemonic,
             other => WalletError::Startup {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<RestoreError> for WalletError {
+    fn from(error: RestoreError) -> Self {
+        match error {
+            RestoreError::NodeRunning => WalletError::AlreadyRunning,
+            RestoreError::InvalidMnemonic => WalletError::InvalidMnemonic,
+            RestoreError::NoBackupFound => WalletError::NoBackupFound,
+            RestoreError::BackupInconsistent { detail } => {
+                WalletError::BackupInconsistent { detail }
+            }
+            other @ (RestoreError::VssDisabled
+            | RestoreError::Setup { .. }
+            | RestoreError::DownloadFailed { .. }
+            | RestoreError::ValidationFailed { .. }
+            | RestoreError::LocalWriteFailed { .. }
+            | RestoreError::Interrupted) => WalletError::RestoreFailed {
                 detail: other.to_string(),
             },
         }
@@ -399,6 +444,23 @@ impl Wallet {
             .ack()
             .map(|_| ())
             .ok_or(WalletError::NoPendingEvent)
+    }
+
+    /// Replaces the current wallet with the one the entered 12 words back up
+    /// on VSS (U4, F3: the destructive confirm lives in the shells). Valid
+    /// only while stopped ([`WalletError::AlreadyRunning`] otherwise).
+    /// Blocking (backup downloads): call from a background dispatcher;
+    /// progress arrives as [`Event::RestoreProgress`] with the PWA's exact
+    /// step copy. On success the node is restartable via `start()`.
+    pub fn restore(&self, mnemonic: String) -> Result<(), WalletError> {
+        self.node.restore(&mnemonic).map_err(WalletError::from)
+    }
+
+    /// The stored 12 words for the Backup screen (U4, R1 reveal half — the
+    /// 60-second auto-hide is UI policy in the shells). Readable while
+    /// stopped; [`WalletError::NoMnemonic`] before the first start.
+    pub fn reveal_mnemonic(&self) -> Result<String, WalletError> {
+        self.node.reveal_mnemonic().ok_or(WalletError::NoMnemonic)
     }
 
     /// Current balances; requires a running node.

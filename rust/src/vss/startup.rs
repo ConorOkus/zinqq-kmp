@@ -10,9 +10,11 @@
 //!    probe `listKeyVersions`.
 //!    - Empty → fresh wallet. Version-0 first writes are permitted ONLY
 //!      because the probe returned empty this session (`probe_empty`).
-//!    - Non-empty → **silent recovery**: manifest → monitors (validated by
-//!      deserialization BEFORE any local write) → channel manager → known
-//!      peers → local writes. ANY failure rolls back the partial local
+//!    - Non-empty → **silent recovery** via U4's shared engine
+//!      (`crate::restore`): manifest → chunked parallel monitor downloads →
+//!      channel manager → known peers, EVERY blob validated by
+//!      deserialization BEFORE any local write, then ordered local writes
+//!      (CM before monitors — F3). ANY failure rolls back the partial local
 //!      writes and is FATAL ([`BuildError::VssRecoveryFailed`]) — never a
 //!      fall-through to fresh-wallet writes over an existing backup.
 //! 2. **Local data + empty namespace** → migration: ONE transactional
@@ -28,7 +30,6 @@
 //!    error ([`BuildError::VssVersionSeedFailed`]).
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -41,17 +42,13 @@ use lightning::util::persist::{
     CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
     CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
 };
-use lightning::util::ser::ReadableArgs;
 use lightning::{log_error, log_info};
 use lightning_persister::fs_store::FilesystemStore;
 
-use super::known_peers::{
-    parse_known_peers, read_local_known_peers, serialize_known_peers, write_local_known_peers,
-    KNOWN_PEERS_LOCAL_KEY, KNOWN_PEERS_PRIMARY_NAMESPACE, KNOWN_PEERS_SECONDARY_NAMESPACE,
-};
+use super::known_peers::{read_local_known_peers, serialize_known_peers};
 use super::store::{
-    monitor_vss_key, parse_monitor_manifest, VssTransport, CHANNEL_MANAGER_VSS_KEY,
-    KNOWN_PEERS_VSS_KEY, MONITOR_MANIFEST_KEY,
+    monitor_vss_key, VssTransport, CHANNEL_MANAGER_VSS_KEY, KNOWN_PEERS_VSS_KEY,
+    MONITOR_MANIFEST_KEY,
 };
 use crate::builder::BuildError;
 use crate::keys::RESTORE_IN_PROGRESS_FILE_NAME;
@@ -343,11 +340,14 @@ pub(crate) fn establish_vss_state(
     }
 }
 
-/// Silent recovery (branch 1, non-empty namespace): download manifest →
-/// monitors (validate by deserialization BEFORE any local write) → channel
-/// manager → known peers → local writes. ANY failure rolls back the partial
-/// local writes and returns [`BuildError::VssRecoveryFailed`] — never a
-/// fall-through to fresh-wallet writes.
+/// Silent recovery (branch 1, non-empty namespace), delegating the
+/// download/validate/write mechanics to U4's shared restore engine
+/// (`crate::restore`): manifest → chunked parallel monitor downloads within
+/// the shared time budget, EVERY blob validated by deserialization BEFORE
+/// any local write → ordered local writes (CM before monitors, monitors,
+/// peers). ANY failure rolls back the partial local writes and returns
+/// [`BuildError::VssRecoveryFailed`] — never a fall-through to fresh-wallet
+/// writes.
 fn silent_recovery(
     transport: Arc<dyn VssTransport>,
     kv_store: &Arc<FilesystemStore>,
@@ -356,144 +356,52 @@ fn silent_recovery(
     logger: &Arc<Logger>,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<VssStartupState, BuildError> {
-    let mut written_monitor_keys: Vec<String> = Vec::new();
-    let mut wrote_channel_manager = false;
-    let mut wrote_peers = false;
-
-    let mut recover = || -> Result<VssStartupState, String> {
-        let mut versions = HashMap::new();
-        let mut monitor_keys = BTreeSet::new();
-
-        let manifest = runtime
-            .block_on(transport.get(MONITOR_MANIFEST_KEY))
-            .map_err(|e| format!("manifest download failed: {e}"))?;
-        let cm = runtime
-            .block_on(transport.get(CHANNEL_MANAGER_VSS_KEY))
-            .map_err(|e| format!("channel_manager download failed: {e}"))?;
-
-        let manifest_keys = match &manifest {
-            Some((bytes, version)) => {
-                let keys = parse_monitor_manifest(bytes)?;
-                versions.insert(MONITOR_MANIFEST_KEY.to_string(), *version);
-                keys
-            }
-            None => Vec::new(),
-        };
-        if !manifest_keys.is_empty() && cm.is_none() {
-            return Err(
-                "backup inconsistent: monitors present remotely but channel_manager missing"
-                    .to_string(),
-            );
-        }
-
-        for vss_key in &manifest_keys {
-            let (bytes, version) = runtime
-                .block_on(transport.get(vss_key))
-                .map_err(|e| format!("monitor {vss_key} download failed: {e}"))?
-                .ok_or_else(|| {
-                    format!("monitor \"{vss_key}\" listed in manifest but missing from VSS")
-                })?;
-            // Validate by deserialization BEFORE the local write (R4).
-            let (_block_hash, monitor) = <(BlockHash, ChannelMonitor<InMemorySigner>)>::read(
-                &mut Cursor::new(&bytes),
-                (&**keys_manager, &**signer_provider),
-            )
-            .map_err(|e| format!("monitor \"{vss_key}\" from VSS failed deserialization: {e:?}"))?;
-            let local_key = monitor.persistence_key().to_string();
-            kv_store
-                .write(
-                    CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
-                    CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
-                    &local_key,
-                    bytes,
-                )
-                .map_err(|e| format!("local write of monitor {local_key} failed: {e}"))?;
-            written_monitor_keys.push(local_key);
-            versions.insert(vss_key.clone(), version);
-            monitor_keys.insert(vss_key.clone());
-        }
-
-        if let Some((cm_bytes, cm_version)) = &cm {
-            // PWA sanity floor for a serialized ChannelManager; the full
-            // deserialization happens in the build right after this phase.
-            if cm_bytes.len() < 32 {
-                return Err(format!(
-                    "channel_manager from VSS is too small ({} bytes) — likely corrupt",
-                    cm_bytes.len()
-                ));
-            }
-            kv_store
-                .write(
-                    CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-                    CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-                    CHANNEL_MANAGER_PERSISTENCE_KEY,
-                    cm_bytes.clone(),
-                )
-                .map_err(|e| format!("local write of channel_manager failed: {e}"))?;
-            wrote_channel_manager = true;
-            versions.insert(CHANNEL_MANAGER_VSS_KEY.to_string(), *cm_version);
-        }
-
-        if let Some((bytes, version)) = runtime
-            .block_on(transport.get(KNOWN_PEERS_VSS_KEY))
-            .map_err(|e| format!("known-peers download failed: {e}"))?
-        {
-            let peers = parse_known_peers(&bytes)?;
-            write_local_known_peers(kv_store, &peers)
-                .map_err(|e| format!("local write of known peers failed: {e}"))?;
-            wrote_peers = true;
-            versions.insert(KNOWN_PEERS_VSS_KEY.to_string(), version);
-        }
-
-        log_info!(
-            Logger,
-            "Silent recovery complete: {} monitor(s), channel_manager: {}, peers: {}",
-            manifest_keys.len(),
-            cm.is_some(),
-            wrote_peers
-        );
-        Ok(VssStartupState {
-            remote: Some(Arc::clone(&transport)),
-            versions,
-            monitor_keys,
-            probe_empty: false,
-            recovered: true,
-        })
-    };
-
-    match recover() {
-        Ok(state) => Ok(state),
+    let plan = runtime.block_on(async {
+        let manifest = crate::restore::fetch_manifest(&*transport).await?;
+        crate::restore::download_and_validate(
+            &transport,
+            manifest,
+            keys_manager,
+            signer_provider,
+            crate::restore::RESTORE_DOWNLOAD_BUDGET,
+        )
+        .await
+    });
+    let plan = match plan {
+        Ok(plan) => plan,
         Err(e) => {
             log_error!(
                 logger,
-                "Silent recovery against a non-empty namespace FAILED ({e}); rolling back \
-                 partial local writes and refusing to start (never fresh-over-backup)"
+                "Silent recovery against a non-empty namespace FAILED ({e}); refusing to start \
+                 (never fresh-over-backup)"
             );
-            for local_key in &written_monitor_keys {
-                let _ = kv_store.remove(
-                    CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
-                    CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
-                    local_key,
-                    false,
-                );
-            }
-            if wrote_channel_manager {
-                let _ = kv_store.remove(
-                    CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
-                    CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
-                    CHANNEL_MANAGER_PERSISTENCE_KEY,
-                    false,
-                );
-            }
-            if wrote_peers {
-                let _ = kv_store.remove(
-                    KNOWN_PEERS_PRIMARY_NAMESPACE,
-                    KNOWN_PEERS_SECONDARY_NAMESPACE,
-                    KNOWN_PEERS_LOCAL_KEY,
-                    false,
-                );
-            }
-            Err(BuildError::VssRecoveryFailed)
+            return Err(BuildError::VssRecoveryFailed);
         }
+    };
+
+    let mut write_log = Vec::new();
+    if let Err(e) = crate::restore::write_plan_local(kv_store, &plan, &mut write_log, false) {
+        log_error!(
+            logger,
+            "Silent recovery local writes FAILED ({e}); rolling back the partial writes and \
+             refusing to start (never fresh-over-backup)"
+        );
+        crate::restore::rollback_local_writes(kv_store, &write_log);
+        return Err(BuildError::VssRecoveryFailed);
     }
+
+    log_info!(
+        logger,
+        "Silent recovery complete: {} monitor(s), channel_manager: {}, peers: {}",
+        plan.monitors.len(),
+        plan.cm.is_some(),
+        plan.peers.is_some()
+    );
+    Ok(VssStartupState {
+        versions: plan.versions(),
+        monitor_keys: plan.monitor_keys(),
+        remote: Some(transport),
+        probe_empty: false,
+        recovered: true,
+    })
 }

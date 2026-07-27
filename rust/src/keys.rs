@@ -154,7 +154,10 @@ pub(crate) fn write_mnemonic(storage_dir: &Path, mnemonic: &Mnemonic) -> Result<
     use std::io::Write as _;
     let mut file = file;
     file.write_all(mnemonic.to_string().as_bytes())
-        .map_err(|_| KeysError::WriteFailed)
+        .map_err(|_| KeysError::WriteFailed)?;
+    // Durable before it participates in U4's two-phase restore ordering
+    // (mnemonic must be on disk before the restore marker is removed).
+    file.sync_all().map_err(|_| KeysError::WriteFailed)
 }
 
 /// Loads the wallet mnemonic, generating and persisting a fresh one on first

@@ -95,8 +95,8 @@ pub(crate) enum CoreEvent {
     /// Force-close recovery state changed (fired by U10).
     #[allow(dead_code)] // Placeholder until U10 fires it.
     RecoveryStateChanged,
-    /// Restore-from-seed progress (fired by U4's restore flow).
-    #[allow(dead_code)] // Placeholder until U4's restore flow fires it.
+    /// Restore-from-seed progress (U4): the step strings match the PWA's
+    /// Restore.tsx copy exactly.
     RestoreProgress { step: String },
 }
 
@@ -547,6 +547,39 @@ impl Node {
         components.peer_manager.disconnect_all_peers();
         runtime.shutdown_timeout(Duration::from_secs(5));
         persist_res
+    }
+
+    /// Replaces this wallet with the one the entered 12 words back up on VSS
+    /// (U4, F3, R1 restore half / R4). Valid ONLY from the stopped state: the
+    /// node's state lock is held for the whole flow so no concurrent
+    /// `start()` can boot mid-restore, and the engine additionally takes the
+    /// data-dir lock against other processes. Blocking (network downloads):
+    /// call from a background dispatcher; progress arrives as
+    /// `RestoreProgress` events with the PWA's exact step copy.
+    ///
+    /// Everything before the two-phase write leaves local state untouched
+    /// (typed [`RestoreError`]s); once the durable marker is written, any
+    /// interruption resumes on the next `start()`.
+    pub fn restore(&self, mnemonic: &str) -> Result<(), crate::restore::RestoreError> {
+        let state_lock = self.state.lock().unwrap();
+        if state_lock.is_some() {
+            return Err(crate::restore::RestoreError::NodeRunning);
+        }
+        crate::restore::run_restore(&self.config, mnemonic, &*self.event_sink, None)?;
+        // The store dir was replaced wholesale; drop the in-memory rows the
+        // payment store cached from the OLD wallet.
+        self.payment_store.reset();
+        Ok(())
+    }
+
+    /// The stored 12 words for the Backup screen (U4, R1). `None` when no
+    /// mnemonic exists yet or the file does not parse.
+    pub fn reveal_mnemonic(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(
+            PathBuf::from(&self.config.storage_dir).join(crate::keys::MNEMONIC_FILE_NAME),
+        )
+        .ok()?;
+        Some(crate::keys::parse_mnemonic(&raw).ok()?.to_string())
     }
 
     /// Whether the node is currently running.
