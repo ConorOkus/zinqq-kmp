@@ -83,7 +83,7 @@ struct AppShell: View {
             // Home is the stack root, never pushed; unreachable.
             HomeScreen(model: model, onNavigate: navigate)
         case .receive:
-            PlaceholderScreen(title: "Receive", route: route, onNavigate: navigate)
+            ReceiveScreen(port: model, onClose: { navigate(.home) })
         case .send:
             SendScreen(
                 port: model,

@@ -20,7 +20,8 @@ enum WalletEvent {
     case syncFailed
     case syncCompleted
     case invoiceReady(bolt11: String, expiryUnixSecs: UInt64)
-    case paymentReceived(amountMsat: UInt64, skimmedFeeMsat: UInt64?)
+    /// `paymentHash` lets the Receive visit settle only on ITS invoice (U21).
+    case paymentReceived(paymentHash: String, amountMsat: UInt64, skimmedFeeMsat: UInt64?)
     case paymentSuccessful
     case paymentFailed(reason: String)
     case channelPending
@@ -52,7 +53,11 @@ enum WalletEvent {
             return .invoiceReady(bolt11: e.bolt11, expiryUnixSecs: e.expiryUnixSecs)
         case let e as Event.PaymentReceived:
             // skimmed_fee_msat is Option<u64> in Rust, so it arrives as KotlinULong?
-            return .paymentReceived(amountMsat: e.amountMsat, skimmedFeeMsat: e.skimmedFeeMsat?.uint64Value)
+            return .paymentReceived(
+                paymentHash: e.paymentHash,
+                amountMsat: e.amountMsat,
+                skimmedFeeMsat: e.skimmedFeeMsat?.uint64Value
+            )
         case is Event.PaymentSuccessful:
             return .paymentSuccessful
         case let e as Event.PaymentFailed:
@@ -457,7 +462,7 @@ final class WalletModel: ObservableObject {
             syncBanner = nil
         case let .invoiceReady(bolt11, expiryUnixSecs):
             currentInvoice = Invoice(bolt11: bolt11, expiryUnixSecs: expiryUnixSecs)
-        case let .paymentReceived(amountMsat, skimmedFeeMsat):
+        case let .paymentReceived(_, amountMsat, skimmedFeeMsat):
             // Optimistic bookkeeping; the triggered refreshWalletData()
             // overwrites it with the authoritative balances() snapshot.
             balanceMsat += amountMsat
@@ -653,5 +658,64 @@ extension WalletModel: SendPort {
     func onchainBalanceSats() -> UInt64 {
         guard let balances else { return 0 }
         return balances.onchainTotalSats - balances.onchainUntrustedPendingSats
+    }
+}
+
+// MARK: - ReceivePort (U21, R14)
+
+/// Thin passthroughs to the core's receive FFI, mirroring Android's
+/// `WalletHolder` ReceivePort section: the capacity decision, live floor,
+/// quote/buy protocol, and expiry clamp all live in Rust; blocking calls hop
+/// off the MainActor via `runBlockingFFI`. `walletEvents` (shared with
+/// SendPort) already satisfies the protocol's event stream.
+extension WalletModel: ReceivePort {
+    func receiveBundle(amountMsat: UInt64?) async throws -> ReceiveBundle {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.receiveBundle(
+                amountMsat: amountMsat.map { KotlinULong(unsignedLongLong: $0) }
+            )
+        }
+    }
+
+    func jitQuote(amountMsat: UInt64) async throws -> JitQuote {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.jitQuote(amountMsat: amountMsat)
+        }
+    }
+
+    func jitAccept(quoteToken: UInt64, amountMsat: UInt64) async throws -> JitInvoice {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.jitAccept(quoteToken: quoteToken, amountMsat: amountMsat)
+        }
+    }
+
+    func minReceiveSats(refresh: Bool) async throws -> UInt64 {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            wallet.minReceiveSats(refresh: refresh)
+        }
+    }
+
+    func usableInboundMsat() async throws -> UInt64 {
+        let wallet = try requireWallet()
+        let channels = try await Self.runBlockingFFI { try wallet.listChannels() }
+        return sumUsableInboundMsat(channels)
+    }
+
+    func buildUnifiedUri(
+        address: String,
+        amountSats: UInt64?,
+        invoice: String?
+    ) async throws -> String {
+        try await Self.runBlockingFFI {
+            Wallet_core_nativeKt.buildBip321Uri(
+                address: address,
+                amountSats: amountSats.map { KotlinULong(unsignedLongLong: $0) },
+                invoice: invoice
+            )
+        }
     }
 }

@@ -10,7 +10,9 @@ import XCTest
 final class RefreshTriggerTests: XCTestCase {
     func testSettlementAndStateChangeEventsTriggerARefresh() {
         XCTAssertTrue(
-            shouldRefreshWalletData(.paymentReceived(amountMsat: 1_000, skimmedFeeMsat: nil))
+            shouldRefreshWalletData(
+                .paymentReceived(paymentHash: "hash", amountMsat: 1_000, skimmedFeeMsat: nil)
+            )
         )
         XCTAssertTrue(shouldRefreshWalletData(.paymentSuccessful))
         XCTAssertTrue(shouldRefreshWalletData(.channelReady))
