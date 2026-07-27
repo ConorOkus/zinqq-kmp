@@ -47,6 +47,12 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     // QR rendering only: the BOLT11 string goes in, pixels come out (R4).
     implementation(libs.zxing.core)
+    // U15 Scan: CameraX preview + MLKit QR-only analyzer (R13).
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+    implementation(libs.androidx.camera.mlkit.vision)
+    implementation(libs.mlkit.barcode.scanning)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test)

@@ -9,13 +9,25 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import uniffi.wallet_core.ClassifiedView
+import uniffi.wallet_core.Event
+import uniffi.wallet_core.FeeEstimate
+import uniffi.wallet_core.LnurlPayView
+import uniffi.wallet_core.MaxSendEstimate
+import uniffi.wallet_core.ResolvedView
 import uniffi.wallet_core.Wallet
 import uniffi.wallet_core.WalletException
+import zinqq.app.screens.send.SendPort
 import zinqq.app.theme.AppearanceMode
 import zinqq.app.theme.SettingsRepository
 import zinqq.spike.WalletCore
@@ -47,7 +59,7 @@ import zinqq.spike.WalletCore
 class WalletHolder(
     context: Context,
     private val settings: SettingsRepository,
-) : DefaultLifecycleObserver {
+) : DefaultLifecycleObserver, SendPort {
     // App-private filesDir (NOT cache, which the OS may purge): holds the seed,
     // channel monitors, and the storage lock, and is the directory
     // data_extraction_rules.xml excludes from backup and device transfer (R6).
@@ -66,6 +78,16 @@ class WalletHolder(
         UiState(appearanceMode = settings.appearanceModeBlocking()),
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
+
+    // U15: live rebroadcast of core events so the send flow can await its
+    // payment outcome (F1). No replay — a subscriber must exist before the
+    // dispatch it cares about; DROP_OLDEST so the event loop never blocks on
+    // a slow collector (the durable queue in the core is the real record).
+    private val _events = MutableSharedFlow<Event>(
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    override val walletEvents: Flow<Event> = _events.asSharedFlow()
 
     private var loopJob: Job? = null
 
@@ -180,15 +202,59 @@ class WalletHolder(
         }
     }
 
-    fun sendPayment(bolt11: String) {
-        scope.launch {
-            try {
-                wallet.send(bolt11.trim())
-            } catch (e: Exception) {
-                _state.update { it.copy(lastOutcome = "Send failed: ${e.message}") }
-            }
-        }
+    // ------------------------------------------------------------------
+    // SendPort (U15, R14): thin passthroughs to the core's send FFI. All
+    // blocking calls hop to IO; `resolveInput`/`fetchLnurlInvoice` are
+    // already suspend bindings polled by the foreign executor.
+    // ------------------------------------------------------------------
+
+    override suspend fun classify(input: String): ClassifiedView =
+        withContext(Dispatchers.IO) { wallet.classifyInput(input) }
+
+    override suspend fun resolve(input: String): ResolvedView = wallet.resolveInput(input)
+
+    override suspend fun fetchLnurlInvoice(
+        lnurl: LnurlPayView,
+        amountMsat: ULong,
+    ): ClassifiedView = wallet.fetchLnurlInvoice(lnurl, amountMsat)
+
+    override suspend fun sendBolt11(bolt11: String, amountMsat: ULong?) =
+        withContext(Dispatchers.IO) { wallet.sendBolt11(bolt11, amountMsat) }
+
+    override suspend fun payOffer(offer: String, amountMsat: ULong?) =
+        withContext(Dispatchers.IO) { wallet.payOffer(offer, amountMsat, payerNote = null) }
+
+    override suspend fun estimateOnchainFee(address: String, amountSats: ULong): FeeEstimate =
+        withContext(Dispatchers.IO) { wallet.estimateOnchainFee(address, amountSats) }
+
+    override suspend fun estimateMaxSendable(address: String): MaxSendEstimate =
+        withContext(Dispatchers.IO) { wallet.estimateMaxSendable(address) }
+
+    override suspend fun sendOnchain(
+        address: String,
+        amountSats: ULong,
+        expectedAmountSats: ULong,
+        expectedFeeSats: ULong,
+    ): String = withContext(Dispatchers.IO) {
+        wallet.sendOnchain(address, amountSats, expectedAmountSats, expectedFeeSats)
     }
+
+    override suspend fun sendOnchainMax(
+        address: String,
+        expectedAmountSats: ULong,
+        expectedFeeSats: ULong,
+    ): String = withContext(Dispatchers.IO) {
+        wallet.sendOnchainMax(address, expectedAmountSats, expectedFeeSats)
+    }
+
+    override fun lightningCapacityMsat(): ULong =
+        _state.value.balances?.lightningMsat ?: 0uL
+
+    // The PWA's onchainBalance is confirmed + trusted pending
+    // (`Send.tsx:164-165`) = total − untrusted pending, both core-computed.
+    override fun onchainBalanceSats(): ULong =
+        _state.value.balances?.let { it.onchainTotalSats - it.onchainUntrustedPendingSats }
+            ?: 0uL
 
     private fun startNode() {
         // Still active while a just-stopped loop drains its terminal
@@ -222,6 +288,9 @@ class WalletHolder(
             // terminal NodeStopped pushed by stop() (KTD-8).
             WalletCore.runEventLoop(wallet) { event ->
                 _state.update { reduce(it, event) }
+                // Rebroadcast AFTER the reduce so subscribers (the send
+                // flow's outcome await, U15) observe state and event in order.
+                _events.emit(event)
                 if (shouldRefreshWalletData(event)) refreshWalletData()
             }
         }

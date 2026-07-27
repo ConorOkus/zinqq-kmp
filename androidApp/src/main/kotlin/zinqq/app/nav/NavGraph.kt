@@ -26,8 +26,13 @@ import zinqq.app.screens.HomeScreen
 import zinqq.app.screens.PlaceholderScreen
 import zinqq.app.screens.RecoverFundsScreen
 import zinqq.app.screens.TransactionDetailScreen
+import zinqq.app.screens.scan.ScanScreen
+import zinqq.app.screens.send.SendScreen
 import zinqq.app.theme.ZinqqDimens
 import zinqq.app.theme.ZinqqTheme
+
+/** Saved-state key carrying a scan's raw decode into the Send entry (R13). */
+const val SCANNED_INPUT_KEY = "scannedInput"
 
 /**
  * Navigation shell (U13, KTD-11, R12): the PWA's `Layout` — a centered
@@ -133,11 +138,35 @@ private fun ZinqqNavHost(
         composable(Route.Receive.pattern) {
             PlaceholderScreen("Receive", backFor(Route.Receive))
         }
-        composable(Route.Send.pattern) {
-            PlaceholderScreen("Send", backFor(Route.Send))
+        composable(Route.Send.pattern) { entry ->
+            // The scanned raw string travels like the PWA's location.state
+            // (Scan.tsx:60 / Send.tsx:608-620): entry-scoped, consumed once,
+            // and re-classified from scratch — never a parsed object (R13/R14).
+            val scanned = androidx.compose.runtime.remember(entry) {
+                entry.savedStateHandle.remove<String>(SCANNED_INPUT_KEY)
+            }
+            SendScreen(
+                port = holder,
+                scannedInput = scanned,
+                onDone = { navController.navigateTo(Route.Home) },
+                onBackToHome = { navController.navigateTo(Route.Home) },
+            )
         }
         composable(Route.Scan.pattern) {
-            PlaceholderScreen("Scan", backFor(Route.Scan))
+            ScanScreen(
+                port = holder,
+                onScanned = { raw ->
+                    // Replace Scan with Send (popUpTo) and hand over the raw
+                    // string via the Send entry's saved state.
+                    navController.navigate(Route.Send.pattern) {
+                        launchSingleTop = true
+                        popUpTo(Route.Scan.pattern) { inclusive = true }
+                    }
+                    navController.getBackStackEntry(Route.Send.pattern)
+                        .savedStateHandle[SCANNED_INPUT_KEY] = raw
+                },
+                onClose = { navController.navigateTo(Route.Scan.backTo ?: Route.Home) },
+            )
         }
         composable(Route.Activity.pattern) {
             ActivityScreen(
