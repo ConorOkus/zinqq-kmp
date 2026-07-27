@@ -181,12 +181,14 @@ version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c99821af39c7df004bd411ece2ef22d9fba5a631b4489f3d9a0ac0d19637e2d0"
 dependencies = [
+ "anyhow",
  "bdk_chain",
  "bitcoin",
  "miniscript",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

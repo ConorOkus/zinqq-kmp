@@ -18,6 +18,7 @@ use crate::history::{ActivityRow, PersistedPayment};
 use crate::keys::{self, KeysError};
 use crate::liquidity::Lsps2Error;
 use crate::node::Node;
+use crate::onchain_send::{FeeEstimate, MaxSendEstimate, OnchainSendError};
 use crate::payment::SendError;
 use crate::restore::RestoreError;
 use crate::types::Logger;
@@ -138,6 +139,25 @@ pub enum WalletError {
     /// The send attempt failed (e.g. no route); `reason` is the same distinct
     /// reason the corresponding [`Event::PaymentFailed`] carries.
     SendFailed { reason: String },
+    /// An on-chain address that failed to parse at all (U8).
+    InvalidAddress { detail: String },
+    /// An on-chain address for a different network (U8; PWA copy).
+    WrongAddressNetwork,
+    /// The on-chain fee estimate exceeds the 50,000-sat ceiling (U8/KTD-9;
+    /// PWA "try again later" copy).
+    OnchainFeesTooHigh,
+    /// A send-all cannot clear the recipient's dust floor after fees (U8;
+    /// PWA copy).
+    OnchainBalanceTooLow,
+    /// The tx built at the broadcast boundary differs from the reviewed
+    /// amounts — the R5 drift guard; shells re-render "Amounts were updated".
+    OnchainAmountChanged,
+    /// amount + fee + anchor reserve exceed the spendable balance (U8, R7).
+    OnchainInsufficientFunds { reserve_sats: u64 },
+    /// The requested amount is below the recipient script's dust floor (U8).
+    OnchainAmountBelowDust { min_sats: u64 },
+    /// The on-chain tx could not be built or signed (U8); `detail` says why.
+    OnchainSendFailed { detail: String },
 }
 
 impl std::fmt::Display for WalletError {
@@ -190,6 +210,41 @@ impl std::fmt::Display for WalletError {
                 write!(f, "a payment for this invoice is already pending")
             }
             WalletError::SendFailed { reason } => write!(f, "sending failed: {reason}"),
+            // U8: the on-chain errors reuse the core engine's PWA-parity copy.
+            WalletError::InvalidAddress { detail } => {
+                write!(
+                    f,
+                    "{}",
+                    OnchainSendError::InvalidAddress {
+                        detail: detail.clone()
+                    }
+                )
+            }
+            WalletError::WrongAddressNetwork => write!(f, "{}", OnchainSendError::WrongNetwork),
+            WalletError::OnchainFeesTooHigh => write!(f, "{}", OnchainSendError::FeeTooHigh),
+            WalletError::OnchainBalanceTooLow => write!(f, "{}", OnchainSendError::BalanceTooLow),
+            WalletError::OnchainAmountChanged => write!(f, "{}", OnchainSendError::DriftDetected),
+            WalletError::OnchainInsufficientFunds { reserve_sats } => {
+                write!(
+                    f,
+                    "{}",
+                    OnchainSendError::InsufficientFunds {
+                        reserve_sats: *reserve_sats
+                    }
+                )
+            }
+            WalletError::OnchainAmountBelowDust { min_sats } => {
+                write!(
+                    f,
+                    "{}",
+                    OnchainSendError::AmountBelowDust {
+                        min_sats: *min_sats
+                    }
+                )
+            }
+            WalletError::OnchainSendFailed { detail } => {
+                write!(f, "on-chain send failed: {detail}")
+            }
         }
     }
 }
@@ -238,6 +293,29 @@ impl From<RestoreError> for WalletError {
             | RestoreError::Interrupted) => WalletError::RestoreFailed {
                 detail: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<OnchainSendError> for WalletError {
+    fn from(error: OnchainSendError) -> Self {
+        match error {
+            OnchainSendError::NotRunning => WalletError::NotRunning,
+            OnchainSendError::InvalidAddress { detail } => WalletError::InvalidAddress { detail },
+            OnchainSendError::WrongNetwork => WalletError::WrongAddressNetwork,
+            OnchainSendError::FeeTooHigh => WalletError::OnchainFeesTooHigh,
+            OnchainSendError::BalanceTooLow => WalletError::OnchainBalanceTooLow,
+            OnchainSendError::DriftDetected => WalletError::OnchainAmountChanged,
+            OnchainSendError::InsufficientFunds { reserve_sats } => {
+                WalletError::OnchainInsufficientFunds { reserve_sats }
+            }
+            OnchainSendError::AmountBelowDust { min_sats } => {
+                WalletError::OnchainAmountBelowDust { min_sats }
+            }
+            OnchainSendError::BuildFailed { detail }
+            | OnchainSendError::SigningFailed { detail } => {
+                WalletError::OnchainSendFailed { detail }
+            }
         }
     }
 }
@@ -503,6 +581,74 @@ impl Wallet {
     /// while the node is stopped.
     pub fn payment_detail(&self, payment_id: String) -> Option<PersistedPayment> {
         self.node.payment_detail(&payment_id)
+    }
+
+    /// Fee estimate for an exact-amount on-chain send (U8, R7): builds the
+    /// tx at the 6-block rate (clamped >= 2 sat/vB, KTD-9) without
+    /// broadcasting; a fee above 50,000 sats is
+    /// [`WalletError::OnchainFeesTooHigh`]. Requires a running node.
+    pub fn estimate_onchain_fee(
+        &self,
+        address: String,
+        amount_sats: u64,
+    ) -> Result<FeeEstimate, WalletError> {
+        self.node
+            .estimate_onchain_fee(&address, amount_sats)
+            .map_err(WalletError::from)
+    }
+
+    /// Max-sendable estimate for the given recipient (U8, R7): the drain
+    /// amount after fees and the 10,000-sat anchor reserve (withheld iff at
+    /// least one channel is open). Requires a running node.
+    pub fn estimate_max_sendable(&self, address: String) -> Result<MaxSendEstimate, WalletError> {
+        self.node
+            .estimate_max_sendable(&address)
+            .map_err(WalletError::from)
+    }
+
+    /// Exact-amount on-chain send (U8, R7): amount + fee + reserve must fit
+    /// in the spendable balance; `expected_amount_sats`/`expected_fee_sats`
+    /// are the review-screen values, re-verified at the broadcast boundary —
+    /// any change is [`WalletError::OnchainAmountChanged`] (R5 drift guard).
+    /// Returns the txid; the persist-first broadcaster owns delivery
+    /// (U12/KTD-9). On-chain history rows arrive via `list_activity` from
+    /// the wallet's transactions, exactly like the PWA.
+    pub fn send_onchain(
+        &self,
+        address: String,
+        amount_sats: u64,
+        expected_amount_sats: u64,
+        expected_fee_sats: u64,
+    ) -> Result<String, WalletError> {
+        self.node
+            .send_onchain(
+                &address,
+                amount_sats,
+                expected_amount_sats,
+                expected_fee_sats,
+            )
+            .map_err(WalletError::from)
+    }
+
+    /// On-chain send-max (U8, AE6): drains fully at zero channels; with
+    /// channels exactly 10,000 sats remain as an explicit reserve output.
+    /// The same drift guard applies. Returns the txid.
+    pub fn send_onchain_max(
+        &self,
+        address: String,
+        expected_amount_sats: u64,
+        expected_fee_sats: u64,
+    ) -> Result<String, WalletError> {
+        self.node
+            .send_onchain_max(&address, expected_amount_sats, expected_fee_sats)
+            .map_err(WalletError::from)
+    }
+
+    /// Next unused on-chain receive address (U8): revealed on the external
+    /// keychain with the changeset persisted, so a restart keeps the index.
+    /// Requires a running node.
+    pub fn next_receive_address(&self) -> Result<String, WalletError> {
+        self.node.next_receive_address().map_err(WalletError::from)
     }
 }
 

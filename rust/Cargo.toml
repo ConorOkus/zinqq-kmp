@@ -58,6 +58,9 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# U8 tests fund bdk wallets offline via bdk's own insert_tx/insert_checkpoint
+# harness (feature-gated); test builds only.
+bdk_wallet = { version = "2.4.0", features = ["test-utils"] }
 
 [profile.release]
 opt-level = "z"

@@ -16,6 +16,7 @@ pub mod keys;
 pub mod liquidity;
 mod lock;
 pub mod node;
+pub mod onchain_send;
 pub mod payment;
 pub mod restore;
 mod signer;
@@ -34,6 +35,7 @@ pub use history::{
 };
 pub use liquidity::Lsps2Error;
 pub use node::Node;
+pub use onchain_send::{DriftGuard, FeeEstimate, MaxSendEstimate, OnchainSendError};
 pub use payment::SendError;
 pub use restore::RestoreError;
 

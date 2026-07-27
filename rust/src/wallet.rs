@@ -1,15 +1,19 @@
 //! On-chain wallet: a BIP84 `bdk_wallet` over the mnemonic-derived
 //! descriptors (U1, KTD-4), persisted into the shared KVStore as a merged
 //! `ChangeSet` blob and synced via the shared esplora client. Also serves as
-//! the sweeper's change-destination source and the signer's address source
-//! (deterministic destination scripts, next-unused shutdown scripts).
+//! the sweeper's change-destination source, the signer's address source
+//! (deterministic destination scripts, next-unused shutdown scripts), and the
+//! U8 send engine's tx factory (focused build/sign methods over the mutexed
+//! bdk wallet — the raw wallet is never exposed).
 
 use std::sync::{Arc, Mutex};
 
 use bdk_esplora::EsploraAsyncExt;
 use bdk_wallet::chain::Merge;
-use bdk_wallet::{ChangeSet, KeychainKind, PersistedWallet, Wallet as BdkWallet, WalletPersister};
-use bitcoin::{Network, ScriptBuf};
+use bdk_wallet::{
+    ChangeSet, KeychainKind, PersistedWallet, SignOptions, Wallet as BdkWallet, WalletPersister,
+};
+use bitcoin::{Amount, FeeRate, Network, Psbt, ScriptBuf, Transaction};
 use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::log_error;
 use lightning::sign::ChangeDestinationSourceSync;
@@ -19,6 +23,7 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use crate::builder::BuildError;
 use crate::chain::ChainError;
+use crate::onchain_send::{BuiltTxFacts, OnchainSendError, TxBuildFailure, TxSpec};
 use crate::types::Logger;
 
 pub(crate) const BDK_WALLET_PRIMARY_NAMESPACE: &str = "bdk_wallet";
@@ -256,6 +261,118 @@ impl OnchainWallet {
         Ok(script)
     }
 
+    /// Trusted-spendable balance in sats: confirmed + trusted pending — the
+    /// PWA's `spendableSats` (`context.tsx:47-51`). Untrusted pending is
+    /// NEVER counted (U8, R7).
+    pub(crate) fn trusted_spendable_sats(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet
+            .balance()
+            .trusted_spendable()
+            .to_sat()
+    }
+
+    /// Builds `spec` at `fee_rate` to learn its fee and outputs WITHOUT
+    /// broadcasting (U8): staged changes from the estimate build are always
+    /// discarded, mirroring the PWA's `discardStagedChanges`
+    /// (`context.tsx:147-166`).
+    pub(crate) fn estimate_onchain_tx(
+        &self,
+        spec: &TxSpec,
+        fee_rate: FeeRate,
+    ) -> Result<BuiltTxFacts, TxBuildFailure> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, .. } = &mut *inner;
+        let result = build_tx_locked(wallet, spec, fee_rate).and_then(|psbt| facts_from(&psbt));
+        let _ = wallet.take_staged();
+        result
+    }
+
+    /// Builds `spec`, runs `verify` on the built facts at the broadcast
+    /// boundary (U8/R7 drift + fee guards — BEFORE anything is signed), then
+    /// signs, extracts, and persists the changeset (address reveals). On any
+    /// rejection the abandoned build's staged changes are discarded, exactly
+    /// like the PWA's `buildSignBroadcast` (`context.tsx:168-237`).
+    pub(crate) fn create_onchain_tx(
+        &self,
+        spec: &TxSpec,
+        fee_rate: FeeRate,
+        verify: impl FnOnce(&BuiltTxFacts) -> Result<(), OnchainSendError>,
+        map_build_failure: impl FnOnce(TxBuildFailure) -> OnchainSendError,
+    ) -> Result<Transaction, OnchainSendError> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, persister } = &mut *inner;
+
+        let discard = |wallet: &mut PersistedWallet<KVStoreWalletPersister>| {
+            let _ = wallet.take_staged();
+        };
+
+        let mut psbt = match build_tx_locked(wallet, spec, fee_rate).and_then(|psbt| {
+            let facts = facts_from(&psbt)?;
+            Ok((psbt, facts))
+        }) {
+            Ok((psbt, facts)) => {
+                if let Err(rejection) = verify(&facts) {
+                    discard(wallet);
+                    return Err(rejection);
+                }
+                psbt
+            }
+            Err(failure) => {
+                discard(wallet);
+                return Err(map_build_failure(failure));
+            }
+        };
+
+        let finalized = wallet
+            .sign(&mut psbt, SignOptions::default())
+            .map_err(|e| {
+                discard(wallet);
+                OnchainSendError::SigningFailed {
+                    detail: e.to_string(),
+                }
+            })?;
+        if !finalized {
+            discard(wallet);
+            return Err(OnchainSendError::SigningFailed {
+                detail: "the signed transaction did not finalize".to_string(),
+            });
+        }
+        let tx = psbt.extract_tx().map_err(|e| {
+            discard(wallet);
+            OnchainSendError::SigningFailed {
+                detail: e.to_string(),
+            }
+        })?;
+
+        // Persist BEFORE handing the tx to the broadcaster: the reveal of the
+        // change/reserve address must survive a crash between sign and
+        // broadcast (the address-reveal learning).
+        wallet.persist(persister).map_err(|e| {
+            log_error!(self.logger, "Failed to persist the send changeset: {e}");
+            OnchainSendError::BuildFailed {
+                detail: format!("failed to persist the wallet changeset: {e}"),
+            }
+        })?;
+        Ok(tx)
+    }
+
+    /// Next unused EXTERNAL address for the Receive screen (U8, PWA
+    /// `generateAddress`, `context.tsx:134-139`): the changeset is persisted
+    /// after every reveal — the address-reveal learning — so a restart keeps
+    /// the index.
+    pub(crate) fn next_receive_address(&self) -> Result<String, ()> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, persister } = &mut *inner;
+        let address = wallet.next_unused_address(KeychainKind::External);
+        wallet.persist(persister).map_err(|e| {
+            log_error!(self.logger, "Failed to persist receive-address reveal: {e}");
+        })?;
+        Ok(address.address.to_string())
+    }
+
     /// Next unused external script for the signer's
     /// `get_shutdown_scriptpubkey` — non-deterministic by design (PWA parity):
     /// shutdown scripts are recorded at channel open and replayed from
@@ -274,6 +391,95 @@ impl OnchainWallet {
     }
 }
 
+/// Builds a [`TxSpec`] into a PSBT over the locked bdk wallet (U8).
+///
+/// Untrusted-pending UTXOs (unconfirmed EXTERNAL receives) are always marked
+/// unspendable so they are never counted, matching the trusted-spendable
+/// arithmetic (R7). The reserve branch adds an EXPLICIT reserve output to the
+/// next unused internal (change) address, so a send-max with channels leaves
+/// exactly the reserve behind (AE6).
+fn build_tx_locked(
+    wallet: &mut PersistedWallet<KVStoreWalletPersister>,
+    spec: &TxSpec,
+    fee_rate: FeeRate,
+) -> Result<Psbt, TxBuildFailure> {
+    let untrusted: Vec<bitcoin::OutPoint> = wallet
+        .list_unspent()
+        .filter(|utxo| {
+            !utxo.chain_position.is_confirmed() && utxo.keychain == KeychainKind::External
+        })
+        .map(|utxo| utxo.outpoint)
+        .collect();
+    // The reserve output's internal address is revealed FRESH per build
+    // (`reveal_next_address`, like the sweeper's change source) rather than
+    // `next_unused_address`: next-unused stages the reveal only once, and an
+    // earlier estimate build's staged-then-discarded reveal would leave the
+    // send's persisted changeset without it — the reserve script would be
+    // unwatched after a restart (the address-reveal learning). Reveals are
+    // monotone, so persisting the send's higher index covers the estimates'.
+    let reserve_script = match spec {
+        TxSpec::DrainWithReserve { .. } => Some(
+            wallet
+                .reveal_next_address(KeychainKind::Internal)
+                .address
+                .script_pubkey(),
+        ),
+        TxSpec::Recipient { .. } | TxSpec::DrainAll { .. } => None,
+    };
+
+    let mut builder = wallet.build_tx();
+    builder.unspendable(untrusted).fee_rate(fee_rate);
+    match spec {
+        TxSpec::Recipient {
+            script,
+            amount_sats,
+        } => {
+            builder.add_recipient(script.clone(), Amount::from_sat(*amount_sats));
+        }
+        TxSpec::DrainAll { script } => {
+            builder.drain_wallet().drain_to(script.clone());
+        }
+        TxSpec::DrainWithReserve {
+            recipient,
+            reserve_sats,
+        } => {
+            builder
+                .add_recipient(
+                    reserve_script.expect("reserve script is Some for DrainWithReserve"),
+                    Amount::from_sat(*reserve_sats),
+                )
+                .drain_wallet()
+                .drain_to(recipient.clone());
+        }
+    }
+    builder.finish().map_err(|e| match e {
+        bdk_wallet::error::CreateTxError::OutputBelowDustLimit(_) => {
+            TxBuildFailure::OutputBelowDust
+        }
+        bdk_wallet::error::CreateTxError::CoinSelection(e) => {
+            TxBuildFailure::InsufficientFunds(e.to_string())
+        }
+        other => TxBuildFailure::Other(other.to_string()),
+    })
+}
+
+/// The facts the U8 guards inspect: absolute fee and the built outputs.
+fn facts_from(psbt: &Psbt) -> Result<BuiltTxFacts, TxBuildFailure> {
+    let fee_sats = psbt
+        .fee()
+        .map_err(|e| TxBuildFailure::Other(e.to_string()))?
+        .to_sat();
+    Ok(BuiltTxFacts {
+        fee_sats,
+        outputs: psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|out| (out.script_pubkey.clone(), out.value.to_sat()))
+            .collect(),
+    })
+}
+
 impl ChangeDestinationSourceSync for OnchainWallet {
     fn get_change_destination_script(&self) -> Result<ScriptBuf, ()> {
         let mut inner = self.inner.lock().unwrap();
@@ -286,6 +492,100 @@ impl ChangeDestinationSourceSync for OnchainWallet {
             );
         })?;
         Ok(address.address.script_pubkey())
+    }
+}
+
+/// Offline funding helpers for the U8 send tests: bdk's own `test_utils`
+/// (`insert_tx` + checkpoint anchors) inject confirmed / trusted-pending /
+/// untrusted-pending outputs without any network.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+    use bdk_wallet::test_utils::{receive_output, receive_output_to_address, ReceiveTo};
+    use bitcoin::hashes::Hash as _;
+
+    use super::*;
+
+    fn ensure_checkpoint(wallet: &mut PersistedWallet<KVStoreWalletPersister>) {
+        if wallet.latest_checkpoint().height() == 0 {
+            bdk_wallet::test_utils::insert_checkpoint(
+                wallet,
+                BlockId {
+                    height: 1_000,
+                    hash: bitcoin::BlockHash::all_zeros(),
+                },
+            );
+        }
+    }
+
+    /// A confirmed external receive: counted in every balance.
+    pub(crate) fn fund_confirmed(onchain: &OnchainWallet, sats: u64) {
+        let mut inner = onchain.inner.lock().unwrap();
+        let wallet = &mut inner.wallet;
+        ensure_checkpoint(wallet);
+        let anchor = ConfirmationBlockTime {
+            block_id: wallet.latest_checkpoint().block_id(),
+            confirmation_time: 100,
+        };
+        receive_output(wallet, Amount::from_sat(sats), ReceiveTo::Block(anchor));
+    }
+
+    /// An UNCONFIRMED external receive: bdk's untrusted pending — never
+    /// spendable, never counted (U8, R7).
+    pub(crate) fn fund_untrusted_pending(onchain: &OnchainWallet, sats: u64) {
+        let mut inner = onchain.inner.lock().unwrap();
+        let wallet = &mut inner.wallet;
+        ensure_checkpoint(wallet);
+        receive_output(
+            wallet,
+            Amount::from_sat(sats),
+            ReceiveTo::Mempool(1_700_000_000),
+        );
+    }
+
+    /// An UNCONFIRMED internal (change) receive: bdk's trusted pending —
+    /// counted in the trusted-spendable balance.
+    pub(crate) fn fund_trusted_pending(onchain: &OnchainWallet, sats: u64) {
+        let mut inner = onchain.inner.lock().unwrap();
+        let wallet = &mut inner.wallet;
+        ensure_checkpoint(wallet);
+        let address = wallet.reveal_next_address(KeychainKind::Internal).address;
+        receive_output_to_address(
+            wallet,
+            address,
+            Amount::from_sat(sats),
+            ReceiveTo::Mempool(1_700_000_000),
+        );
+    }
+
+    /// Whether `script` belongs to the wallet's INTERNAL (change) keychain —
+    /// the AE6 reserve-output assertion.
+    pub(crate) fn is_internal_script(onchain: &OnchainWallet, script: &ScriptBuf) -> bool {
+        matches!(
+            onchain
+                .inner
+                .lock()
+                .unwrap()
+                .wallet
+                .derivation_of_spk(script.clone()),
+            Some((KeychainKind::Internal, _))
+        )
+    }
+
+    /// The wallet's revealed derivation index for a keychain (restart tests).
+    pub(crate) fn derivation_index(onchain: &OnchainWallet, keychain: KeychainKind) -> Option<u32> {
+        onchain
+            .inner
+            .lock()
+            .unwrap()
+            .wallet
+            .derivation_index(keychain)
+    }
+
+    /// How many transactions the wallet's local graph knows (estimates must
+    /// never add one).
+    pub(crate) fn tx_count(onchain: &OnchainWallet) -> usize {
+        onchain.inner.lock().unwrap().wallet.transactions().count()
     }
 }
 

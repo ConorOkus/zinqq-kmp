@@ -406,7 +406,17 @@ impl ChainSource {
 
         self.fee_estimator
             .set_cache(cache_from_esplora_estimates(&estimates));
+        // U8: the raw 6-block rate rides along for the on-chain send path.
+        self.fee_estimator.set_onchain_send_rate(
+            crate::fees::onchain_send_sat_per_vb_from_estimates(&estimates),
+        );
         Ok(())
+    }
+
+    /// The U8 on-chain send fee rate (6-block target, ceil'd, clamped >= 2
+    /// sat/vB — KTD-9); answered from the cache, never the network.
+    pub(crate) fn onchain_send_fee_rate_sat_per_vb(&self) -> u64 {
+        self.fee_estimator.onchain_send_rate_sat_per_vb()
     }
 
     /// Broadcasts one transaction, mapping "already known" responses to the

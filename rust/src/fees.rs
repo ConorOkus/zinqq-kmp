@@ -25,6 +25,25 @@ pub(crate) const FEE_REFRESH_BACKOFF: Duration = Duration::from_secs(15);
 /// `MAX_FEE_SAT_KW`). Applied before the per-variant floor.
 pub(crate) const MAX_FEE_RATE_SAT_PER_KW: u32 = 500_000;
 
+/// The on-chain send path's block target (U8/KTD-9, PWA `context.tsx`
+/// `FEE_TARGET_BLOCKS`): the raw 6-block Esplora estimate, not an LDK
+/// confirmation-target slot.
+pub(crate) const ONCHAIN_SEND_TARGET_BLOCKS: u16 = 6;
+
+/// Minimum fee rate the wallet broadcasts an on-chain send at (U8, PWA
+/// `MIN_FEE_RATE_SAT_VB`, `config.ts:6`).
+pub(crate) const MIN_ONCHAIN_SEND_RATE_SAT_PER_VB: u64 = 2;
+
+/// The raw 6-block sat/vB out of an Esplora fee-estimates response for the
+/// U8 send path, filtered like the PWA's fee cache (finite, positive) —
+/// `None` when the response has no usable 6-block row.
+pub(crate) fn onchain_send_sat_per_vb_from_estimates(estimates: &HashMap<u16, f64>) -> Option<f64> {
+    estimates
+        .get(&ONCHAIN_SEND_TARGET_BLOCKS)
+        .copied()
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+}
+
 /// One row per `ConfirmationTarget` variant, in cache-slot order:
 /// `(target, num_blocks, floor_sat_per_kw)` — the PWA's `targetToBlocks` and
 /// `DEFAULT_FEE_RATES` tables verbatim. Notably `UrgentOnChainSweep` targets
@@ -149,6 +168,10 @@ struct RefreshState {
 pub(crate) struct CachedFeeEstimator {
     /// `None` per slot until the first successful refresh.
     cache: RwLock<[Option<u32>; 8]>,
+    /// Raw 6-block sat/vB for the U8 on-chain send path; `None` until a
+    /// refresh delivers a usable 6-block row (the PWA's shared fee cache
+    /// keeps the raw Esplora format for exactly this consumer).
+    onchain_send_sat_per_vb: RwLock<Option<f64>>,
     refresh: RwLock<RefreshState>,
 }
 
@@ -156,11 +179,30 @@ impl CachedFeeEstimator {
     pub(crate) fn new() -> Self {
         Self {
             cache: RwLock::new([None; 8]),
+            onchain_send_sat_per_vb: RwLock::new(None),
             refresh: RwLock::new(RefreshState {
                 fetched_at: None,
                 failed_at: None,
             }),
         }
+    }
+
+    /// Installs the raw 6-block sat/vB alongside a cache refresh (U8).
+    pub(crate) fn set_onchain_send_rate(&self, sat_per_vb: Option<f64>) {
+        *self.onchain_send_sat_per_vb.write().unwrap() = sat_per_vb;
+    }
+
+    /// The U8 send path's fee rate in sat/vB (KTD-9, PWA `getFeeRate` +
+    /// `context.tsx:32-36`): the cached 6-block estimate — or the PWA's
+    /// 6-block default (5 sat/vB) before the first refresh — rounded UP and
+    /// clamped to at least [`MIN_ONCHAIN_SEND_RATE_SAT_PER_VB`].
+    pub(crate) fn onchain_send_rate_sat_per_vb(&self) -> u64 {
+        let raw = self
+            .onchain_send_sat_per_vb
+            .read()
+            .unwrap()
+            .unwrap_or_else(|| default_sat_per_vb(ONCHAIN_SEND_TARGET_BLOCKS as usize));
+        (raw.ceil() as u64).max(MIN_ONCHAIN_SEND_RATE_SAT_PER_VB)
     }
 
     /// Installs a refreshed cache produced by [`cache_from_esplora_estimates`]
@@ -413,6 +455,35 @@ mod tests {
             estimator.get_est_sat_per_1000_weight(ConfirmationTarget::OutputSpendingFee),
             7_500
         );
+    }
+
+    /// U8/KTD-9: the on-chain send rate is the raw 6-block estimate, ceil'd
+    /// and clamped >= 2 sat/vB; before any refresh it answers the PWA's
+    /// 6-block default (5 sat/vB); a response without a usable 6-block row
+    /// falls back to the default too.
+    #[test]
+    fn onchain_send_rate_mirrors_the_pwa_six_block_path() {
+        let estimator = CachedFeeEstimator::new();
+        // Before the first refresh: the PWA 6-block default.
+        assert_eq!(estimator.onchain_send_rate_sat_per_vb(), 5);
+
+        // Fractional rates round UP (PWA Math.ceil).
+        let estimates: HashMap<u16, f64> = [(6u16, 7.2)].into_iter().collect();
+        estimator.set_onchain_send_rate(onchain_send_sat_per_vb_from_estimates(&estimates));
+        assert_eq!(estimator.onchain_send_rate_sat_per_vb(), 8);
+
+        // The 2 sat/vB floor (PWA MIN_FEE_RATE_SAT_VB).
+        let low: HashMap<u16, f64> = [(6u16, 0.4)].into_iter().collect();
+        estimator.set_onchain_send_rate(onchain_send_sat_per_vb_from_estimates(&low));
+        assert_eq!(estimator.onchain_send_rate_sat_per_vb(), 2);
+
+        // No usable 6-block row (missing / non-positive): default 5.
+        let missing: HashMap<u16, f64> = [(1u16, 30.0)].into_iter().collect();
+        estimator.set_onchain_send_rate(onchain_send_sat_per_vb_from_estimates(&missing));
+        assert_eq!(estimator.onchain_send_rate_sat_per_vb(), 5);
+        let broken: HashMap<u16, f64> = [(6u16, f64::NAN)].into_iter().collect();
+        estimator.set_onchain_send_rate(onchain_send_sat_per_vb_from_estimates(&broken));
+        assert_eq!(estimator.onchain_send_rate_sat_per_vb(), 5);
     }
 
     /// U12/KTD-9: the 60 s TTL — fresh right after a refresh, due again once
