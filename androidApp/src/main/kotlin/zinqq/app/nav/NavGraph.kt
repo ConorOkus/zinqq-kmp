@@ -20,8 +20,12 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import zinqq.app.WalletHolder
 import zinqq.app.components.FencedScreen
+import zinqq.app.screens.ActivityScreen
+import zinqq.app.screens.ChannelCloseDetailScreen
 import zinqq.app.screens.HomeScreen
 import zinqq.app.screens.PlaceholderScreen
+import zinqq.app.screens.RecoverFundsScreen
+import zinqq.app.screens.TransactionDetailScreen
 import zinqq.app.theme.ZinqqDimens
 import zinqq.app.theme.ZinqqTheme
 
@@ -117,7 +121,15 @@ private fun ZinqqNavHost(
         navController = navController,
         startDestination = Route.Home.pattern,
     ) {
-        composable(Route.Home.pattern) { HomeScreen(holder) }
+        composable(Route.Home.pattern) {
+            HomeScreen(
+                holder = holder,
+                onSend = { navController.navigateTo(Route.Send) },
+                onRequest = { navController.navigateTo(Route.Receive) },
+                onRecover = { navController.navigateTo(Route.Recover) },
+                onReceive = { navController.navigateTo(Route.Receive) },
+            )
+        }
         composable(Route.Receive.pattern) {
             PlaceholderScreen("Receive", backFor(Route.Receive))
         }
@@ -128,16 +140,50 @@ private fun ZinqqNavHost(
             PlaceholderScreen("Scan", backFor(Route.Scan))
         }
         composable(Route.Activity.pattern) {
-            PlaceholderScreen("Activity", onBack = null, isFieldScreen = true)
+            ActivityScreen(
+                holder = holder,
+                onOpenTx = { txId ->
+                    navController.navigate(Route.ActivityTxDetail.path(txId)) {
+                        launchSingleTop = true
+                    }
+                },
+                onOpenClose = { channelId ->
+                    navController.navigate(Route.ActivityCloseDetail.path(channelId)) {
+                        launchSingleTop = true
+                    }
+                },
+            )
         }
-        composable(Route.ActivityCloseDetail.pattern) {
-            PlaceholderScreen("Channel Close", backFor(Route.ActivityCloseDetail))
+        composable(Route.ActivityCloseDetail.pattern) { entry ->
+            ChannelCloseDetailScreen(
+                holder = holder,
+                channelId = entry.arguments
+                    ?.getString(Route.ActivityCloseDetail.ARG_CHANNEL_ID)
+                    .orEmpty(),
+                onBack = { navController.navigateTo(Route.Activity) },
+                onRecover = { navController.navigateTo(Route.Recover) },
+            )
         }
-        composable(Route.ActivityTxDetail.pattern) {
-            PlaceholderScreen("Transaction", backFor(Route.ActivityTxDetail))
+        composable(Route.ActivityTxDetail.pattern) { entry ->
+            TransactionDetailScreen(
+                holder = holder,
+                txId = entry.arguments?.getString(Route.ActivityTxDetail.ARG_TX_ID).orEmpty(),
+                onBack = { navController.navigateTo(Route.Activity) },
+                // A close spans ~14 days; its own live detail page replaces
+                // this snapshot view (TransactionDetail.tsx:81-85).
+                onRedirectToClose = { channelId ->
+                    navController.navigate(Route.ActivityCloseDetail.path(channelId)) {
+                        launchSingleTop = true
+                        popUpTo(Route.ActivityTxDetail.pattern) { inclusive = true }
+                    }
+                },
+            )
         }
         composable(Route.Recover.pattern) {
-            PlaceholderScreen("Recover Funds", backFor(Route.Recover))
+            RecoverFundsScreen(
+                holder = holder,
+                onBack = { navController.navigateTo(Route.Home) },
+            )
         }
         composable(Route.Settings.pattern) {
             PlaceholderScreen("Settings", backFor(Route.Settings))

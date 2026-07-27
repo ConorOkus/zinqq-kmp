@@ -1457,6 +1457,13 @@ impl Wallet {
         })
     }
 
+    /// Durably dismiss the recovery success banner (U14/U19, R9). No-op
+    /// unless the recovery state is `SweepConfirmed` — an active recovery is
+    /// chain-truth-owned and not user-dismissible.
+    pub fn dismiss_recovery(&self) {
+        self.node.dismiss_recovery();
+    }
+
     /// Outputs still waiting to sweep (U11, R8), `None` when nothing is
     /// pending. Readable while stopped (the store owns its own handle).
     pub fn pending_sweep(&self) -> Option<PendingSweepView> {

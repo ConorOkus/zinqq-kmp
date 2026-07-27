@@ -1245,6 +1245,21 @@ impl Node {
         self.recovery.state()
     }
 
+    /// Dismiss the recovery success banner (U14/U19, R9): durably clears the
+    /// recovery state, but only once the sweep is confirmed — an active
+    /// `NeedsRecovery` state is chain-truth-owned and never user-dismissible
+    /// (PWA `use-recovery.ts` dismiss semantics).
+    pub fn dismiss_recovery(&self) {
+        if let Some(state) = self.recovery.state() {
+            if matches!(
+                state.status,
+                crate::recovery::RecoveryStatus::SweepConfirmed
+            ) {
+                self.recovery.clear();
+            }
+        }
+    }
+
     /// Outputs still waiting to sweep (U11, R8), `None` when nothing is
     /// pending. `pending_sats` is a LOWER BOUND (`has_unknown_value` marks
     /// undercounting); `needs_onchain_funds`/`shortfall_sats` drive the

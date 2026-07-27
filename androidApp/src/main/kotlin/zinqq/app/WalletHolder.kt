@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import uniffi.wallet_core.Event
 import uniffi.wallet_core.Wallet
 import uniffi.wallet_core.WalletException
 import zinqq.app.theme.AppearanceMode
@@ -77,6 +76,12 @@ class WalletHolder(
                 _state.update { it.copy(appearanceMode = mode) }
             }
         }
+        // Same mirror for the persisted balance-visibility toggle (R12).
+        scope.launch {
+            settings.balanceVisible.collect { visible ->
+                _state.update { it.copy(balanceVisible = visible) }
+            }
+        }
     }
 
     fun observeProcessLifecycle() {
@@ -92,20 +97,73 @@ class WalletHolder(
         scope.launch { settings.setAppearanceMode(mode) }
     }
 
-    fun refreshBalances() {
+    /** Persist a new balance-visibility choice; [state] updates via the mirror. */
+    fun setBalanceVisible(visible: Boolean) {
+        scope.launch { settings.setBalanceVisible(visible) }
+    }
+
+    /**
+     * Dismiss the sweep-confirmed success banner: durable via the core
+     * (`dismiss_recovery`, a no-op unless SweepConfirmed) plus the session
+     * flag so the UI hides immediately (see UiState).
+     */
+    fun dismissRecoveryBanner() {
+        _state.update { it.copy(recoveryBannerDismissed = true) }
         scope.launch {
-            // Balances need a running node; a stopped-node refresh is a no-op.
+            runCatching { wallet?.dismissRecovery() }
+            refreshWalletData()
+        }
+    }
+
+    /**
+     * Re-query every wallet-data snapshot the screens render (U14): balances,
+     * the unified activity feed, recovery state, pending sweep, and the open
+     * close detail, if any. Home's refresh icon calls this directly; the
+     * event loop calls it on [shouldRefreshWalletData] events. All derivation
+     * happens in pure presentation functions (R14) — this only snapshots.
+     */
+    fun refreshWalletData() {
+        scope.launch {
+            // Balances/activity need a running node; keep the previous
+            // snapshots when the query fails (e.g. refresh while stopped).
             val balances = try {
                 wallet.balances()
             } catch (_: Exception) {
-                return@launch
+                null
             }
-            _state.update {
-                it.copy(
-                    balanceMsat = balances.lightningMsat,
-                    onchainSats = balances.onchainTotalSats,
+            val activity = try {
+                wallet.listActivity()
+            } catch (_: Exception) {
+                null
+            }
+            // Local-first stores: readable even while stopped, and null is a
+            // real answer (no recovery / nothing pending), not a failure.
+            val recovery = wallet.recoveryState()
+            val sweep = wallet.pendingSweep()
+            _state.update { state ->
+                state.copy(
+                    balances = balances ?: state.balances,
+                    balanceMsat = balances?.lightningMsat ?: state.balanceMsat,
+                    onchainSats = balances?.onchainTotalSats ?: state.onchainSats,
+                    activity = activity ?: state.activity,
+                    recoveryState = recovery,
+                    pendingSweep = sweep,
+                    closeDetail = state.closeDetail?.let {
+                        it.copy(record = wallet.closeDetail(it.channelId))
+                    },
                 )
             }
+        }
+    }
+
+    /**
+     * Load (or re-load) the close-detail screen's record. The screen renders
+     * [UiState.closeDetail]; refreshes keep it live while the close resolves.
+     */
+    fun loadCloseDetail(channelId: String) {
+        scope.launch {
+            val record = wallet.closeDetail(channelId)
+            _state.update { it.copy(closeDetail = CloseDetailUi(channelId, record)) }
         }
     }
 
@@ -148,21 +206,23 @@ class WalletHolder(
                 _state.update { it.copy(fenced = true) }
                 return@launch
             } catch (e: Exception) {
-                _state.update { it.copy(lastOutcome = "Node start failed: ${e.message}") }
+                // Home replaces its content with the PWA's error state
+                // ("Something went wrong", Home.tsx:29-42).
+                _state.update {
+                    it.copy(
+                        lastOutcome = "Node start failed: ${e.message}",
+                        startError = e.message ?: "Node start failed",
+                    )
+                }
                 return@launch
             }
-            refreshBalances()
+            _state.update { it.copy(startError = null) }
+            refreshWalletData()
             // Handle-then-ack inside WalletCore; returns after acking the
             // terminal NodeStopped pushed by stop() (KTD-8).
             WalletCore.runEventLoop(wallet) { event ->
                 _state.update { reduce(it, event) }
-                when (event) {
-                    is Event.PaymentReceived,
-                    is Event.PaymentSuccessful,
-                    is Event.ChannelReady,
-                    -> refreshBalances()
-                    else -> Unit
-                }
+                if (shouldRefreshWalletData(event)) refreshWalletData()
             }
         }
     }

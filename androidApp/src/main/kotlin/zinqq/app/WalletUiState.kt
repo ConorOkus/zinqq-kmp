@@ -1,6 +1,11 @@
 package zinqq.app
 
+import uniffi.wallet_core.ActivityRow
+import uniffi.wallet_core.Balances
+import uniffi.wallet_core.CloseRecordView
 import uniffi.wallet_core.Event
+import uniffi.wallet_core.PendingSweepView
+import uniffi.wallet_core.RecoveryStateView
 import zinqq.app.theme.AppearanceMode
 
 /** The invoice currently on screen, straight off [Event.InvoiceReady]. */
@@ -9,7 +14,17 @@ data class InvoiceUi(
     val expiryUnixSecs: ULong,
 )
 
-/** Immutable screen state; only [reduce] and balance refreshes produce new values. */
+/**
+ * The channel-close detail query result (U14): [record] is null when the
+ * core has no record for [channelId] ("Close record not found"), while a
+ * missing [CloseDetailUi] altogether means the query hasn't run yet.
+ */
+data class CloseDetailUi(
+    val channelId: String,
+    val record: CloseRecordView?,
+)
+
+/** Immutable screen state; only [reduce] and wallet-data refreshes produce new values. */
 data class UiState(
     val nodeRunning: Boolean = false,
     val balanceMsat: ULong = 0uL,
@@ -26,7 +41,47 @@ data class UiState(
     val fenced: Boolean = false,
     /** Persisted appearance selection (U13, KTD-11); mirrored from DataStore. */
     val appearanceMode: AppearanceMode = AppearanceMode.DEFAULT,
+    /** Persisted `balance-visible` toggle (R12); mirrored from DataStore. */
+    val balanceVisible: Boolean = true,
+    /** Last `balances()` snapshot; null until the first refresh (loading). */
+    val balances: Balances? = null,
+    /** Last `list_activity()` snapshot; null until the first refresh (loading). */
+    val activity: List<ActivityRow>? = null,
+    /** Force-close recovery state; null = no recovery in progress (R9). */
+    val recoveryState: RecoveryStateView? = null,
+    /**
+     * Session-local hide of the sweep-confirmed success banner. The PWA's
+     * dismiss durably clears the recovery state; the core exposes no clear
+     * call yet, so dismissal lives here and resets whenever
+     * [Event.RecoveryStateChanged] announces fresh state.
+     */
+    val recoveryBannerDismissed: Boolean = false,
+    /** Outputs waiting to sweep; the banner gates on `lastAttemptFailed` (R8). */
+    val pendingSweep: PendingSweepView? = null,
+    /** The close-detail screen's current query result. */
+    val closeDetail: CloseDetailUi? = null,
+    /**
+     * Fatal start failure — Home replaces its content with the PWA's
+     * "Something went wrong" state (`Home.tsx:29-42`).
+     */
+    val startError: String? = null,
 )
+
+/**
+ * The events after which the wallet-data snapshots (balances, activity,
+ * recovery state, pending sweep) must be re-queried: the spike's balance
+ * triggers extended with the sweep/recovery change events (U14; the PWA's
+ * hooks re-read on the equivalent change notifications).
+ */
+fun shouldRefreshWalletData(event: Event): Boolean = when (event) {
+    is Event.PaymentReceived,
+    is Event.PaymentSuccessful,
+    is Event.ChannelReady,
+    is Event.SweepStateChanged,
+    is Event.RecoveryStateChanged,
+    -> true
+    else -> false
+}
 
 /**
  * Pure event-to-state reduction, unit-testable without Android or a wallet
@@ -63,6 +118,9 @@ fun reduce(state: UiState, event: Event): UiState =
         // The core fenced itself (KTD-3): the shell blocks every destination
         // behind the fenced screen until the user restores or quits (U13).
         is Event.Fenced -> state.copy(fenced = true)
+        // Fresh recovery state invalidates a session-local banner dismissal
+        // (the holder re-queries the state itself; see shouldRefreshWalletData).
+        is Event.RecoveryStateChanged -> state.copy(recoveryBannerDismissed = false)
         // KTD-5: the Event enum grows ahead of the shells (U5 added backup /
         // sweep / recovery / restore variants fired by later units); reducers
         // ignore unrecognized variants defensively.

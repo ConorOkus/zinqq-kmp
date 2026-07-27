@@ -1,158 +1,227 @@
 package zinqq.app.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.LocalContentColor
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
+import androidx.compose.ui.unit.sp
+import zinqq.app.R
 import zinqq.app.WalletHolder
-import zinqq.app.components.QrView
+import zinqq.app.components.BalanceDisplay
+import zinqq.app.components.Banner
+import zinqq.app.components.BannerIcon
+import zinqq.app.homeBalance
+import zinqq.app.recoveryBanner
+import zinqq.app.sweepBanner
+import zinqq.app.theme.ZinqqDimens
 import zinqq.app.theme.ZinqqTheme
 
 /**
- * Home temporarily hosts the spike's single WalletScreen (U13): the proven
- * receive/send flow moved here unchanged so the shell keeps paying while
- * U14 builds the real Home. Only the QR rendering moved into the shared
- * [QrView] component; everything else is the spike content verbatim.
+ * The PWA's Home (U14, R12; `Home.tsx`): field screen with a refresh icon
+ * (re-queries wallet data — no page-reload concept natively; the PWA
+ * install button is omitted on native), the unified BalanceDisplay,
+ * RecoveryBanner / PendingSweepBanner, and the two 88dp CTAs. A fatal start
+ * failure replaces the content with "Something went wrong" (`Home.tsx:29-42`).
  */
 @Composable
-fun HomeScreen(holder: WalletHolder) {
+fun HomeScreen(
+    holder: WalletHolder,
+    onSend: () -> Unit,
+    onRequest: () -> Unit,
+    onRecover: () -> Unit,
+    onReceive: () -> Unit,
+) {
     val state by holder.state.collectAsState()
-    var receiveAmount by remember { mutableStateOf("") }
-    var sendBolt11 by remember { mutableStateOf("") }
     val colors = ZinqqTheme.colors
 
-    CompositionLocalProvider(LocalContentColor provides colors.onField) {
+    if (state.startError != null) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .background(colors.field)
-                .verticalScroll(rememberScrollState())
-                .padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(horizontal = 24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "${state.balanceMsat / 1_000uL} sats",
-                        style = MaterialTheme.typography.headlineMedium,
-                    )
-                    Text(
-                        text = "on-chain ${state.onchainSats} sats · " +
-                            "node ${if (state.nodeRunning) "running" else "stopped"}",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                TextButton(onClick = holder::refreshBalances) { Text("Refresh") }
-            }
-            state.syncBanner?.let {
-                Text(text = it, color = colors.dangerStrong)
-            }
-
-            HorizontalDivider(color = colors.onFieldMuted)
-            Text(text = "Receive", style = MaterialTheme.typography.titleMedium)
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                OutlinedTextField(
-                    value = receiveAmount,
-                    onValueChange = { receiveAmount = it },
-                    label = { Text("Amount (sats)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-                val parsedAmount = remember(receiveAmount) { receiveAmount.toULongOrNull() }
-                Button(
-                    onClick = { parsedAmount?.let(holder::requestInvoice) },
-                    enabled = state.nodeRunning && parsedAmount != null,
-                ) { Text("Invoice") }
-            }
-            state.currentInvoice?.let { InvoiceDisplay(it) }
-
-            HorizontalDivider(color = colors.onFieldMuted)
-            Text(text = "Send", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
-                value = sendBolt11,
-                onValueChange = { sendBolt11 = it },
-                label = { Text("BOLT11 invoice") },
-                modifier = Modifier.fillMaxWidth(),
+            Text(
+                text = "Something went wrong",
+                color = colors.onField,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.SemiBold,
             )
-            Button(
-                onClick = { holder.sendPayment(sendBolt11) },
-                enabled = state.nodeRunning && sendBolt11.isNotBlank(),
-            ) { Text("Pay") }
+            Text(
+                text = state.startError.orEmpty(),
+                color = colors.onFieldMuted,
+                fontSize = 14.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
+        return
+    }
 
-            state.lastOutcome?.let {
-                HorizontalDivider(color = colors.onFieldMuted)
-                Text(text = it, style = MaterialTheme.typography.bodyMedium)
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(colors.field)
+            .padding(horizontal = 24.dp)
+            .padding(top = 16.dp),
+    ) {
+        // Top bar: install slot omitted on native (left spacer keeps the
+        // refresh pinned right, like the PWA's placeholder div).
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Box(modifier = Modifier.size(ZinqqDimens.MinTouchTarget))
+            Box(
+                modifier = Modifier
+                    .size(ZinqqDimens.MinTouchTarget)
+                    .clip(CircleShape)
+                    .clickable(onClick = holder::refreshWalletData)
+                    .semantics { contentDescription = "Refresh" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_refresh),
+                    contentDescription = null,
+                    tint = colors.onField,
+                    modifier = Modifier.size(20.dp),
+                )
             }
         }
-    }
-}
 
-@Composable
-private fun ColumnScope.InvoiceDisplay(invoice: zinqq.app.InvoiceUi) {
-    // The BOLT11 is opaque display data here (R14): it goes straight from the
-    // InvoiceReady event into pixels.
-    QrView(
-        payload = invoice.bolt11,
-        contentDescription = "Invoice QR code",
-        modifier = Modifier
-            .size(240.dp)
-            .align(Alignment.CenterHorizontally),
-    )
-    ExpiryCountdown(expiryUnixSecs = invoice.expiryUnixSecs)
-    Text(text = invoice.bolt11, style = MaterialTheme.typography.bodySmall)
-}
+        // Balance centered in the flexible middle, like the PWA's
+        // justify-between column.
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            val balance = state.balances?.let(::homeBalance)
+            BalanceDisplay(
+                balanceSats = balance?.totalSats ?: 0L,
+                visible = state.balanceVisible,
+                onToggleVisible = { holder.setBalanceVisible(!state.balanceVisible) },
+                pendingSats = balance?.pendingSats,
+                loading = balance == null,
+            )
+        }
 
-@Composable
-private fun ExpiryCountdown(expiryUnixSecs: ULong) {
-    var remaining by remember(expiryUnixSecs) { mutableLongStateOf(secsUntil(expiryUnixSecs)) }
-    LaunchedEffect(expiryUnixSecs) {
-        while (remaining > 0) {
-            delay(1_000)
-            remaining = secsUntil(expiryUnixSecs)
+        recoveryBanner(state.recoveryState, state.recoveryBannerDismissed)?.let { banner ->
+            Banner(
+                icon = if (banner.dismissible) BannerIcon.CHECK else BannerIcon.WARNING_HOT,
+                title = banner.title,
+                subtitle = banner.subtitle,
+                onClick = if (banner.navigatesToRecover) onRecover else null,
+                onDismiss = if (banner.dismissible) holder::dismissRecoveryBanner else null,
+                modifier = Modifier.padding(bottom = 12.dp),
+            )
+        }
+
+        sweepBanner(state.pendingSweep)?.let { banner ->
+            Banner(
+                icon = if (banner.navigatesToReceive) BannerIcon.WARNING_HOT else BannerIcon.WARNING,
+                title = banner.heading,
+                subtitle = banner.subtitle,
+                onClick = if (banner.navigatesToReceive) onReceive else null,
+                modifier = Modifier.padding(bottom = 12.dp),
+            )
+        }
+
+        // The two 88dp CTAs: Send filled (the field screen's hot moment),
+        // Request outlined (Home.tsx:92-107).
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            HomeCta(
+                label = "Send",
+                iconRes = R.drawable.ic_arrow_up_right,
+                background = colors.fieldCta,
+                contentColor = colors.onFieldCta,
+                outline = null,
+                onClick = onSend,
+                modifier = Modifier.weight(1f),
+            )
+            HomeCta(
+                label = "Request",
+                iconRes = R.drawable.ic_arrow_down_left,
+                background = Color.Transparent,
+                contentColor = colors.onField,
+                outline = colors.fieldOutline,
+                onClick = onRequest,
+                modifier = Modifier.weight(1f),
+            )
         }
     }
-    Text(
-        text = if (remaining > 0) {
-            "Expires in ${remaining / 60}m ${remaining % 60}s"
-        } else {
-            "Invoice expired"
-        },
-        style = MaterialTheme.typography.bodyMedium,
-    )
 }
 
-private fun secsUntil(expiryUnixSecs: ULong): Long =
-    expiryUnixSecs.toLong() - System.currentTimeMillis() / 1_000
+@Composable
+private fun HomeCta(
+    label: String,
+    iconRes: Int,
+    background: Color,
+    contentColor: Color,
+    outline: Color?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(16.dp)
+    Row(
+        modifier = modifier
+            .height(88.dp)
+            .clip(shape)
+            .background(background)
+            .let { if (outline != null) it.border(2.dp, outline, shape) else it }
+            .clickable(onClick = onClick)
+            .semantics { contentDescription = label },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = label.uppercase(),
+            color = contentColor,
+            fontFamily = ZinqqTheme.fonts.display,
+            fontWeight = FontWeight.Bold,
+            fontSize = 20.sp,
+            letterSpacing = 1.sp,
+        )
+        Icon(
+            painter = painterResource(iconRes),
+            contentDescription = null,
+            tint = contentColor,
+            modifier = Modifier
+                .padding(start = 12.dp)
+                .size(22.dp),
+        )
+    }
+}
