@@ -453,6 +453,13 @@ impl crate::close_records::ChainTruth for ChainSource {
 pub(crate) struct ChainSource {
     esplora_client: EsploraAsyncClient,
     tx_sync: Arc<EsploraSyncClient<Arc<Logger>>>,
+    /// Base URL, trailing slash trimmed. Kept so [`Self::transaction_by_txid`]
+    /// can reach `/tx/:txid/hex` directly — see that method for why the
+    /// esplora-client helper is unusable here.
+    esplora_url: String,
+    /// Shared with nothing else; `reqwest::Client` is internally an Arc and
+    /// pools connections, so one per chain source is the intended shape.
+    http: reqwest::Client,
     fee_estimator: Arc<CachedFeeEstimator>,
     pending_broadcasts: Arc<PendingBroadcasts>,
     network: bitcoin::Network,
@@ -477,6 +484,8 @@ impl ChainSource {
         Ok(Self {
             esplora_client,
             tx_sync,
+            esplora_url: esplora_url.trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
             fee_estimator,
             pending_broadcasts,
             network,
@@ -650,14 +659,61 @@ impl ChainSource {
     /// know it. Used by the missed-descriptor replay pass ([`crate::replay`]):
     /// `ChannelMonitor::get_spendable_outputs` scans a transaction's outputs,
     /// so the txid alone is not enough there.
+    /// Fetches a full transaction over `/tx/:txid/hex`.
+    ///
+    /// NOT `esplora_client::get_tx`, which reads `/tx/:txid/raw`. That endpoint
+    /// serves a raw BINARY body, and the first-party backend
+    /// ([`crate::config::DEFAULT_ESPLORA_URL`]) mangles it: every byte >= 0x80
+    /// comes back UTF-8 re-encoded as two bytes, so a 443-byte transaction
+    /// arrives as 773 bytes and consensus decoding fails with
+    /// `UnexpectedEof`. `/tx/:txid/hex` is the same standard Esplora API, is
+    /// pure ASCII, and is therefore immune to that corruption — verified
+    /// byte-identical to another backend's `/raw` for the same txid.
+    ///
+    /// Hex is the right primary for every backend, not a workaround for one:
+    /// it costs 2x the bytes of a small body and removes a whole class of
+    /// proxy-transparency assumptions.
     pub(crate) async fn transaction_by_txid(
         &self,
         txid: &Txid,
     ) -> Result<Option<Transaction>, ChainError> {
-        self.esplora_client
-            .get_tx(txid)
+        let url = format!("{}/tx/{txid}/hex", self.esplora_url);
+        let response = self
+            .http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(ESPLORA_CLIENT_TIMEOUT_SECS))
+            .send()
             .await
-            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?;
+        // A txid the backend does not know is absence, not failure — the
+        // caller decides whether that is benign (a pruned or never-confirmed
+        // tx) or fatal.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(ChainError::EsploraUnreachable(format!(
+                "GET /tx/{txid}/hex returned {}",
+                response.status()
+            )));
+        }
+        let hex = response
+            .text()
+            .await
+            .map_err(|e| ChainError::EsploraUnreachable(e.to_string()))?;
+        let bytes = <Vec<u8> as bitcoin::hex::FromHex>::from_hex(hex.trim())
+            .map_err(|e| ChainError::EsploraUnreachable(format!("malformed tx hex: {e}")))?;
+        let tx: Transaction = bitcoin::consensus::deserialize(&bytes)
+            .map_err(|e| ChainError::EsploraUnreachable(format!("undecodable tx: {e}")))?;
+        // Cheap integrity check: a backend that returned the wrong body would
+        // otherwise feed a foreign transaction into monitor replay.
+        if tx.compute_txid() != *txid {
+            return Err(ChainError::EsploraUnreachable(format!(
+                "backend returned {} for requested {txid}",
+                tx.compute_txid()
+            )));
+        }
+        Ok(Some(tx))
     }
 
     /// Current tip height (U10 reconcile).
