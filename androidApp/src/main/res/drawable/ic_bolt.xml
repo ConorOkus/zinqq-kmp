@@ -1,0 +1,13 @@
+<!-- Balance "Lightning" row icon (Balance.tsx:60-70): feather zap. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M13,2 L3,14 h9 l-1,8 10,-12 h-9 l1,-8 z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

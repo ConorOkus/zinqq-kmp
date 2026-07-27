@@ -23,17 +23,34 @@ import zinqq.app.components.FencedScreen
 import zinqq.app.screens.ActivityScreen
 import zinqq.app.screens.ChannelCloseDetailScreen
 import zinqq.app.screens.HomeScreen
-import zinqq.app.screens.PlaceholderScreen
 import zinqq.app.screens.RecoverFundsScreen
 import zinqq.app.screens.TransactionDetailScreen
 import zinqq.app.screens.receive.ReceiveScreen
 import zinqq.app.screens.scan.ScanScreen
 import zinqq.app.screens.send.SendScreen
+import zinqq.app.screens.settings.AdvancedScreen
+import zinqq.app.screens.settings.BackupScreen
+import zinqq.app.screens.settings.BalanceScreen
+import zinqq.app.screens.settings.CloseChannelScreen
+import zinqq.app.screens.settings.OpenChannelScreen
+import zinqq.app.screens.settings.PeersScreen
+import zinqq.app.screens.settings.RestoreScreen
+import zinqq.app.screens.settings.SettingsScreen
 import zinqq.app.theme.ZinqqDimens
 import zinqq.app.theme.ZinqqTheme
 
 /** Saved-state key carrying a scan's raw decode into the Send entry (R13). */
 const val SCANNED_INPUT_KEY = "scannedInput"
+
+/**
+ * Saved-state keys carrying the Peers screen's selections into the
+ * open/close channel entries (U17) — the Android equivalent of the PWA's
+ * `location.state` (entry-scoped, consumed once; a missing value redirects
+ * back to Peers, like the PWA's replace-navigation guards).
+ */
+const val OPEN_CHANNEL_PEER_KEY = "openChannelPeer"
+const val CLOSE_CHANNEL_ID_KEY = "closeChannelId"
+const val CLOSE_CHANNEL_FORCE_KEY = "closeChannelForce"
 
 /**
  * Navigation shell (U13, KTD-11, R12): the PWA's `Layout` — a centered
@@ -222,28 +239,97 @@ private fun ZinqqNavHost(
             )
         }
         composable(Route.Settings.pattern) {
-            PlaceholderScreen("Settings", backFor(Route.Settings))
+            SettingsScreen(
+                holder = holder,
+                onBack = backFor(Route.Settings),
+                onOpenRow = navController::navigateTo,
+            )
         }
         composable(Route.SettingsBackup.pattern) {
-            PlaceholderScreen("Backup", backFor(Route.SettingsBackup))
+            BackupScreen(
+                port = holder,
+                onBack = backFor(Route.SettingsBackup),
+                onDone = { navController.navigateTo(Route.Settings) },
+            )
         }
         composable(Route.SettingsRestore.pattern) {
-            PlaceholderScreen("Restore", backFor(Route.SettingsRestore))
+            RestoreScreen(
+                holder = holder,
+                onBack = backFor(Route.SettingsRestore),
+                // F3: success restarts over the restored wallet → Home.
+                onRestored = { navController.navigateTo(Route.Home) },
+            )
         }
         composable(Route.SettingsAdvanced.pattern) {
-            PlaceholderScreen("Advanced", backFor(Route.SettingsAdvanced))
+            AdvancedScreen(
+                holder = holder,
+                onBack = backFor(Route.SettingsAdvanced),
+                onOpenRow = navController::navigateTo,
+            )
         }
         composable(Route.AdvancedBalance.pattern) {
-            PlaceholderScreen("Balance", backFor(Route.AdvancedBalance))
+            BalanceScreen(holder = holder, onBack = backFor(Route.AdvancedBalance))
         }
         composable(Route.AdvancedPeers.pattern) {
-            PlaceholderScreen("Peers", backFor(Route.AdvancedPeers))
+            PeersScreen(
+                port = holder,
+                onBack = backFor(Route.AdvancedPeers),
+                // The parsed connect input travels like the PWA's
+                // location.state: entry-scoped saved state, consumed once.
+                onOpenChannel = { address ->
+                    navController.navigate(Route.PeersOpenChannel.pattern) {
+                        launchSingleTop = true
+                        popUpTo(Route.PeersOpenChannel.pattern) { inclusive = true }
+                    }
+                    navController.getBackStackEntry(Route.PeersOpenChannel.pattern)
+                        .savedStateHandle[OPEN_CHANNEL_PEER_KEY] = address
+                },
+                onCloseChannel = { channelId, force ->
+                    navController.navigate(Route.PeersCloseChannel.pattern) {
+                        launchSingleTop = true
+                        popUpTo(Route.PeersCloseChannel.pattern) { inclusive = true }
+                    }
+                    val handle = navController
+                        .getBackStackEntry(Route.PeersCloseChannel.pattern)
+                        .savedStateHandle
+                    handle[CLOSE_CHANNEL_ID_KEY] = channelId
+                    handle[CLOSE_CHANNEL_FORCE_KEY] = force
+                },
+            )
         }
-        composable(Route.PeersOpenChannel.pattern) {
-            PlaceholderScreen("Open Channel", backFor(Route.PeersOpenChannel))
+        composable(Route.PeersOpenChannel.pattern) { entry ->
+            val peerAddress = androidx.compose.runtime.remember(entry) {
+                entry.savedStateHandle.remove<String>(OPEN_CHANNEL_PEER_KEY)
+            }
+            OpenChannelScreen(
+                port = holder,
+                peerAddress = peerAddress,
+                onBack = { navController.navigateTo(Route.AdvancedPeers) },
+                onDone = { navController.navigateTo(Route.Home) },
+                onMissingPeer = { navController.navigateTo(Route.AdvancedPeers) },
+            )
         }
-        composable(Route.PeersCloseChannel.pattern) {
-            PlaceholderScreen("Close Channel", backFor(Route.PeersCloseChannel))
+        composable(Route.PeersCloseChannel.pattern) { entry ->
+            val channelId = androidx.compose.runtime.remember(entry) {
+                entry.savedStateHandle.remove<String>(CLOSE_CHANNEL_ID_KEY)
+            }
+            val force = androidx.compose.runtime.remember(entry) {
+                entry.savedStateHandle.remove<Boolean>(CLOSE_CHANNEL_FORCE_KEY) ?: false
+            }
+            CloseChannelScreen(
+                port = holder,
+                channelId = channelId,
+                initialForce = force,
+                onBack = { navController.navigateTo(Route.AdvancedPeers) },
+                onTrackProgress = { id ->
+                    navController.navigate(Route.ActivityCloseDetail.path(id)) {
+                        launchSingleTop = true
+                        popUpTo(Route.PeersCloseChannel.pattern) { inclusive = true }
+                    }
+                },
+                onDone = { navController.navigateTo(Route.Home) },
+                onMissingChannel = { navController.navigateTo(Route.AdvancedPeers) },
+            )
         }
     }
 }

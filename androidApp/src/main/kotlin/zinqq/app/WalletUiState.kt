@@ -24,6 +24,20 @@ data class CloseDetailUi(
     val record: CloseRecordView?,
 )
 
+/**
+ * The Restore screen's live progress and terminal outcome (U17, F3). Held on
+ * [UiState] because the holder owns the whole stop → restore → restart
+ * sequence in its process scope: leaving the screen mid-restore must not
+ * orphan a stopped node, and the screen re-attaches to whatever phase is
+ * current. `null` = no restore this session.
+ */
+sealed interface RestoreUi {
+    /** [step] is the PWA's exact progress copy from `RestoreProgress` events. */
+    data class InProgress(val step: String) : RestoreUi
+    data object Succeeded : RestoreUi
+    data class Failed(val message: String) : RestoreUi
+}
+
 /** Immutable screen state; only [reduce] and wallet-data refreshes produce new values. */
 data class UiState(
     val nodeRunning: Boolean = false,
@@ -65,6 +79,15 @@ data class UiState(
      * "Something went wrong" state (`Home.tsx:29-42`).
      */
     val startError: String? = null,
+    /**
+     * This node's pubkey for the Advanced screen's copy card (U17): queried
+     * on every wallet-data refresh, kept cached across stops (`node_id()`
+     * needs a running node) — the card simply doesn't render before the
+     * first successful start, like the PWA's not-ready gate.
+     */
+    val nodeId: String? = null,
+    /** The Restore flow's live phase (U17, F3); null = no restore running. */
+    val restore: RestoreUi? = null,
 )
 
 /**
@@ -121,6 +144,15 @@ fun reduce(state: UiState, event: Event): UiState =
         // Fresh recovery state invalidates a session-local banner dismissal
         // (the holder re-queries the state itself; see shouldRefreshWalletData).
         is Event.RecoveryStateChanged -> state.copy(recoveryBannerDismissed = false)
+        // U17/F3: the core's restore emits the PWA's exact step copy; it only
+        // advances an in-progress restore — a stray late event can neither
+        // start one nor overwrite a terminal outcome.
+        is Event.RestoreProgress ->
+            if (state.restore is RestoreUi.InProgress) {
+                state.copy(restore = RestoreUi.InProgress(event.step))
+            } else {
+                state
+            }
         // KTD-5: the Event enum grows ahead of the shells (U5 added backup /
         // sweep / recovery / restore variants fired by later units); reducers
         // ignore unrecognized variants defensively.
