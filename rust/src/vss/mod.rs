@@ -38,7 +38,7 @@ pub use store::{DualWriteKvStore, VssBackedStore};
 /// listing entries matchable against plaintext keys in assertions.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
@@ -104,6 +104,27 @@ pub(crate) mod test_support {
 
         pub(crate) fn put_many_calls(&self) -> Vec<BatchItems> {
             self.put_many_calls.lock().unwrap().clone()
+        }
+
+        /// Every plaintext key the client has ever ASKED this transport to
+        /// store — single puts and transactional batches, successful or not.
+        /// The remote-key-surface regression guard reads this: a key that was
+        /// put and later deleted still proves the write path can reach it.
+        pub(crate) fn attempted_put_keys(&self) -> BTreeSet<String> {
+            self.put_attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, _, _)| key.clone())
+                .chain(
+                    self.put_many_calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .flatten()
+                        .map(|(key, _, _)| key.clone()),
+                )
+                .collect()
         }
 
         pub(crate) fn get_calls_for(&self, key: &str) -> usize {

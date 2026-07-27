@@ -47,8 +47,8 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use super::known_peers::{read_local_known_peers, serialize_known_peers};
 use super::store::{
-    monitor_vss_key, VssTransport, CHANNEL_MANAGER_VSS_KEY, CLOSE_RECORDS_VSS_KEY,
-    FORCE_CLOSE_RECOVERY_VSS_KEY, KNOWN_PEERS_VSS_KEY, MONITOR_MANIFEST_KEY,
+    monitor_vss_key, VssTransport, CHANNEL_MANAGER_VSS_KEY, FIXED_REMOTE_KEYS, KNOWN_PEERS_VSS_KEY,
+    MONITOR_MANIFEST_KEY,
 };
 use crate::builder::BuildError;
 use crate::keys::RESTORE_IN_PROGRESS_FILE_NAME;
@@ -311,16 +311,10 @@ pub(crate) fn establish_vss_state(
         // Branch (3): mandatory version seeding from the listing.
         let by_obfuscated: HashMap<String, i64> = listing.into_iter().collect();
         let mut versions = HashMap::new();
-        let fixed = [
-            CHANNEL_MANAGER_VSS_KEY,
-            MONITOR_MANIFEST_KEY,
-            KNOWN_PEERS_VSS_KEY,
-            // U10: seeded so the first close-record / recovery write of a
-            // session puts at the real server version instead of 409ing.
-            CLOSE_RECORDS_VSS_KEY,
-            FORCE_CLOSE_RECOVERY_VSS_KEY,
-        ];
-        for key in fixed
+        // Every fixed key, from the shared list — including U10's
+        // `close_records` / `force_close_recovery`, so the first write of a
+        // session puts at the real server version instead of 409ing.
+        for key in FIXED_REMOTE_KEYS
             .iter()
             .map(|k| k.to_string())
             .chain(monitor_keys.iter().cloned())

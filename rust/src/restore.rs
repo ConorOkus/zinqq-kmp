@@ -69,18 +69,10 @@ use crate::vss::known_peers::{
 };
 use crate::vss::store::{
     parse_monitor_manifest, VersionedValue, VssTransport, CHANNEL_MANAGER_VSS_KEY,
-    FENCED_FLAG_FILE_NAME, KNOWN_PEERS_VSS_KEY, MONITOR_MANIFEST_KEY,
+    FENCED_FLAG_FILE_NAME, FIXED_REMOTE_KEYS, KNOWN_PEERS_VSS_KEY, MONITOR_MANIFEST_KEY,
 };
 use crate::vss::VssError;
 use crate::wallet::OnchainWallet;
-
-/// The close-records VSS key (PWA `close-records/store.ts`). Written by U10;
-/// U4 only needs it as an EXPECTED key during manifest reconciliation.
-pub(crate) const CLOSE_RECORDS_VSS_KEY: &str = "close_records";
-
-/// The force-close-recovery VSS key (PWA `recovery/recovery-state.ts`).
-/// Written by U10; expected during reconciliation.
-pub(crate) const FORCE_CLOSE_RECOVERY_VSS_KEY: &str = "force_close_recovery";
 
 /// Monitors are downloaded in parallel chunks of this size (PWA
 /// `VSS_RECOVERY_CHUNK_SIZE`).
@@ -324,14 +316,24 @@ pub(crate) async fn fetch_manifest(
     }
 }
 
+/// How many unexplained obfuscated keys the error names before eliding the
+/// rest. Obfuscated keys are HMACs of key NAMES, never of secrets, so quoting
+/// a few is safe — and without at least one the failure is un-triageable.
+const UNEXPLAINED_KEYS_IN_ERROR: usize = 3;
+
 /// Manifest reconciliation (U4, adversarially reviewed — load-bearing):
 /// every key `listKeyVersions` reports must be EXPLAINED — the obfuscated
-/// form of a manifest entry or of one of the fixed keys (`channel_manager`,
-/// `_monitor_keys`, `_known_peers`, `close_records`,
-/// `force_close_recovery`). Any unexplained remote key means the manifest
-/// undercounts the monitors (or the store holds foreign data): restoring
-/// would silently drop fund-safety state, so the restore aborts BEFORE any
-/// write with a typed error.
+/// form of a manifest entry or of one of [`FIXED_REMOTE_KEYS`]. Any
+/// unexplained remote key means the manifest undercounts the monitors (or the
+/// store holds foreign data): restoring would silently drop fund-safety
+/// state, so the restore aborts BEFORE any write with a typed error.
+///
+/// The error text is a triage report, not just a hash: it names how big the
+/// listing was, how much of it the manifest and the fixed keys each accounted
+/// for, WHICH fixed keys were present versus absent, and the first few
+/// unexplained obfuscated keys. All of that is derived from key NAMES and
+/// counts — no blob is fetched or decrypted here, and the mnemonic,
+/// encryption key and plaintext values never enter the message.
 pub(crate) fn reconcile_backup_keys(
     listing: &[(String, i64)],
     manifest_keys: &[String],
@@ -340,17 +342,19 @@ pub(crate) fn reconcile_backup_keys(
     // Obfuscated keys are deterministic HMACs, so the obfuscated form of
     // every EXPECTED plaintext key is computable client-side and set-diffed
     // against the (obfuscated) listing.
-    let expected: HashSet<String> = [
-        CHANNEL_MANAGER_VSS_KEY,
-        MONITOR_MANIFEST_KEY,
-        KNOWN_PEERS_VSS_KEY,
-        CLOSE_RECORDS_VSS_KEY,
-        FORCE_CLOSE_RECOVERY_VSS_KEY,
-    ]
-    .iter()
-    .map(|key| transport.obfuscate(key))
-    .chain(manifest_keys.iter().map(|key| transport.obfuscate(key)))
-    .collect();
+    let fixed: Vec<(&str, String)> = FIXED_REMOTE_KEYS
+        .iter()
+        .map(|key| (*key, transport.obfuscate(key)))
+        .collect();
+    let manifest_obfuscated: HashSet<String> = manifest_keys
+        .iter()
+        .map(|key| transport.obfuscate(key))
+        .collect();
+    let expected: HashSet<&String> = fixed
+        .iter()
+        .map(|(_, obfuscated)| obfuscated)
+        .chain(manifest_obfuscated.iter())
+        .collect();
     let unexplained: Vec<&str> = listing
         .iter()
         .filter(|(obfuscated_key, _)| !expected.contains(obfuscated_key))
@@ -359,12 +363,50 @@ pub(crate) fn reconcile_backup_keys(
     if unexplained.is_empty() {
         return Ok(());
     }
+
+    // Which side of the comparison came up short: the plaintext names are the
+    // only actionable fact a user or developer can relay.
+    let listed: HashSet<&str> = listing.iter().map(|(key, _)| key.as_str()).collect();
+    let mut present: Vec<&str> = Vec::new();
+    let mut absent: Vec<&str> = Vec::new();
+    for (plaintext, obfuscated) in &fixed {
+        if listed.contains(obfuscated.as_str()) {
+            present.push(plaintext);
+        } else {
+            absent.push(plaintext);
+        }
+    }
+    let explained_by_manifest = listing
+        .iter()
+        .filter(|(key, _)| manifest_obfuscated.contains(key))
+        .count();
+    let shown: Vec<&str> = unexplained
+        .iter()
+        .take(UNEXPLAINED_KEYS_IN_ERROR)
+        .copied()
+        .collect();
+    let elided = unexplained.len().saturating_sub(shown.len());
     Err(RestoreError::BackupInconsistent {
         detail: format!(
-            "{} remote key(s) are not explained by the monitor manifest or the fixed key set \
-             (first unexplained obfuscated key: {})",
+            "{} of the {} key(s) on the backup server are not explained. The monitor manifest \
+             declares {} monitor key(s) and accounts for {} of the listing; the expected wallet \
+             keys account for {} more. Expected keys found: [{}]. Expected keys absent: [{}]. \
+             Unexplained obfuscated key(s): {}{}. This is usually a channel-monitor backup that \
+             was uploaded but never listed in the manifest, so restoring from it could silently \
+             drop channel state — nothing was written locally.",
             unexplained.len(),
-            unexplained[0]
+            listing.len(),
+            manifest_keys.len(),
+            explained_by_manifest,
+            present.len(),
+            present.join(", "),
+            absent.join(", "),
+            shown.join(", "),
+            if elided > 0 {
+                format!(" (+{elided} more)")
+            } else {
+                String::new()
+            }
         ),
     })
 }
@@ -1075,17 +1117,14 @@ mod tests {
     fn reconciliation_accepts_the_fixed_key_set_and_manifest_entries() {
         let transport = MockTransport::new();
         let monitor_key = format!("{}:0", "ab".repeat(32));
-        let listing: Vec<(String, i64)> = [
-            CHANNEL_MANAGER_VSS_KEY,
-            MONITOR_MANIFEST_KEY,
-            KNOWN_PEERS_VSS_KEY,
-            CLOSE_RECORDS_VSS_KEY,
-            FORCE_CLOSE_RECOVERY_VSS_KEY,
-            monitor_key.as_str(),
-        ]
-        .iter()
-        .map(|key| (key.to_string(), 1))
-        .collect();
+        // Driven off the shared list, so a key added there without teaching
+        // reconcile about it can never pass unnoticed.
+        let listing: Vec<(String, i64)> = FIXED_REMOTE_KEYS
+            .iter()
+            .copied()
+            .chain(std::iter::once(monitor_key.as_str()))
+            .map(|key| (key.to_string(), 1))
+            .collect();
         reconcile_backup_keys(&listing, std::slice::from_ref(&monitor_key), &transport)
             .expect("every key is explained");
 
@@ -1095,6 +1134,63 @@ mod tests {
             reconcile_backup_keys(&with_rogue, std::slice::from_ref(&monitor_key), &transport),
             Err(RestoreError::BackupInconsistent { .. })
         ));
+    }
+
+    /// A bare hash is not a bug report: `BackupInconsistent` must name what
+    /// was actually COMPARED — the listing size, how much of it the manifest
+    /// and the expected keys each accounted for, and which expected plaintext
+    /// keys were present versus absent — so a user's screenshot is
+    /// triageable. It must stay leak-free: obfuscated keys, plaintext KEY
+    /// NAMES and counts only, never a value.
+    #[test]
+    fn backup_inconsistent_names_what_was_compared_without_leaking_values() {
+        let transport = MockTransport::new();
+        let monitor_key = format!("{}:0", "ab".repeat(32));
+        let orphan_a = format!("{}:0", "cd".repeat(32));
+        let orphan_b = format!("{}:1", "cd".repeat(32));
+        let orphan_c = format!("{}:2", "cd".repeat(32));
+        let orphan_d = format!("{}:3", "cd".repeat(32));
+        // A partially-populated backup: CM + manifest + one listed monitor,
+        // and four monitor blobs the manifest never declared.
+        let listing: Vec<(String, i64)> = [
+            CHANNEL_MANAGER_VSS_KEY,
+            MONITOR_MANIFEST_KEY,
+            monitor_key.as_str(),
+            orphan_a.as_str(),
+            orphan_b.as_str(),
+            orphan_c.as_str(),
+            orphan_d.as_str(),
+        ]
+        .iter()
+        .map(|key| (key.to_string(), 1))
+        .collect();
+
+        let detail =
+            match reconcile_backup_keys(&listing, std::slice::from_ref(&monitor_key), &transport) {
+                Err(RestoreError::BackupInconsistent { detail }) => detail,
+                other => panic!("expected BackupInconsistent, got {other:?}"),
+            };
+
+        // The comparison, in numbers.
+        assert!(detail.contains("4 of the 7 key(s)"), "{detail}");
+        assert!(detail.contains("declares 1 monitor key(s)"), "{detail}");
+        assert!(detail.contains("accounts for 1 of the listing"), "{detail}");
+        // Which expected keys the server actually had, by plaintext name.
+        assert!(
+            detail.contains("found: [channel_manager, _monitor_keys]"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("absent: [_known_peers, close_records, force_close_recovery]"),
+            "{detail}"
+        );
+        // The offenders, capped, with the remainder counted.
+        assert!(detail.contains(&orphan_a), "{detail}");
+        assert!(detail.contains("(+1 more)"), "{detail}");
+        assert!(
+            !detail.contains(&orphan_d),
+            "the listing is truncated, not dumped: {detail}"
+        );
     }
 
     // ---------- scenario 2: rollback / original intact ----------

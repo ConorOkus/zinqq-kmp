@@ -3099,4 +3099,150 @@ mod tests {
         assert!(node.payment_detail(&payment_id_hex).is_some());
         assert!(node.list_activity().is_none());
     }
+
+    // ---------- U3/U4 remote-key-surface regression guard ----------
+
+    /// PERMANENT REGRESSION GUARD (lifecycle half) for the bug reported as
+    /// `Restore failed: backup inconsistent: N remote key(s) are not
+    /// explained by the monitor manifest or the fixed key set`.
+    ///
+    /// [`crate::restore::reconcile_backup_keys`] aborts a restore when
+    /// `listKeyVersions` reports ANY key that is not the obfuscated form of a
+    /// [`crate::vss::store::FIXED_REMOTE_KEYS`] entry or of a manifest entry.
+    /// That guard is only safe if our own node can never upload such a key:
+    /// one mis-wired component (a store handed the VSS-backed store instead
+    /// of the plain local one, or a new blob written remotely without being
+    /// added to the shared fixed list) would permanently brick restore for
+    /// that seed, and the failure would only surface months later at the
+    /// worst possible moment.
+    ///
+    /// So boot a REAL VSS-enabled node over a recording transport, drive the
+    /// whole fresh-wallet lifecycle — start (fresh channel manager, the BDK
+    /// persister, the network graph, the scorer, the LDK event queue and the
+    /// liquidity manager's own event queue all persist), a known-peer write,
+    /// a close record, a force-close recovery state, stop — and then run the
+    /// PRODUCTION reconciliation against the resulting server listing. Also
+    /// diff every key the transport was ever ASKED to store, which catches
+    /// writes that were later deleted.
+    ///
+    /// If this test ever fails, the offending plaintext key is printed: fix
+    /// the WIRING (route it at the plain local `FilesystemStore`), or, if the
+    /// key genuinely belongs in the backup, add it to `FIXED_REMOTE_KEYS` —
+    /// the one list both the writers and reconcile read. Never widen
+    /// reconcile alone: it is the guard that catches a manifest undercounting
+    /// monitors, which is a fund-safety check.
+    #[test]
+    fn fresh_wallet_lifecycle_never_writes_a_remote_key_restore_cannot_explain() {
+        use crate::close_records::CloseRecord;
+        use crate::config::VssTransportOverride;
+        use crate::restore::reconcile_backup_keys;
+        use crate::vss::store::{
+            parse_monitor_manifest, VssTransport, FIXED_REMOTE_KEYS, MONITOR_MANIFEST_KEY,
+        };
+        use crate::vss::test_support::MockTransport;
+
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let mut config = offline_config(dir.path());
+        config.vss_disabled = false;
+        config.vss_transport_override = Some(VssTransportOverride(
+            Arc::clone(&transport) as Arc<dyn VssTransport>
+        ));
+
+        let node = Node::new(config);
+        node.start().expect("fresh VSS-enabled offline start");
+
+        // Give the startup tasks, the background processor and the liquidity
+        // manager a chance to persist through their stores.
+        std::thread::sleep(Duration::from_millis(750));
+
+        // U9/R10: a saved peer — the `_known_peers` LWW blob.
+        node.channel_handles()
+            .expect("the node is running")
+            .known_peers
+            .upsert(
+                "02eadbd9e7557375161df8b646776a547c5cbc2e95b3071ec81553f8ec2cea3b8c",
+                "127.0.0.1",
+                9735,
+            )
+            .expect("known-peer persist");
+
+        // U10/R9: the close-records map and the force-close recovery blob.
+        let channel_id = "cd".repeat(32);
+        node.close_records
+            .upsert(CloseRecord::skeleton(&channel_id, 1_700_000_000_000));
+        node.recovery
+            .enter(&channel_id, Some(25_000), || None, None, 1_700_000_000_000);
+
+        std::thread::sleep(Duration::from_millis(750));
+        node.stop().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listing = rt.block_on(transport.list_key_versions()).unwrap();
+        assert!(
+            !listing.is_empty(),
+            "a VSS-enabled fresh wallet must back the channel manager up remotely; an empty \
+             listing would make this guard vacuous"
+        );
+
+        // The manifest as a restoring client would read it.
+        let manifest_keys: Vec<String> = match rt.block_on(transport.get(MONITOR_MANIFEST_KEY)) {
+            Ok(Some((bytes, _))) => {
+                parse_monitor_manifest(&bytes).expect("our own manifest parses")
+            }
+            _ => Vec::new(),
+        };
+
+        // 1. The production predicate over the production listing.
+        if let Err(e) = reconcile_backup_keys(&listing, &manifest_keys, &*transport) {
+            let explained: std::collections::BTreeSet<String> = FIXED_REMOTE_KEYS
+                .iter()
+                .map(|k| k.to_string())
+                .chain(manifest_keys.iter().cloned())
+                .collect();
+            let offenders: Vec<&str> = listing
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .filter(|key| !explained.contains(*key))
+                .collect();
+            panic!(
+                "a fresh wallet's own lifecycle produced a remote key restore cannot explain: \
+                 {offenders:?}\nroute these at the local FilesystemStore, or add them to \
+                 FIXED_REMOTE_KEYS if they truly belong in the backup.\nreconcile said: {e}"
+            );
+        }
+
+        // 2. Every key the transport was ever ASKED to store, including any
+        //    since deleted (the mock's `obfuscate` is the identity, so these
+        //    ARE the plaintext keys).
+        let explained: std::collections::BTreeSet<String> = FIXED_REMOTE_KEYS
+            .iter()
+            .map(|k| k.to_string())
+            .chain(manifest_keys.iter().cloned())
+            .collect();
+        let attempted = transport.attempted_put_keys();
+        let unexplained: Vec<&String> = attempted.difference(&explained).collect();
+        assert!(
+            unexplained.is_empty(),
+            "these plaintext keys were written to VSS but restore cannot explain them: \
+             {unexplained:?} (attempted: {attempted:?}, explained: {explained:?})"
+        );
+
+        // The lifecycle really did exercise the remote blob writers — a guard
+        // over an empty write set proves nothing.
+        for key in [
+            crate::vss::store::CHANNEL_MANAGER_VSS_KEY,
+            crate::vss::store::KNOWN_PEERS_VSS_KEY,
+            crate::vss::store::CLOSE_RECORDS_VSS_KEY,
+            crate::vss::store::FORCE_CLOSE_RECOVERY_VSS_KEY,
+        ] {
+            assert!(
+                attempted.contains(key),
+                "the lifecycle must exercise the {key} writer for this guard to mean anything"
+            );
+        }
+    }
 }

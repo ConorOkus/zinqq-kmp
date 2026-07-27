@@ -85,6 +85,33 @@ pub(crate) const FORCE_CLOSE_RECOVERY_VSS_KEY: &str = "force_close_recovery";
 /// PWA-shaped.
 pub(crate) const CHANNEL_MANAGER_VSS_KEY: &str = "channel_manager";
 
+/// EVERY fixed (non per-monitor) plaintext key this wallet stores remotely —
+/// the SINGLE source of truth, so a writer and a reader can never drift.
+///
+/// Three consumers read it and they must agree exactly:
+///
+/// 1. the writers (CM dual-write, `_monitor_keys`, `_known_peers`,
+///    `close_records`, `force_close_recovery`);
+/// 2. [`super::startup`]'s mandatory version seeding, which needs a server
+///    version for every key a session may put;
+/// 3. U4's [`crate::restore::reconcile_backup_keys`], which aborts a restore
+///    when `listKeyVersions` reports a key that is neither one of these nor a
+///    manifest entry.
+///
+/// Adding a key in only one of those places is precisely how a restore starts
+/// failing with `BackupInconsistent` on a perfectly healthy backup, so the
+/// list lives here and nowhere else. Everything NOT in this list plus the
+/// manifest's per-monitor keys is local-only (graph, scorer, sweeper
+/// descriptors, the liquidity-manager event queue, funding txs, payment
+/// history, the BDK changeset, the event queue).
+pub(crate) const FIXED_REMOTE_KEYS: [&str; 5] = [
+    CHANNEL_MANAGER_VSS_KEY,
+    MONITOR_MANIFEST_KEY,
+    KNOWN_PEERS_VSS_KEY,
+    CLOSE_RECORDS_VSS_KEY,
+    FORCE_CLOSE_RECOVERY_VSS_KEY,
+];
+
 /// Manifest entry cap (PWA `MAX_MANIFEST_ENTRIES`).
 pub(crate) const MAX_MANIFEST_ENTRIES: usize = 1_000;
 
@@ -2183,5 +2210,204 @@ mod tests {
             "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000:1"
         );
         assert!(is_valid_monitor_key(&monitor_vss_key(&outpoint)));
+    }
+
+    /// PERMANENT REGRESSION GUARD (routing half) for the
+    /// `BackupInconsistent`-on-a-healthy-backup class of bug.
+    ///
+    /// [`DualWriteKvStore`] is the ONLY `KVStoreSync` a remote-capable store
+    /// hides behind: the background processor persists the channel manager,
+    /// the network graph, the scorer, the output sweeper and the
+    /// liquidity-manager event queue through this one object. Exactly one of
+    /// those namespaces may reach VSS — a second one would upload a key
+    /// [`crate::restore::reconcile_backup_keys`] cannot explain and would
+    /// permanently brick restore for that seed.
+    ///
+    /// So: drive every namespace the node actually uses through
+    /// `KVStoreSync::write` and assert the transport saw the channel manager
+    /// and NOTHING else, while every write landed locally.
+    #[test]
+    fn dual_write_store_routes_only_the_channel_manager_to_vss() {
+        use lightning::util::persist::{
+            NETWORK_GRAPH_PERSISTENCE_KEY, NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+            NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE, OUTPUT_SWEEPER_PERSISTENCE_KEY,
+            OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
+            OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE, SCORER_PERSISTENCE_KEY,
+            SCORER_PERSISTENCE_PRIMARY_NAMESPACE, SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+        };
+        use lightning_liquidity::persist::{
+            LIQUIDITY_MANAGER_EVENT_QUEUE_PERSISTENCE_KEY,
+            LIQUIDITY_MANAGER_EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+            LIQUIDITY_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+        };
+
+        let h = harness();
+        let dual = DualWriteKvStore::new(Arc::clone(&h.store), Arc::clone(&h.local));
+
+        // Every namespace that reaches the dual store in production. The
+        // liquidity-manager event queue is the one a fresh wallet writes even
+        // with zero channels — the exact shape that would produce a single
+        // unexplained remote key.
+        let local_only = [
+            (
+                NETWORK_GRAPH_PERSISTENCE_PRIMARY_NAMESPACE,
+                NETWORK_GRAPH_PERSISTENCE_SECONDARY_NAMESPACE,
+                NETWORK_GRAPH_PERSISTENCE_KEY,
+            ),
+            (
+                SCORER_PERSISTENCE_PRIMARY_NAMESPACE,
+                SCORER_PERSISTENCE_SECONDARY_NAMESPACE,
+                SCORER_PERSISTENCE_KEY,
+            ),
+            (
+                OUTPUT_SWEEPER_PERSISTENCE_PRIMARY_NAMESPACE,
+                OUTPUT_SWEEPER_PERSISTENCE_SECONDARY_NAMESPACE,
+                OUTPUT_SWEEPER_PERSISTENCE_KEY,
+            ),
+            (
+                LIQUIDITY_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+                LIQUIDITY_MANAGER_EVENT_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE,
+                LIQUIDITY_MANAGER_EVENT_QUEUE_PERSISTENCE_KEY,
+            ),
+        ];
+        for (primary, secondary, key) in local_only {
+            dual.write(primary, secondary, key, b"local-only".to_vec())
+                .unwrap();
+            assert_eq!(
+                h.local.read(primary, secondary, key).unwrap(),
+                b"local-only".to_vec(),
+                "{primary}/{secondary}/{key} must persist locally"
+            );
+        }
+        assert_eq!(
+            h.transport.attempted_put_keys(),
+            BTreeSet::new(),
+            "no namespace other than the channel manager may reach VSS: an unexplained remote \
+             key permanently aborts every future restore for this seed"
+        );
+
+        // The channel manager DOES go remote — under the one plaintext key
+        // reconcile expects, never under LDK's local `manager` key.
+        dual.write(
+            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_KEY,
+            b"cm-bytes".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            h.transport.attempted_put_keys(),
+            BTreeSet::from([CHANNEL_MANAGER_VSS_KEY.to_string()])
+        );
+        assert!(FIXED_REMOTE_KEYS.contains(&CHANNEL_MANAGER_VSS_KEY));
+    }
+
+    /// The listing a restoring client would see, as `(plaintext key, version)`
+    /// pairs — the mock's `obfuscate` is the identity, so plaintext IS the
+    /// wire form here.
+    fn remote_listing(h: &Harness) -> Vec<(String, i64)> {
+        h.rt.block_on(h.transport.list_key_versions()).unwrap()
+    }
+
+    fn remote_manifest_keys(h: &Harness) -> Vec<String> {
+        match h.transport.value(MONITOR_MANIFEST_KEY) {
+            Some((bytes, _)) => parse_monitor_manifest(&bytes).unwrap(),
+            None => Vec::new(),
+        }
+    }
+
+    /// PERMANENT REGRESSION GUARD (monitor half): a COMPLETED new-channel
+    /// persist must leave the remote store fully self-describing — every key
+    /// present is either a [`FIXED_REMOTE_KEYS`] entry or listed in the
+    /// manifest, which is exactly what
+    /// [`crate::restore::reconcile_backup_keys`] demands. If the monitor key
+    /// derivation and the manifest contents ever drift apart, restore breaks
+    /// for every wallet with a channel, and this fails first.
+    #[test]
+    fn a_completed_monitor_persist_leaves_every_remote_key_explained() {
+        let h = harness();
+        let mon_key = format!("{}:0", "bb".repeat(32));
+
+        h.store
+            .queue_monitor_write(monitor_write(0xbb, 0, b"new"), true);
+        wait_until(&h.rt, || !h.completion.0.lock().unwrap().is_empty());
+
+        let listing = remote_listing(&h);
+        let manifest_keys = remote_manifest_keys(&h);
+        assert!(manifest_keys.contains(&mon_key));
+        crate::restore::reconcile_backup_keys(&listing, &manifest_keys, &*h.transport)
+            .expect("a completed monitor persist must reconcile cleanly");
+    }
+
+    /// KNOWN HAZARD, pinned deliberately (NOT desirable behavior).
+    ///
+    /// [`Inner::run_monitor_job`] puts the monitor blob remotely BEFORE the
+    /// gating manifest write. That ordering is what makes the completion
+    /// signal safe (LDK stays halted until the manifest lists the monitor),
+    /// but it leaves a window: if the process dies after the blob lands and
+    /// before the manifest does — a mobile app killed while `_monitor_keys`
+    /// puts are being retried through a VSS outage — the store keeps a
+    /// monitor blob that no manifest entry explains.
+    ///
+    /// That orphan is UNRECOVERABLE client-side: keys go over the wire as
+    /// HMACs of their names, so a later session cannot even learn the orphan's
+    /// plaintext key to delete it or to backfill the manifest. Every future
+    /// restore for that seed therefore aborts with `BackupInconsistent`, and
+    /// this test shows it produces the exact reported shape — one unexplained
+    /// key alongside a healthy `channel_manager`.
+    ///
+    /// This is pinned so the contradiction between the archive/manifest
+    /// "best-effort" posture and reconcile's hard abort stays VISIBLE. The
+    /// real fix is atomicity — one transactional `putObjects` carrying the new
+    /// monitor blob and the manifest together — which changes the KTD-3
+    /// per-key conflict/fence semantics and is the maintainer's call. If you
+    /// make that change, this test SHOULD fail: replace it with its positive
+    /// counterpart above.
+    #[test]
+    fn a_monitor_persist_interrupted_before_the_manifest_orphans_a_remote_key() {
+        let h = harness();
+        let mon_key = format!("{}:0", "bb".repeat(32));
+        // A healthy channel_manager backup, as any started wallet has.
+        h.rt.block_on(async {
+            h.transport
+                .put(CHANNEL_MANAGER_VSS_KEY, b"cm-bytes", 0)
+                .await
+                .unwrap()
+        });
+        // The manifest put never lands: the process dies in the window.
+        h.transport.fail_puts_for(MONITOR_MANIFEST_KEY, true);
+
+        h.store
+            .queue_monitor_write(monitor_write(0xbb, 0, b"new"), true);
+        wait_until(&h.rt, || h.transport.value(&mon_key).is_some());
+        wait_until(&h.rt, || {
+            h.transport.put_attempts_for(MONITOR_MANIFEST_KEY) >= 2
+        });
+
+        let listing = remote_listing(&h);
+        assert_eq!(
+            listing.len(),
+            2,
+            "channel_manager plus the orphaned monitor"
+        );
+        assert!(
+            remote_manifest_keys(&h).is_empty(),
+            "the manifest never landed"
+        );
+        let err = crate::restore::reconcile_backup_keys(&listing, &[], &*h.transport)
+            .expect_err("an orphaned monitor blob must abort the restore");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("1 of the 2 key(s)"),
+            "the error must name what was compared, got: {detail}"
+        );
+        assert!(
+            detail.contains(&mon_key),
+            "the error must name the unexplained key, got: {detail}"
+        );
+        assert!(
+            detail.contains("channel_manager") && detail.contains("_monitor_keys"),
+            "the error must say which expected keys were present and absent, got: {detail}"
+        );
     }
 }
