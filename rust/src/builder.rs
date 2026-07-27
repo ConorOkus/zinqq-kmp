@@ -595,6 +595,12 @@ pub(crate) fn build(
         CHANNEL_MANAGER_PERSISTENCE_KEY,
     )?;
 
+    // Whether local LDK state pre-dated this boot: with a persisted manager the
+    // bdk wallet's address history was NOT necessarily produced on this device
+    // (a restored install writes the manager before its first scan), so the
+    // first full scan takes the cold-restore stop gap.
+    let had_local_channel_manager = cm_bytes.is_some();
+
     // U4 integrity check, first half (the PWA's orphaned-monitors halt):
     // monitors with no manager mean channels whose state is lost — starting
     // fresh would silently discard channel funds.
@@ -708,6 +714,33 @@ pub(crate) fn build(
         }
         None => make_fresh_manager()?,
     };
+
+    // KTD-4 cross-client restore fix, BEFORE any chain scan: reveal the
+    // deterministic close/sweep destination of every channel this boot loaded
+    // to the bdk wallet, so the on-chain side of a restored wallet actually
+    // watches where its close funds landed. Both reads above
+    // (`read_channel_monitors` and the `ChannelManager` deserialization) ran
+    // through `signer_provider`, which recorded each channel's
+    // `channel_keys_id`; see `WalletSignerProvider::reveal_derived_destinations`
+    // for the full rationale, including the archived-monitor residual. Runs on
+    // EVERY boot — plain restarts and `vss::startup::silent_recovery` need the
+    // same guarantee, and re-revealing is a monotone no-op.
+    match signer_provider.reveal_derived_destinations() {
+        Some(max_index) => log_info!(
+            logger,
+            "Revealed on-chain close destinations for {} loaded channel(s), up to external \
+             index {max_index}",
+            signer_provider.derived_channel_count()
+        ),
+        None => log_info!(logger, "No channel close destinations to reveal."),
+    }
+
+    // A restore / silent recovery inherits an EMPTY bdk changeset over another
+    // client's address history, so its one full scan gets the wider cold-restore
+    // stop gap (`BDK_COLD_RESTORE_STOP_GAP`).
+    if vss_recovered || !channel_monitors.is_empty() || had_local_channel_manager {
+        onchain_wallet.mark_cold_restore();
+    }
 
     // Initial chain sync of manager AND monitors — BEFORE watch_channel.
     let chain_synced_at_start = {

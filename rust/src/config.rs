@@ -133,9 +133,32 @@ pub(crate) const RGS_SYNC_INTERVAL: Duration = Duration::from_secs(3600);
 /// How often the reconnect loop checks configured peers.
 pub(crate) const PEER_RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// BDK full-scan stop gap / request concurrency.
+/// BDK full-scan stop gap / request concurrency. The steady-state value, used
+/// for the full scan of a wallet THIS device created: its revealed indices and
+/// its history were produced here, so BIP44's conventional 20-address gap is
+/// ample.
 pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
 pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
+
+/// Stop gap for the FIRST full scan of a wallet that came from a restore or a
+/// silent recovery (U4/KTD-3) — a cold start over someone else's address
+/// history.
+///
+/// A cross-client restore inherits an EMPTY bdk changeset: nothing local
+/// records how many addresses the PWA revealed before the seed moved here, and
+/// [`BDK_CLIENT_STOP_GAP`] (20) gives no room for a wallet that burned
+/// addresses without receiving to them (every Receive-screen tap, every
+/// shutdown script, every sweep destination advances the PWA's external index
+/// whether or not the address is ever paid). 20 consecutive unused addresses is
+/// a realistic gap on a wallet that has been used for a while; 200 is not.
+///
+/// 200 is one order of magnitude of headroom for ~400 extra Esplora script
+/// queries (external + internal) on a ONE-TIME scan, and it is deliberately far
+/// short of the 10 000-index deterministic destination space: those indices are
+/// reached by DERIVATION (see
+/// [`crate::signer::WalletSignerProvider::reveal_derived_destinations`]), never
+/// by brute-force scanning, so this number does not have to cover them.
+pub(crate) const BDK_COLD_RESTORE_STOP_GAP: usize = 200;
 
 /// Megalith's LSPS2 node id (U4), taken from the Zinqq PWA's own working
 /// configuration (`VITE_LSP_NODE_ID`) rather than a public explorer listing.

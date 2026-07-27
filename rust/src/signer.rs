@@ -16,7 +16,8 @@
 //!   at channel open and replayed from serialized state, so determinism is
 //!   scoped to destination scripts only.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, WPubkeyHash};
@@ -41,6 +42,21 @@ pub(crate) struct WalletSignerProvider {
     keys_manager: Arc<KeysManager>,
     wallet: Arc<OnchainWallet>,
     channel_keys_id_hmac_key: [u8; 32],
+    /// Every `channel_keys_id` LDK has asked this provider to derive a signer
+    /// for. Interior-mutable because `SignerProvider` takes `&self`.
+    ///
+    /// This is how the startup destination reveal
+    /// ([`WalletSignerProvider::reveal_derived_destinations`]) learns which
+    /// channels exist: `lightning` 0.2.4 exposes NO public accessor for a
+    /// deserialized `ChannelMonitor`'s `channel_keys_id`
+    /// (`ChannelMonitor::do_mut_signer_call`, the only route to the signer, is
+    /// `#[cfg(any(test, feature = "_test_utils"))]`-gated inside the crate), so
+    /// the ids are recorded as they flow past. Both
+    /// `read_channel_monitors` (via `OnchainTxHandler`'s `read`) and
+    /// `ChannelManager`'s `read` call `derive_channel_signer` exactly once per
+    /// channel they load, so after startup's reads this set is precisely the
+    /// set of channels this boot knows about.
+    derived_channel_keys_ids: Mutex<BTreeSet<[u8; 32]>>,
     logger: Arc<Logger>,
 }
 
@@ -55,8 +71,95 @@ impl WalletSignerProvider {
             keys_manager,
             wallet,
             channel_keys_id_hmac_key,
+            derived_channel_keys_ids: Mutex::new(BTreeSet::new()),
             logger,
         }
+    }
+
+    /// How many distinct channels this provider has derived a signer for.
+    pub(crate) fn derived_channel_count(&self) -> usize {
+        self.derived_channel_keys_ids.lock().unwrap().len()
+    }
+
+    /// The deterministic destination index of every channel this provider has
+    /// derived a signer for, computed with [`destination_index`] — the SAME
+    /// helper [`SignerProvider::get_destination_script`] uses, so there is one
+    /// source of truth for "where can this channel's close funds land".
+    pub(crate) fn derived_destination_indexes(&self) -> Vec<u32> {
+        let mut indexes: Vec<u32> = self
+            .derived_channel_keys_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .map(destination_index)
+            .collect();
+        indexes.sort_unstable();
+        indexes.dedup();
+        indexes
+    }
+
+    /// Reveals the deterministic close/sweep destination of every channel this
+    /// provider has derived a signer for to the bdk wallet, and persists the
+    /// reveal. Returns the highest revealed EXTERNAL index, or `None` when
+    /// there is nothing to reveal (a wallet with no channels reveals nothing —
+    /// no gratuitous address inflation).
+    ///
+    /// Called from `builder::build` on EVERY boot, after the monitors and the
+    /// channel manager are read and BEFORE the first bdk chain scan.
+    ///
+    /// WHY: `get_destination_script` derives close destinations at
+    /// `BE(channel_keys_id[0..4]) mod 10_000` (KTD-4, PWA parity), so close
+    /// funds can sit at ANY external index up to 9 999. A restored wallet's
+    /// bdk changeset starts with `last_revealed` at 0, and
+    /// `BDK_CLIENT_STOP_GAP` means the full scan never looks anywhere near
+    /// those indices — the on-chain balance of a cross-client restore comes
+    /// back EMPTY even though the closed channels' funds are on chain. This is
+    /// the reveal-on-restore half of the PWA's own
+    /// `bdk-ldk-force-close-destination-script-interop` learning; the
+    /// deterministic-derivation half was already honored. Not gated on the
+    /// restore path: plain restarts and `vss::startup::silent_recovery` need
+    /// the same guarantee, and re-revealing is a monotone no-op.
+    ///
+    /// COST: bdk can only watch an index by REVEALING it, and a reveal is
+    /// inclusive — one channel at index 9 970 means 9 971 tracked external
+    /// addresses, a proportionally larger persisted changeset, and a
+    /// revealed-SPK sync that queries all of them. That cost is inherent to the
+    /// KTD-4 destination scheme and a wallet that OPENED the channel here
+    /// already pays it (`destination_script_for_index` reveals the same index at
+    /// channel-open time); this only stops a restored wallet from silently
+    /// paying less and seeing less.
+    ///
+    /// NOT a brute force of the 10 000-index space. Revealing all of it would
+    /// make every later revealed-SPK sync a 10 000-script Esplora query on a
+    /// mobile connection, for a wallet that has at most a handful of channels.
+    /// RESIDUAL: a channel whose monitor was fully archived AND deleted leaves
+    /// no `channel_keys_id` to derive from, so its destination index is
+    /// unrecoverable by derivation. That is a real, known gap for the
+    /// maintainer — not something a 10k-address scan should paper over.
+    pub(crate) fn reveal_derived_destinations(&self) -> Option<u32> {
+        // Destinations are EXTERNAL-only and `reveal_addresses_to` is
+        // monotone, so revealing to the single highest index covers every
+        // recorded channel in one persist.
+        let max_index = self.derived_destination_indexes().into_iter().max()?;
+        if self.wallet.reveal_external_addresses_to(max_index).is_err() {
+            // The wallet logs the underlying persistence error; an unpersisted
+            // reveal would be lost on the next start (the PWA's
+            // `bdk-address-reveal-not-persisted` learning), so report failure
+            // rather than claim the destinations are watched.
+            log_error!(
+                self.logger,
+                "Failed to reveal channel destination addresses up to external index {max_index}; \
+                 close funds may stay invisible until the next successful start"
+            );
+            return None;
+        }
+        Some(max_index)
+    }
+
+    /// The wallet these destinations are revealed into (tests only).
+    #[cfg(test)]
+    pub(crate) fn wallet(&self) -> &Arc<OnchainWallet> {
+        &self.wallet
     }
 }
 
@@ -91,6 +194,13 @@ impl SignerProvider for WalletSignerProvider {
     }
 
     fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> InMemorySigner {
+        // Record the id: this is the only hook that sees the `channel_keys_id`
+        // of every channel LDK loads (see `derived_channel_keys_ids`), and the
+        // startup destination reveal depends on it.
+        self.derived_channel_keys_ids
+            .lock()
+            .unwrap()
+            .insert(channel_keys_id);
         self.keys_manager.derive_channel_keys(&channel_keys_id)
     }
 
@@ -123,6 +233,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use bdk_wallet::KeychainKind;
     use bitcoin::Network;
     use lightning::sign::ChannelSigner;
     use lightning_persister::fs_store::FilesystemStore;
@@ -242,6 +353,116 @@ mod tests {
         let keys_id = provider.generate_channel_keys_id(true, 42);
         let signer = provider.derive_channel_signer(keys_id);
         assert_eq!(signer.channel_keys_id(), keys_id);
+    }
+
+    // ---------- startup destination reveal (cross-client restore fix) ----------
+
+    /// The bug: a restored wallet never revealed the deterministic close
+    /// destinations, so a channel whose `channel_keys_id` maps to a HIGH index
+    /// (here the PWA vector's 9 970, two orders of magnitude past
+    /// `BDK_CLIENT_STOP_GAP`) was unwatched and its close funds invisible.
+    ///
+    /// `derive_channel_signer` is the exact call LDK makes for every channel it
+    /// loads (`OnchainTxHandler::read` for monitors, `ChannelManager::read` for
+    /// the manager), which is what the provider records. The real-monitor half
+    /// of this — that deserializing an actual serialized `ChannelMonitor`
+    /// records its id — is pinned in `restore::tests`; the fixture monitors'
+    /// harness-generated ids happen to sit at indices 0 and 1, so the
+    /// high-index case is driven from our own PWA-vector id here.
+    #[test]
+    fn startup_reveal_covers_a_high_destination_index() {
+        let (_dir, store) = fresh_store();
+        let provider = test_provider(store);
+
+        let keys_id = provider.generate_channel_keys_id(false, BIG_UCID);
+        let _signer = provider.derive_channel_signer(keys_id);
+        assert_eq!(provider.derived_channel_count(), 1);
+
+        let max_index = provider
+            .reveal_derived_destinations()
+            .expect("one loaded channel must produce a reveal");
+        // ONE source of truth: the index the reveal walks to is the index
+        // `get_destination_script` derives for the same id.
+        assert_eq!(max_index, destination_index(&keys_id));
+        assert_eq!(max_index, EXPECTED_INDEX_OUTBOUND_BIG);
+        assert!(
+            max_index as usize > crate::config::BDK_CLIENT_STOP_GAP,
+            "the regression only bites past the stop gap"
+        );
+
+        // The wallet's revealed EXTERNAL index now covers it...
+        assert_eq!(
+            crate::wallet::test_support::derivation_index(
+                provider.wallet(),
+                KeychainKind::External
+            ),
+            Some(max_index),
+        );
+        // ...and the SPK a sync request would query is the destination script
+        // the signer hands LDK.
+        let destination = provider.get_destination_script(keys_id).unwrap();
+        assert!(
+            provider
+                .wallet()
+                .revealed_sync_request_spks()
+                .contains(&destination),
+            "the next chain sync must query the close destination's SPK"
+        );
+    }
+
+    /// The reveal is worthless unless persisted: an unpersisted reveal is lost
+    /// on the next start (the PWA's `bdk-address-reveal-not-persisted`
+    /// learning), which would resurrect the empty-on-chain-balance bug on the
+    /// very next boot.
+    #[test]
+    fn startup_reveal_survives_a_restart() {
+        let (_dir, store) = fresh_store();
+        let max_index = {
+            let provider = test_provider(Arc::clone(&store));
+            // Index 735 (the inbound-42 vector): still 36x the stop gap, but a
+            // far cheaper reveal than 9 970 for a persistence assertion.
+            let keys_id = provider.generate_channel_keys_id(true, 42);
+            let _signer = provider.derive_channel_signer(keys_id);
+            let max_index = provider.reveal_derived_destinations().unwrap();
+            assert_eq!(max_index, EXPECTED_INDEX_INBOUND_42);
+            max_index
+        };
+
+        // Restart: a fresh provider over the same store, with no channels
+        // loaded yet, still finds the destination revealed.
+        let restarted = test_provider(store);
+        assert_eq!(restarted.derived_channel_count(), 0);
+        assert_eq!(
+            crate::wallet::test_support::derivation_index(
+                restarted.wallet(),
+                KeychainKind::External
+            ),
+            Some(max_index),
+            "the revealed destination index must survive persistence"
+        );
+    }
+
+    /// No channels means no extra addresses: the reveal must not inflate the
+    /// external keychain on a fresh (or channel-less) wallet, which would cost
+    /// every later revealed-SPK sync for nothing.
+    #[test]
+    fn wallet_with_no_channels_reveals_nothing_extra() {
+        let (_dir, store) = fresh_store();
+        let provider = test_provider(store);
+        assert_eq!(provider.derived_channel_count(), 0);
+        assert!(provider.derived_destination_indexes().is_empty());
+        assert!(
+            provider.reveal_derived_destinations().is_none(),
+            "nothing to reveal"
+        );
+        assert_eq!(
+            crate::wallet::test_support::derivation_index(
+                provider.wallet(),
+                KeychainKind::External
+            ),
+            None,
+            "no address may be revealed on a wallet with no channels"
+        );
     }
 
     #[test]

@@ -111,6 +111,15 @@ pub(crate) struct OnchainWallet {
     /// on a failed scan. Per-process by design (a fresh wallet is built at
     /// every `start()`), mirroring the PWA's per-session module flag.
     initial_scan_complete: std::sync::atomic::AtomicBool,
+    /// Set by `builder::build` when this boot loaded pre-existing LDK state —
+    /// a U4 restore, a `vss::startup` silent recovery, or an existing install's
+    /// restart. Only the FIRST full scan of such a wallet consults it (see
+    /// [`ChainSource::sync_onchain_wallet`]): a cross-client cold start has an
+    /// empty bdk changeset, so it needs more stop-gap headroom than a wallet
+    /// this device created itself.
+    ///
+    /// [`ChainSource::sync_onchain_wallet`]: crate::chain::ChainSource::sync_onchain_wallet
+    cold_restore: std::sync::atomic::AtomicBool,
     logger: Arc<Logger>,
 }
 
@@ -154,8 +163,22 @@ impl OnchainWallet {
         Ok(Self {
             inner: Mutex::new(WalletInner { wallet, persister }),
             initial_scan_complete: std::sync::atomic::AtomicBool::new(false),
+            cold_restore: std::sync::atomic::AtomicBool::new(false),
             logger,
         })
+    }
+
+    /// Marks this boot as a cold restore / recovery (see
+    /// [`OnchainWallet::cold_restore`]).
+    pub(crate) fn mark_cold_restore(&self) {
+        self.cold_restore
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this boot loaded pre-existing LDK state, which widens the stop
+    /// gap of the first full scan.
+    pub(crate) fn is_cold_restore(&self) -> bool {
+        self.cold_restore.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Syncs against Esplora: full scan on first use, incremental afterwards.
@@ -309,6 +332,43 @@ impl OnchainWallet {
             );
         })?;
         Ok(script)
+    }
+
+    /// Reveals EXTERNAL addresses up to and INCLUDING `index` and persists the
+    /// changeset — the startup destination reveal
+    /// ([`crate::signer::WalletSignerProvider::reveal_derived_destinations`]),
+    /// which walks the deterministic close destinations of every channel loaded
+    /// this boot so the next chain scan watches them.
+    ///
+    /// `reveal_addresses_to` is monotone: an `index` at or below what the wallet
+    /// already tracks is a no-op, so this can run on every boot. The persist is
+    /// mandatory — an unpersisted reveal is silently lost on the next start (the
+    /// PWA's `bdk-address-reveal-not-persisted` learning).
+    pub(crate) fn reveal_external_addresses_to(&self, index: u32) -> Result<(), ()> {
+        let mut inner = self.inner.lock().unwrap();
+        let WalletInner { wallet, persister } = &mut *inner;
+        // The iterator of newly revealed addresses is not needed; the index
+        // update is staged eagerly.
+        drop(wallet.reveal_addresses_to(KeychainKind::External, index));
+        wallet.persist(persister).map_err(|e| {
+            log_error!(
+                self.logger,
+                "Failed to persist the startup destination reveal: {e}"
+            );
+        })?;
+        Ok(())
+    }
+
+    /// The SPKs a revealed-SPK sync request would query (tests): proof that a
+    /// revealed destination index is actually watched by the next sync.
+    #[cfg(test)]
+    pub(crate) fn revealed_sync_request_spks(&self) -> Vec<ScriptBuf> {
+        let inner = self.inner.lock().unwrap();
+        let mut request = inner.wallet.start_sync_with_revealed_spks().build();
+        request
+            .iter_spks_with_expected_txids()
+            .map(|spk| spk.spk)
+            .collect()
     }
 
     /// Trusted-spendable balance in sats: confirmed + trusted pending — the

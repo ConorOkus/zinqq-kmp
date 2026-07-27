@@ -23,8 +23,8 @@ use lightning_transaction_sync::EsploraSyncClient;
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 
 use crate::config::{
-    BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, CHAIN_SYNC_TIMEOUT, ESPLORA_CLIENT_TIMEOUT_SECS,
-    FEE_UPDATE_TIMEOUT, RGS_SYNC_TIMEOUT, TX_BROADCAST_TIMEOUT,
+    BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_COLD_RESTORE_STOP_GAP, CHAIN_SYNC_TIMEOUT,
+    ESPLORA_CLIENT_TIMEOUT_SECS, FEE_UPDATE_TIMEOUT, RGS_SYNC_TIMEOUT, TX_BROADCAST_TIMEOUT,
 };
 use crate::fees::{cache_from_esplora_estimates, CachedFeeEstimator};
 use crate::types::{Graph, Logger, RapidGossipSync};
@@ -498,12 +498,19 @@ impl ChainSource {
         &self,
         wallet: &OnchainWallet,
     ) -> Result<(), ChainError> {
+        // The stop gap only ever governs a FULL scan (the revealed-SPK
+        // incremental sync has none), and a wallet only full-scans once — so
+        // this choice is exactly "how wide is the first scan". A restore /
+        // silent recovery starts from an empty changeset over another client's
+        // address history and needs the wider gap; a wallet this device created
+        // keeps the cheap steady-state value.
+        let stop_gap = if wallet.is_cold_restore() {
+            BDK_COLD_RESTORE_STOP_GAP
+        } else {
+            BDK_CLIENT_STOP_GAP
+        };
         wallet
-            .sync(
-                &self.esplora_client,
-                BDK_CLIENT_STOP_GAP,
-                BDK_CLIENT_CONCURRENCY,
-            )
+            .sync(&self.esplora_client, stop_gap, BDK_CLIENT_CONCURRENCY)
             .await
     }
 

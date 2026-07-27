@@ -1427,6 +1427,64 @@ mod tests {
         }
     }
 
+    /// The cross-client restore fix's recovery mechanism, over REAL serialized
+    /// monitors: `lightning` 0.2.4 has no accessor for a deserialized
+    /// `ChannelMonitor`'s `channel_keys_id`, so the signer provider records the
+    /// ids LDK asks it to derive. Deserializing genuine monitors must populate
+    /// that set, and the startup reveal must then leave the bdk wallet watching
+    /// each monitor's deterministic close destination — the reveal that was
+    /// missing, which is why a restored PWA wallet's on-chain balance came back
+    /// empty.
+    ///
+    /// (These fixtures' ids come from LDK's own functional-test harness and land
+    /// at destination indices 0 and 1; the HIGH-index case is pinned in
+    /// `signer::tests::startup_reveal_covers_a_high_destination_index`.)
+    #[test]
+    fn deserializing_real_monitors_records_their_destination_indexes_for_the_startup_reveal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keys_manager, signer_provider) = validation_stack(dir.path());
+        assert_eq!(
+            signer_provider.derived_channel_count(),
+            0,
+            "nothing recorded before any monitor is read"
+        );
+
+        let vectors = monitor_vectors();
+        for vector in &vectors {
+            deserialize_monitor(&vector.bytes, &keys_manager, &signer_provider)
+                .expect("a real serialized monitor must deserialize");
+        }
+        assert_eq!(
+            signer_provider.derived_channel_count(),
+            vectors.len(),
+            "every deserialized monitor must have its channel_keys_id recorded"
+        );
+
+        let indexes = signer_provider.derived_destination_indexes();
+        assert_eq!(indexes.len(), vectors.len());
+        let max_index = signer_provider
+            .reveal_derived_destinations()
+            .expect("loaded monitors must produce a reveal");
+        assert_eq!(max_index, *indexes.iter().max().unwrap());
+        assert_eq!(
+            crate::wallet::test_support::derivation_index(
+                signer_provider.wallet(),
+                bdk_wallet::KeychainKind::External
+            ),
+            Some(max_index),
+            "the reveal must cover every loaded monitor's destination index"
+        );
+
+        // Each monitor's destination SPK is now one the next chain sync queries.
+        let watched = signer_provider.wallet().revealed_sync_request_spks();
+        for index in indexes {
+            assert!(
+                watched.contains(&signer_provider.wallet().peek_external_script(index)),
+                "destination index {index} must be watched after the startup reveal"
+            );
+        }
+    }
+
     // ---------- scenario 1 (AE3 offline half) + progress copy ----------
 
     /// Full explicit restore over an EXISTING different wallet: identity,
