@@ -160,6 +160,20 @@ pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
 /// by brute-force scanning, so this number does not have to cover them.
 pub(crate) const BDK_COLD_RESTORE_STOP_GAP: usize = 200;
 
+/// Bound on ONE on-chain wallet sync pass.
+///
+/// This pass is awaited inline in the background loop's `select!`, alongside the
+/// lightning sync tick and the stop signal, so an unbounded pass starves both.
+/// It is deliberately much larger than [`CHAIN_SYNC_TIMEOUT`]: the widest
+/// legitimate pass is a cold-restore full scan, roughly
+/// `2 * BDK_COLD_RESTORE_STOP_GAP` script queries at
+/// [`BDK_CLIENT_CONCURRENCY`], which at realistic per-request latency lands in
+/// tens of seconds — this leaves several times that headroom before cutting a
+/// dragging backend loose. A timed-out pass is not fund-relevant: nothing is
+/// persisted, `initial_scan_complete` stays false, and the next tick retries
+/// from scratch.
+pub(crate) const ONCHAIN_SYNC_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// How many revealed SPKs per keychain each END of the revealed range
 /// contributes to the INCREMENTAL (steady-state) on-chain sync — see
 /// [`crate::wallet::OnchainWallet::bounded_sync_request`]. Governs nothing

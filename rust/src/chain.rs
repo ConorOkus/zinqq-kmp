@@ -24,7 +24,8 @@ use tokio::sync::{mpsc, Mutex, MutexGuard};
 
 use crate::config::{
     BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_COLD_RESTORE_STOP_GAP, CHAIN_SYNC_TIMEOUT,
-    ESPLORA_CLIENT_TIMEOUT_SECS, FEE_UPDATE_TIMEOUT, RGS_SYNC_TIMEOUT, TX_BROADCAST_TIMEOUT,
+    ESPLORA_CLIENT_TIMEOUT_SECS, FEE_UPDATE_TIMEOUT, ONCHAIN_SYNC_TIMEOUT, RGS_SYNC_TIMEOUT,
+    TX_BROADCAST_TIMEOUT,
 };
 use crate::fees::{cache_from_esplora_estimates, CachedFeeEstimator};
 use crate::types::{Graph, Logger, RapidGossipSync};
@@ -544,9 +545,24 @@ impl ChainSource {
         } else {
             BDK_CLIENT_STOP_GAP
         };
-        wallet
-            .sync(&self.esplora_client, stop_gap, BDK_CLIENT_CONCURRENCY)
-            .await
+        // Bounded, unlike every other network op here, this one used to be not:
+        // the caller awaits it inline in the background loop's `select!`, in the
+        // same arm set as the lightning sync tick and the stop signal, so an
+        // unbounded pass starves BOTH — monitor sync stops advancing and
+        // shutdown stops responding for as long as the backend drags. That is
+        // what made a healthy 30 s-guarded lightning sync trip its own deadline
+        // in testing while the on-chain pass itself was sub-second.
+        //
+        // A timeout bounds the damage; it does not make the pass concurrent
+        // with the lightning arm. Moving the on-chain sync off this loop
+        // entirely is the structural fix and is deliberately NOT attempted
+        // here.
+        tokio::time::timeout(
+            ONCHAIN_SYNC_TIMEOUT,
+            wallet.sync(&self.esplora_client, stop_gap, BDK_CLIENT_CONCURRENCY),
+        )
+        .await
+        .map_err(|_| ChainError::EsploraUnreachable("on-chain sync timed out".to_string()))?
     }
 
     /// Whether the fee cache is due a refresh (60 s TTL / 15 s failure
@@ -766,8 +782,16 @@ impl ChainSource {
     /// sweep engine's sentinel verification (U11/KTD-8, PWA
     /// `subsidized-sweep.ts:213-230`): an unreachable Esplora reads as
     /// "unknown", never as proof.
+    ///
+    /// Goes through [`Self::transaction_by_txid`] (`/tx/:txid/hex`), NOT
+    /// `esplora_client::get_tx` (`/tx/:txid/raw`): the first-party backend
+    /// corrupts that binary endpoint, so the sentinel read every known
+    /// transaction as unknown — turning the subsidized sweep's `AlreadyKnown`
+    /// confirmation into a permanent broadcast-ambiguous failure. The
+    /// unreachable-reads-as-unknown contract above is preserved because every
+    /// error path here still yields `false`.
     pub(crate) async fn tx_known_to_chain(&self, txid: &Txid) -> bool {
-        matches!(self.esplora_client.get_tx(txid).await, Ok(Some(_)))
+        matches!(self.transaction_by_txid(txid).await, Ok(Some(_)))
     }
 
     /// Broadcast one queued package, tolerating already-known transactions.

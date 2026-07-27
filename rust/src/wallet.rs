@@ -25,7 +25,7 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use crate::builder::BuildError;
 use crate::chain::ChainError;
-use crate::config::ONCHAIN_SYNC_KEYCHAIN_WINDOW;
+use crate::config::{BDK_COLD_RESTORE_STOP_GAP, ONCHAIN_SYNC_KEYCHAIN_WINDOW};
 use crate::onchain_send::{BuiltTxFacts, OnchainSendError, TxBuildFailure, TxSpec};
 use crate::types::Logger;
 
@@ -337,12 +337,31 @@ impl OnchainWallet {
                 .filter(|(keychain_index, _)| tracked.is_used(keychain_index))
                 .map(|(keychain_index, spk)| (*keychain_index, spk.clone())),
         );
+        // The low-end window must be as wide as the stop gap that produced this
+        // wallet's revealed range, NOT merely as wide as our own vending needs.
+        // A cold restore's one full scan (gap
+        // [`BDK_COLD_RESTORE_STOP_GAP`]) reveals well past the other client's
+        // last USED index, so the revealed interior is full of addresses that
+        // client vended and displayed but was never paid to — see that
+        // constant's own rationale. Watching only the lowest
+        // `ONCHAIN_SYNC_KEYCHAIN_WINDOW` unused SPKs would drop that interior
+        // permanently, and a later payment to one of those addresses would
+        // never be seen by any sync: silent fund invisibility, and strictly
+        // worse than the unbounded request this bounding replaced. A wallet
+        // whose range this device produced itself only ever vends from the
+        // lowest unused index, so it keeps the cheap window.
+        let low_window = if self.is_cold_restore() {
+            BDK_COLD_RESTORE_STOP_GAP
+        } else {
+            ONCHAIN_SYNC_KEYCHAIN_WINDOW
+        };
         for keychain in [KeychainKind::External, KeychainKind::Internal] {
-            // (2) the low end: where `next_unused_address` vends.
+            // (2) the low end: where `next_unused_address` vends, plus the
+            // inherited interior described above.
             spks.extend(
                 index
                     .unused_keychain_spks(keychain)
-                    .take(ONCHAIN_SYNC_KEYCHAIN_WINDOW)
+                    .take(low_window)
                     .map(|(i, spk)| ((keychain, i), spk)),
             );
             // (3) the high end: where `reveal_next_address` vends.
@@ -1247,6 +1266,79 @@ mod tests {
         // script window.
         let outpoints = wallet.sync_request_outpoints();
         assert_eq!(outpoints.len(), 2, "both confirmed UTXOs, queried directly");
+    }
+
+    /// The safety property the bounded sync must not break, on the wallet shape
+    /// that makes it fail: a COLD RESTORE.
+    ///
+    /// A cold restore's one full scan runs at `BDK_COLD_RESTORE_STOP_GAP`, so it
+    /// reveals ~200 indices past the other client's last USED index. Everything
+    /// in that interior is an address the other client vended and may have
+    /// DISPLAYED — unpaid, so not "used", and far above the 20 lowest unused.
+    /// Watching only a 20-wide low window would drop it permanently and a later
+    /// payment there would never be seen by any sync. That is silent fund
+    /// invisibility, and strictly worse than the unbounded request this bounding
+    /// replaced, so the low window widens to the gap that produced the range.
+    #[test]
+    fn a_cold_restore_keeps_watching_the_interior_another_client_vended() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+        wallet.mark_cold_restore();
+
+        // History at the low indices, as a restored PWA wallet has ...
+        test_support::fund_confirmed(&wallet, 25_000);
+        test_support::fund_confirmed(&wallet, 10_000);
+        // ... and a revealed range reaching far past them.
+        wallet
+            .destination_script_for_index(OBSERVED_DESTINATION_INDEX)
+            .unwrap();
+
+        // An unpaid address sitting in the inherited interior: well beyond the
+        // steady-state 20-wide window, well inside the cold-restore gap.
+        const VENDED_BUT_UNPAID: u32 = 100;
+        assert!(
+            VENDED_BUT_UNPAID as usize > ONCHAIN_SYNC_KEYCHAIN_WINDOW,
+            "the index must be outside the steady-state window or this proves nothing"
+        );
+        let inherited = wallet.peek_external_script(VENDED_BUT_UNPAID);
+
+        let spks = wallet.sync_request_spks();
+        assert!(
+            spks.contains(&inherited),
+            "a cold restore must keep querying the interior another client vended"
+        );
+        // Still bounded — the point is a wider window, not the old unbounded
+        // request: 2 used + 200 lowest unused + 20 highest revealed + 0 internal.
+        assert!(
+            spks.len() < 300,
+            "widening the window must not restore the 5 031-script regression, got {}",
+            spks.len()
+        );
+    }
+
+    /// The contrast that shows the widening is gated: a wallet whose revealed
+    /// range THIS device produced never inherits a foreign interior, so it keeps
+    /// the cheap window and does not pay for 200 scripts per tick.
+    #[test]
+    fn a_locally_created_wallet_keeps_the_cheap_low_window() {
+        let (_dir, store) = fresh_store();
+        let wallet = test_wallet(store, Network::Bitcoin).unwrap();
+        test_support::fund_confirmed(&wallet, 25_000);
+        test_support::fund_confirmed(&wallet, 10_000);
+        wallet
+            .destination_script_for_index(OBSERVED_DESTINATION_INDEX)
+            .unwrap();
+
+        let spks = wallet.sync_request_spks();
+        assert!(
+            !spks.contains(&wallet.peek_external_script(100)),
+            "no cold restore means no inherited interior to watch"
+        );
+        assert_eq!(
+            spks.len(),
+            2 + 20 + 20,
+            "the steady-state bound is unchanged"
+        );
     }
 
     /// `reveal_next_external_script` (U11 sweep destinations, the PWA's
