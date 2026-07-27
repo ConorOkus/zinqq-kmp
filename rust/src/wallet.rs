@@ -424,7 +424,7 @@ fn build_tx_locked(
                 .address
                 .script_pubkey(),
         ),
-        TxSpec::Recipient { .. } | TxSpec::DrainAll { .. } => None,
+        TxSpec::Recipient { .. } | TxSpec::DrainAll { .. } | TxSpec::FundingOutput { .. } => None,
     };
 
     let mut builder = wallet.build_tx();
@@ -435,6 +435,17 @@ fn build_tx_locked(
             amount_sats,
         } => {
             builder.add_recipient(script.clone(), Amount::from_sat(*amount_sats));
+        }
+        TxSpec::FundingOutput {
+            script,
+            amount_sats,
+        } => {
+            // U9: LDK requires a final locktime on the funding tx; bdk's
+            // anti-fee-sniping default (current height) is overridden to 0,
+            // exactly like the PWA's funding build (`event-handler.ts`).
+            builder
+                .add_recipient(script.clone(), Amount::from_sat(*amount_sats))
+                .nlocktime(bitcoin::absolute::LockTime::ZERO);
         }
         TxSpec::DrainAll { script } => {
             builder.drain_wallet().drain_to(script.clone());

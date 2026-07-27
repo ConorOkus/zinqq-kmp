@@ -419,6 +419,12 @@ impl ChainSource {
         self.fee_estimator.onchain_send_rate_sat_per_vb()
     }
 
+    /// The shared cached fee estimator (U9's close estimates read LDK
+    /// confirmation targets from it directly).
+    pub(crate) fn fee_estimator(&self) -> Arc<CachedFeeEstimator> {
+        Arc::clone(&self.fee_estimator)
+    }
+
     /// Broadcasts one transaction, mapping "already known" responses to the
     /// [`BroadcastOutcome::AlreadyKnown`] success sentinel (U12/KTD-9). On
     /// either success the pending-broadcast entry is cleared; on failure it

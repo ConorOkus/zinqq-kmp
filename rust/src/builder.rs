@@ -221,8 +221,7 @@ impl From<KeysError> for BuildError {
 pub(crate) struct NodeComponents {
     /// The local store. U3 routes all node persistence through
     /// `dual_kv_store`/`vss_store`; kept here for the units that need raw
-    /// local access (U4 restore, U10 close records).
-    #[allow(dead_code)]
+    /// local access (U9 funding store, U4 restore, U10 close records).
     pub(crate) kv_store: Arc<FilesystemStore>,
     /// U3: the composite store — the ChainMonitor's monitor `Persist`, plus
     /// the fence/version/manifest state and the CM/LWW remote write paths.

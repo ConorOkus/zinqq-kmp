@@ -80,6 +80,8 @@ pub enum Event {
     ChannelPending { channel_id: String },
     /// An inbound JIT channel is usable (U4/U5).
     ChannelReady { channel_id: String },
+    /// A channel closed (U9): `reason` is LDK's `ClosureReason` rendered.
+    ChannelClosed { channel_id: String, reason: String },
     /// The LSPS2 flow failed (U4): get_info/buy errors, fee-floor rejections.
     Lsps2Failed { reason: String },
     /// Cloud backup (VSS) writes are failing; local persistence continues.
@@ -236,6 +238,9 @@ impl EventSink for EventQueue {
             },
             CoreEvent::ChannelPending { channel_id } => Event::ChannelPending { channel_id },
             CoreEvent::ChannelReady { channel_id } => Event::ChannelReady { channel_id },
+            CoreEvent::ChannelClosed { channel_id, reason } => {
+                Event::ChannelClosed { channel_id, reason }
+            }
             CoreEvent::Lsps2Failed { reason } => Event::Lsps2Failed { reason },
             CoreEvent::PaymentSuccessful {
                 payment_hash,
@@ -398,6 +403,10 @@ mod tests {
         queue.emit(CoreEvent::ChannelReady {
             channel_id: "bb".repeat(32),
         });
+        queue.emit(CoreEvent::ChannelClosed {
+            channel_id: "bb".repeat(32),
+            reason: "counterparty force-closed".to_string(),
+        });
         queue.emit(CoreEvent::Lsps2Failed {
             reason: "all LSP-offered opening fee params are expired".to_string(),
         });
@@ -448,6 +457,13 @@ mod tests {
             queue.ack(),
             Some(Event::ChannelReady {
                 channel_id: "bb".repeat(32),
+            })
+        );
+        assert_eq!(
+            queue.ack(),
+            Some(Event::ChannelClosed {
+                channel_id: "bb".repeat(32),
+                reason: "counterparty force-closed".to_string(),
             })
         );
         assert_eq!(

@@ -7,6 +7,7 @@ use tokio::runtime::{Builder, Runtime};
 pub mod api;
 pub mod builder;
 mod chain;
+pub mod channels;
 pub mod config;
 pub mod events;
 mod fees;
@@ -27,6 +28,10 @@ mod wallet;
 
 pub use api::{Balances, Wallet, WalletConfig, WalletError};
 pub use builder::BuildError;
+pub use channels::{
+    ChannelStateLabel, ChannelView, ChannelsError, CloseEstimate, CloseFeePayer, OpenFeeEstimate,
+    PeerAddressError, PeerView,
+};
 pub use config::{Config, LspConfig, PeerInfo};
 pub use events::Event;
 pub use history::{

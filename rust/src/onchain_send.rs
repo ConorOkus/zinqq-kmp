@@ -150,11 +150,18 @@ impl DriftGuard {
     }
 }
 
-/// The three tx shapes the U8 engine builds (KTD-9 fee handling is shared).
+/// The tx shapes the U8 engine builds (KTD-9 fee handling is shared).
+/// U9 adds [`TxSpec::FundingOutput`] for channel funding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TxSpec {
     /// Exact-amount send: `add_recipient(script, amount)`.
     Recipient { script: ScriptBuf, amount_sats: u64 },
+    /// Channel funding output (U9): like [`TxSpec::Recipient`] but built with
+    /// `nlocktime(0)` — LDK rejects funding txs with a non-final locktime and
+    /// bdk defaults to current-height anti-fee-sniping (the PWA's
+    /// `event-handler.ts` funding build sets `nlocktime(0)` for the same
+    /// reason).
+    FundingOutput { script: ScriptBuf, amount_sats: u64 },
     /// Zero-channel send-max: `drain_wallet().drain_to(script)` (AE6).
     DrainAll { script: ScriptBuf },
     /// Send-max with channels: drain to the recipient PLUS an explicit

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use lightning_persister::fs_store::FilesystemStore;
 
 use crate::builder::{BuildError, KV_STORE_SUBDIR};
+use crate::channels::{ChannelView, ChannelsError, CloseEstimate, OpenFeeEstimate, PeerView};
 use crate::config::Config;
 use crate::events::{Event, EventQueue};
 use crate::history::{ActivityRow, PersistedPayment};
@@ -158,6 +159,30 @@ pub enum WalletError {
     OnchainAmountBelowDust { min_sats: u64 },
     /// The on-chain tx could not be built or signed (U8); `detail` says why.
     OnchainSendFailed { detail: String },
+    /// A peer address that failed to parse as `pubkey@host:port` (U9);
+    /// `detail` is the distinct parse failure (missing port, bad pubkey, …).
+    InvalidPeerAddress { detail: String },
+    /// A bare peer pubkey argument that failed to parse (U9).
+    InvalidPeerPubkey,
+    /// The peer dial or handshake failed/timed out (U9).
+    PeerConnectFailed { detail: String },
+    /// The known-peers store could not be written (U9).
+    PeerPersistFailed { detail: String },
+    /// `forget_peer` refused: channels with the peer are open (U9; PWA copy).
+    PeerHasOpenChannels,
+    /// `open_channel` below the 20,000-sat minimum (U9; PWA copy).
+    ChannelAmountBelowMinimum,
+    /// `open_channel` above the 16,777,215-sat maximum (U9; PWA copy).
+    ChannelAmountAboveMaximum,
+    /// `open_channel` amount plus the estimated funding fee exceeds the
+    /// spendable balance (U9; PWA copy).
+    ChannelAmountExceedsBalance,
+    /// `create_channel` was rejected (U9); `detail` says why.
+    ChannelOpenFailed { detail: String },
+    /// No open channel has the given id (U9).
+    ChannelNotFound,
+    /// The cooperative or force close call failed (U9); `detail` says why.
+    ChannelCloseFailed { detail: String },
 }
 
 impl std::fmt::Display for WalletError {
@@ -245,6 +270,79 @@ impl std::fmt::Display for WalletError {
             WalletError::OnchainSendFailed { detail } => {
                 write!(f, "on-chain send failed: {detail}")
             }
+            // U9: the channel errors reuse the core engine's PWA-parity copy.
+            WalletError::InvalidPeerAddress { detail } => write!(f, "{detail}"),
+            WalletError::InvalidPeerPubkey => write!(f, "{}", ChannelsError::InvalidPubkey),
+            WalletError::PeerConnectFailed { detail } => {
+                write!(
+                    f,
+                    "{}",
+                    ChannelsError::ConnectFailed {
+                        detail: detail.clone()
+                    }
+                )
+            }
+            WalletError::PeerPersistFailed { detail } => {
+                write!(
+                    f,
+                    "{}",
+                    ChannelsError::PersistFailed {
+                        detail: detail.clone()
+                    }
+                )
+            }
+            WalletError::PeerHasOpenChannels => {
+                write!(f, "{}", ChannelsError::PeerHasOpenChannels)
+            }
+            WalletError::ChannelAmountBelowMinimum => {
+                write!(f, "{}", ChannelsError::AmountBelowMinimum)
+            }
+            WalletError::ChannelAmountAboveMaximum => {
+                write!(f, "{}", ChannelsError::AmountAboveMaximum)
+            }
+            WalletError::ChannelAmountExceedsBalance => {
+                write!(f, "{}", ChannelsError::AmountExceedsBalance)
+            }
+            WalletError::ChannelOpenFailed { detail } => {
+                write!(
+                    f,
+                    "{}",
+                    ChannelsError::OpenFailed {
+                        detail: detail.clone()
+                    }
+                )
+            }
+            WalletError::ChannelNotFound => write!(f, "{}", ChannelsError::ChannelNotFound),
+            WalletError::ChannelCloseFailed { detail } => {
+                write!(
+                    f,
+                    "{}",
+                    ChannelsError::CloseFailed {
+                        detail: detail.clone()
+                    }
+                )
+            }
+        }
+    }
+}
+
+impl From<ChannelsError> for WalletError {
+    fn from(error: ChannelsError) -> Self {
+        match error {
+            ChannelsError::NotRunning => WalletError::NotRunning,
+            ChannelsError::InvalidAddress(parse_error) => WalletError::InvalidPeerAddress {
+                detail: parse_error.to_string(),
+            },
+            ChannelsError::InvalidPubkey => WalletError::InvalidPeerPubkey,
+            ChannelsError::ConnectFailed { detail } => WalletError::PeerConnectFailed { detail },
+            ChannelsError::PersistFailed { detail } => WalletError::PeerPersistFailed { detail },
+            ChannelsError::PeerHasOpenChannels => WalletError::PeerHasOpenChannels,
+            ChannelsError::AmountBelowMinimum => WalletError::ChannelAmountBelowMinimum,
+            ChannelsError::AmountAboveMaximum => WalletError::ChannelAmountAboveMaximum,
+            ChannelsError::AmountExceedsBalance => WalletError::ChannelAmountExceedsBalance,
+            ChannelsError::OpenFailed { detail } => WalletError::ChannelOpenFailed { detail },
+            ChannelsError::ChannelNotFound => WalletError::ChannelNotFound,
+            ChannelsError::CloseFailed { detail } => WalletError::ChannelCloseFailed { detail },
         }
     }
 }
@@ -649,6 +747,85 @@ impl Wallet {
     /// Requires a running node.
     pub fn next_receive_address(&self) -> Result<String, WalletError> {
         self.node.next_receive_address().map_err(WalletError::from)
+    }
+
+    /// Connects to a `pubkey@host:port` peer and saves it as a known peer
+    /// (U9, R10 — the PWA's `connectToPeer`). Blocking (dial + BOLT8
+    /// handshake, 15 s budget): call from a background dispatcher. Returns
+    /// the peer's pubkey hex. Requires a running node.
+    pub fn connect_peer(&self, address: String) -> Result<String, WalletError> {
+        self.node.connect_peer(&address).map_err(WalletError::from)
+    }
+
+    /// Disconnects a peer's socket (U9). The peer stays saved: the reconnect
+    /// loop keeps dialing known peers.
+    pub fn disconnect_peer(&self, pubkey: String) -> Result<(), WalletError> {
+        self.node
+            .disconnect_peer(&pubkey)
+            .map_err(WalletError::from)
+    }
+
+    /// Removes a saved peer (U9, R10). Fails with
+    /// [`WalletError::PeerHasOpenChannels`] while any channel with the peer
+    /// is open (the PWA's `forgetPeer` guard).
+    pub fn forget_peer(&self, pubkey: String) -> Result<(), WalletError> {
+        self.node.forget_peer(&pubkey).map_err(WalletError::from)
+    }
+
+    /// The Peers screen's rows (U9, R10): the union of saved and connected
+    /// peers with per-peer channel counts, connected first. Requires a
+    /// running node.
+    pub fn list_peers(&self) -> Result<Vec<PeerView>, WalletError> {
+        self.node.list_peers().map_err(WalletError::from)
+    }
+
+    /// Every channel with its state label (Active/Ready/Pending/Closing),
+    /// capacities, reserve, usable flag, and in-flight HTLC count (U9, R10).
+    /// Requires a running node.
+    pub fn list_channels(&self) -> Result<Vec<ChannelView>, WalletError> {
+        self.node.list_channels().map_err(WalletError::from)
+    }
+
+    /// The open-channel review numbers (U9): the 6-block sat/vB rate and
+    /// `rate × 140 vB` (the PWA's `OpenChannel` estimate). Requires a
+    /// running node.
+    pub fn estimate_open_fee(&self) -> Result<OpenFeeEstimate, WalletError> {
+        self.node.estimate_open_fee().map_err(WalletError::from)
+    }
+
+    /// Opens a channel to `pubkey@host:port` (U9, R10): bounds
+    /// 20,000–16,777,215 sats, balance gate at amount + estimated fee,
+    /// connect-if-needed (persisting the known peer), then LDK
+    /// `create_channel`. Blocking: call from a background dispatcher.
+    /// Returns the TEMPORARY channel id hex; progress arrives as
+    /// [`Event::ChannelPending`] / [`Event::ChannelReady`], and the funding
+    /// tx is persisted before LDK is notified and broadcast only on LDK's
+    /// broadcast-safe signal (fund safety).
+    pub fn open_channel(
+        &self,
+        peer_address: String,
+        amount_sats: u64,
+    ) -> Result<String, WalletError> {
+        self.node
+            .open_channel(&peer_address, amount_sats)
+            .map_err(WalletError::from)
+    }
+
+    /// Closes a channel (U9, R10): cooperative by default, unilateral
+    /// (`force_close_broadcasting_latest_txn`) when `force`. The outcome
+    /// arrives as [`Event::ChannelClosed`].
+    pub fn close_channel(&self, channel_id: String, force: bool) -> Result<(), WalletError> {
+        self.node
+            .close_channel(&channel_id, force)
+            .map_err(WalletError::from)
+    }
+
+    /// The informational pre-close estimate (U9, R10): every field
+    /// independently nullable, and NEVER an error — a stopped node or
+    /// unknown channel returns the all-`None` estimate so the close screen
+    /// always renders (the PWA's `estimateClose` contract).
+    pub fn estimate_close(&self, channel_id: String) -> CloseEstimate {
+        self.node.estimate_close(&channel_id)
     }
 }
 

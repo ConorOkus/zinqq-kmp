@@ -114,7 +114,6 @@ impl KnownPeersStore {
     /// Adds or replaces a peer, persists locally, and schedules the LWW VSS
     /// write. Local persistence failure is surfaced; the VSS half is
     /// best-effort by design.
-    #[allow(dead_code)] // U9's connect_peer wires this (the store API lands with U3).
     pub(crate) fn upsert(
         &self,
         pubkey: &str,
@@ -138,7 +137,6 @@ impl KnownPeersStore {
     }
 
     /// Removes a peer, persists locally, and schedules the LWW VSS write.
-    #[allow(dead_code)] // U9's forget_peer wires this (the store API lands with U3).
     pub(crate) fn remove(&self, pubkey: &str) -> Result<(), lightning::io::Error> {
         let snapshot = {
             let mut map = self.map.lock().unwrap();
@@ -151,14 +149,14 @@ impl KnownPeersStore {
     }
 
     /// The full saved-peer map.
-    #[allow(dead_code)] // U9's list_peers wires this (the store API lands with U3).
     pub(crate) fn all(&self) -> BTreeMap<String, KnownPeer> {
         self.map.lock().unwrap().clone()
     }
 
     /// Saved peers as reconnect targets. Entries with an unparsable pubkey
-    /// or a non-IP host are skipped with a log (hostname resolution is a U9
-    /// follow-up; the PWA stores IPs today).
+    /// or a non-IP host are skipped with a log (U9 decision: the core dials
+    /// `SocketAddr`s only — `parse_peer_address` rejects hostnames with a
+    /// typed error, and the PWA stores IPs today).
     pub(crate) fn reconnect_targets(&self) -> Vec<PeerInfo> {
         let map = self.map.lock().unwrap();
         let mut targets = Vec::with_capacity(map.len());
