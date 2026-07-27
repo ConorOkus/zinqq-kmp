@@ -7,7 +7,9 @@ struct iOSApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(model: model)
+            // AppShell applies the persisted appearance mode's token table at
+            // scene setup (KTD-11) and hosts the 16-destination navigation.
+            AppShell(model: model)
         }
         // KTD-10: foreground-only node lifecycle. Start on active, stop on
         // background; iOS drops sockets on suspend and reconnect on the next

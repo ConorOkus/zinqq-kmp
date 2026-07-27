@@ -26,6 +26,9 @@ enum WalletEvent {
     case channelPending
     case channelReady
     case lsps2Failed(reason: String)
+    /// Another client took over this seed's VSS namespace (KTD-3, plan
+    /// System-Wide Impact): the core fenced itself durably and halted.
+    case fenced(detail: String)
     /// Sealed in Kotlin, but Swift cannot prove exhaustiveness over the
     /// exported class hierarchy; unknown events are ignored by the reducer.
     case unknown
@@ -55,6 +58,8 @@ enum WalletEvent {
             return .channelReady
         case let e as Event.Lsps2Failed:
             return .lsps2Failed(reason: e.reason)
+        case let e as Event.Fenced:
+            return .fenced(detail: e.detail)
         default:
             return .unknown
         }
@@ -82,6 +87,17 @@ final class WalletModel: ObservableObject {
     /// True while a receiveJit/send FFI call is in flight; the view disables
     /// the Request Invoice / Pay buttons on it (R8: one coarse flag is fine).
     @Published private(set) var busy = false
+    /// Another client took over this seed's VSS namespace (U18; KTD-3, plan
+    /// System-Wide Impact): set by `Event.Fenced` or a typed `Fenced` start
+    /// failure, never cleared by an event — un-fencing is user-owned (restore
+    /// or quit) and the core's durable flag survives restart.
+    @Published private(set) var fenced = false
+    /// Persisted appearance selection (U18, KTD-11). Read synchronously at
+    /// init — before the first frame — so no frame renders in the wrong
+    /// theme, parity with the PWA's pre-render `data-theme` application.
+    @Published var appearanceMode: AppearanceMode = .loadPersisted() {
+        didSet { appearanceMode.persist() }
+    }
 
     private var wallet: Wallet?
     private var eventLoop: Task<Void, Never>?
@@ -127,7 +143,15 @@ final class WalletModel: ObservableObject {
                 }
             } catch {
                 self.startRequested = false
-                self.lastOutcome = "Start failed: \(error.localizedDescription)"
+                if Self.isFencedError(error) {
+                    // The durable fence survives restart (KTD-3): a fenced
+                    // wallet refuses to start, so the shell re-raises the
+                    // fenced screen even though no Event.Fenced will arrive
+                    // on this run (U18).
+                    self.fenced = true
+                } else {
+                    self.lastOutcome = "Start failed: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -283,9 +307,21 @@ final class WalletModel: ObservableObject {
         case let .lsps2Failed(reason):
             currentInvoice = nil
             lastOutcome = "LSP failed: \(reason)"
+        case .fenced:
+            // The core fenced itself (KTD-3): the shell blocks every
+            // destination behind the fenced screen until the user restores
+            // or quits (U18); never cleared by an event.
+            fenced = true
         case .unknown:
             break
         }
+    }
+
+    /// Kotlin exceptions cross the Kotlin/Native bridge as NSError with the
+    /// original throwable under `KotlinException`; a typed `Fenced` start
+    /// failure means the durable fence is set.
+    private static func isFencedError(_ error: Error) -> Bool {
+        (error as NSError).userInfo["KotlinException"] is WalletException.Fenced
     }
 
     // MARK: Storage

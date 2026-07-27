@@ -1,16 +1,19 @@
-import CoreImage.CIFilterBuiltins
 import SwiftUI
 import UIKit
 
-/// Single wallet screen (R8: rough is acceptable): balance, receive
-/// (amount → invoice QR + expiry countdown), send (paste BOLT11), and a
-/// status/outcome line. Talks only to WalletModel — no shared-framework
-/// types leak into the view.
-struct ContentView: View {
+/// Home temporarily hosts the spike's single wallet screen (U18): the proven
+/// receive/send flow moved here from `ContentView` unchanged so the shell
+/// keeps paying while U19 builds the real Home. Only the QR rendering moved
+/// into the shared `QrView` component and the hardcoded colors onto the field
+/// tokens; everything else is the spike content verbatim. Talks only to
+/// WalletModel — no shared-framework types leak into the view (R14).
+struct HomeScreen: View {
     @ObservedObject var model: WalletModel
 
     @State private var amountSats = ""
     @State private var bolt11Input = ""
+
+    @Environment(\.zinqqColors) private var colors
 
     var body: some View {
         ScrollView {
@@ -18,8 +21,8 @@ struct ContentView: View {
                 balanceSection
                 if let banner = model.syncBanner {
                     Text(banner)
-                        .font(.footnote)
-                        .foregroundColor(.orange)
+                        .font(ZinqqFont.sans(13))
+                        .foregroundColor(colors.warning)
                 }
                 receiveSection
                 sendSection
@@ -27,6 +30,7 @@ struct ContentView: View {
             }
             .padding(24)
         }
+        .background(colors.field.ignoresSafeArea())
         .onChange(of: model.currentInvoice) { invoice in
             // Screen must not sleep mid-payment while an invoice is showing.
             UIApplication.shared.isIdleTimerDisabled = invoice != nil
@@ -41,12 +45,15 @@ struct ContentView: View {
     private var balanceSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Balance")
-                .font(.headline)
+                .font(ZinqqFont.sans(16, weight: .semibold))
+                .foregroundColor(colors.onField)
             Text("\(model.balanceMsat / 1_000) sats")
-                .font(.system(.largeTitle, design: .rounded).weight(.semibold))
+                .font(ZinqqFont.display(34, weight: .semibold))
+                .foregroundColor(colors.onField)
+                .accessibilityLabel("Balance \(model.balanceMsat / 1_000) sats")
             Text("\(model.balanceMsat) msat · node \(model.running ? "running" : "stopped")")
-                .font(.footnote)
-                .foregroundColor(.secondary)
+                .font(ZinqqFont.sans(13))
+                .foregroundColor(colors.onFieldMuted)
         }
     }
 
@@ -55,18 +62,22 @@ struct ContentView: View {
     private var receiveSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Receive")
-                .font(.headline)
+                .font(ZinqqFont.sans(16, weight: .semibold))
+                .foregroundColor(colors.onField)
             HStack {
                 TextField("Amount (sats)", text: $amountSats)
                     .keyboardType(.numberPad)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Amount in sats")
                 let parsedSats = UInt64(amountSats)
                 Button("Request invoice") {
                     guard let sats = parsedSats, sats > 0 else { return }
                     model.requestInvoice(amountSats: sats)
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(colors.fieldCta)
                 .disabled(!model.running || model.busy || parsedSats == nil)
+                .accessibilityLabel("Request invoice")
             }
             if let invoice = model.currentInvoice {
                 invoiceView(invoice)
@@ -76,16 +87,12 @@ struct ContentView: View {
 
     private func invoiceView(_ invoice: WalletModel.Invoice) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let qr = QrCache.image(for: invoice.bolt11) {
-                Image(uiImage: qr)
-                    .interpolation(.none)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 240)
-                    .frame(maxWidth: .infinity)
-            }
+            QrView(payload: invoice.bolt11, accessibilityLabel: "Invoice QR code")
+                .frame(maxWidth: 240)
+                .frame(maxWidth: .infinity)
             Text(invoice.bolt11)
                 .font(.system(.caption2, design: .monospaced))
+                .foregroundColor(colors.onField)
                 .lineLimit(4)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
@@ -93,12 +100,12 @@ struct ContentView: View {
                 let remaining = Int(Double(invoice.expiryUnixSecs) - context.date.timeIntervalSince1970)
                 if remaining > 0 {
                     Text("Expires in \(remaining / 60)m \(remaining % 60)s")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
+                        .font(ZinqqFont.sans(13))
+                        .foregroundColor(colors.onFieldMuted)
                 } else {
                     Text("Invoice expired")
-                        .font(.footnote)
-                        .foregroundColor(.red)
+                        .font(ZinqqFont.sans(13))
+                        .foregroundColor(colors.dangerStrong)
                 }
             }
         }
@@ -109,18 +116,25 @@ struct ContentView: View {
     private var sendSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Send")
-                .font(.headline)
+                .font(ZinqqFont.sans(16, weight: .semibold))
+                .foregroundColor(colors.onField)
             TextField("Paste BOLT11 invoice", text: $bolt11Input, axis: .vertical)
                 .lineLimit(2...4)
                 .font(.system(.caption, design: .monospaced))
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("BOLT11 invoice")
             Button("Pay") {
                 model.sendPayment(bolt11: bolt11Input)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!model.running || model.busy || bolt11Input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .tint(colors.fieldCta)
+            .disabled(
+                !model.running || model.busy
+                    || bolt11Input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
+            .accessibilityLabel("Pay")
         }
     }
 
@@ -130,32 +144,8 @@ struct ContentView: View {
     private var statusSection: some View {
         if let outcome = model.lastOutcome {
             Text(outcome)
-                .font(.footnote)
-                .foregroundColor(.secondary)
+                .font(ZinqqFont.sans(13))
+                .foregroundColor(colors.onFieldMuted)
         }
-    }
-
-}
-
-// MARK: QR (CoreImage, no dependency)
-
-/// Memoizes the last generated QR so unrelated observable changes (balance,
-/// outcome, sync banner) don't re-rasterize an unchanged invoice, and shares
-/// one CIContext, which is expensive to construct.
-@MainActor
-private enum QrCache {
-    private static let context = CIContext()
-    private static var last: (text: String, image: UIImage)?
-
-    static func image(for text: String) -> UIImage? {
-        if let last, last.text == text { return last.image }
-        let filter = CIFilter.qrCodeGenerator()
-        filter.message = Data(text.utf8)
-        guard let output = filter.outputImage else { return nil }
-        let scaled = output.transformed(by: CGAffineTransform(scaleX: 8, y: 8))
-        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
-        let image = UIImage(cgImage: cgImage)
-        last = (text, image)
-        return image
     }
 }
