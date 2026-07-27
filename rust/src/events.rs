@@ -51,8 +51,10 @@ pub enum Event {
     SyncFailed,
     /// Chain sync recovered and reached the tip (clears a `SyncFailed` state).
     SyncCompleted,
-    /// A JIT invoice is ready to display (U4). `expiry_unix_secs` is the
-    /// LSP-guaranteed `valid_until` as UNIX seconds.
+    /// A JIT invoice is ready to display (U4/U7). `expiry_unix_secs` is the
+    /// invoice's clamped expiry as UNIX seconds (R6: the quote's
+    /// `valid_until` minus a 30 s flight margin, capped at 3600 s) — the QR
+    /// countdown's deadline.
     InvoiceReady {
         bolt11: String,
         expiry_unix_secs: u64,

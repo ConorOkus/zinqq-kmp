@@ -19,6 +19,7 @@ mod lock;
 pub mod node;
 pub mod onchain_send;
 pub mod payment;
+pub mod receive;
 pub mod restore;
 pub mod send;
 mod signer;
@@ -43,6 +44,7 @@ pub use liquidity::Lsps2Error;
 pub use node::Node;
 pub use onchain_send::{DriftGuard, FeeEstimate, MaxSendEstimate, OnchainSendError};
 pub use payment::SendError;
+pub use receive::{JitInvoice, JitQuote, ReceiveBundle, ReceiveError, MIN_JIT_RECEIVE_SATS};
 pub use restore::RestoreError;
 
 uniffi::setup_scaffolding!();

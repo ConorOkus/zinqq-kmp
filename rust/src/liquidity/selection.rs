@@ -50,6 +50,19 @@ pub enum Lsps2Error {
     },
     /// Registering or signing the invoice failed.
     InvoiceCreationFailed,
+    /// `jit_accept` with a quote token that was never issued or was already
+    /// consumed (U7: quotes are single-use; a buy commits the LSP).
+    QuoteNotFound,
+    /// `jit_accept` with an amount that differs from the quoted one (U7: the
+    /// signed fee promise is bound to the quoted payment size).
+    QuoteAmountMismatch {
+        quoted_msat: u64,
+        requested_msat: u64,
+    },
+    /// The quote's `valid_until` leaves less than 60 s of payable invoice
+    /// life after the 30 s flight margin — the re-quote signal (U7, R6),
+    /// raised BEFORE any `buy` so no LSP-side reservation is orphaned.
+    QuoteExpired,
 }
 
 impl fmt::Display for Lsps2Error {
@@ -92,6 +105,22 @@ impl fmt::Display for Lsps2Error {
                  {amount_msat}msat payment"
             ),
             Lsps2Error::InvoiceCreationFailed => write!(f, "failed to create the invoice"),
+            Lsps2Error::QuoteNotFound => {
+                write!(
+                    f,
+                    "the fee quote is no longer available, request a new quote"
+                )
+            }
+            Lsps2Error::QuoteAmountMismatch {
+                quoted_msat,
+                requested_msat,
+            } => write!(
+                f,
+                "the quote was for {quoted_msat}msat but {requested_msat}msat was requested"
+            ),
+            // The PWA's `JitQuoteFreshnessError` copy, verbatim
+            // (`src/ldk/context.tsx` `computeJitInvoiceExpirySecs`).
+            Lsps2Error::QuoteExpired => write!(f, "Fee quote expired, please try again"),
         }
     }
 }

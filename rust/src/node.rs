@@ -60,7 +60,9 @@ pub(crate) enum CoreEvent {
     ChainSyncCompleted,
     /// A background chain sync pass failed; it will be retried.
     ChainSyncFailed,
-    /// A JIT invoice is ready to display (U4).
+    /// A JIT invoice is ready to display (U4/U7). `expiry_unix_secs` is the
+    /// invoice's clamped expiry (R6: the quote's `valid_until` minus the
+    /// 30 s flight margin, capped at 3600 s) as UNIX seconds.
     InvoiceReady {
         bolt11: String,
         expiry_unix_secs: u64,
@@ -443,14 +445,7 @@ impl Node {
     /// ALSO pushed as `InvoiceReady`; every failure is pushed as
     /// `Lsps2Failed` with a distinct reason.
     pub fn receive_jit(&self, amount_msat: u64) -> Result<(String, u64), Lsps2Error> {
-        let (liquidity_source, runtime_handle) = {
-            let state_lock = self.state.lock().unwrap();
-            let state = state_lock.as_ref().ok_or(Lsps2Error::NotRunning)?;
-            (
-                Arc::clone(&state.liquidity_source),
-                state.runtime.handle().clone(),
-            )
-        };
+        let (liquidity_source, runtime_handle) = self.liquidity_handles()?;
 
         // Run the flow on the node runtime and wait outside the state lock,
         // so a concurrent stop() can't deadlock; a dropped runtime surfaces
@@ -479,6 +474,314 @@ impl Node {
                 Err(error)
             }
         }
+    }
+
+    /// Clones the LSPS2 handles out of the state lock (the receive_jit
+    /// pattern: spawn on the node runtime, wait outside the lock).
+    fn liquidity_handles(
+        &self,
+    ) -> Result<(Arc<LiquiditySource>, tokio::runtime::Handle), Lsps2Error> {
+        let state_lock = self.state.lock().unwrap();
+        let state = state_lock.as_ref().ok_or(Lsps2Error::NotRunning)?;
+        Ok((
+            Arc::clone(&state.liquidity_source),
+            state.runtime.handle().clone(),
+        ))
+    }
+
+    /// U7 phase A (F2 quote step): `get_info` + cheapest-valid selection
+    /// against the configured LSP — NO `buy`, no LSP-side commitment. The
+    /// quote carries fee/net/validity/freshness for the review screen and a
+    /// single-use token for [`Node::jit_accept`]. AE4: below-floor amounts
+    /// fail here with a typed error, so no buy can ever follow them.
+    /// Blocking (LSP round-trip): call from a background dispatcher.
+    ///
+    /// Quote failures return typed errors WITHOUT queueing `Lsps2Failed`:
+    /// below-minimum is a review-screen state in the PWA, not an incident.
+    pub fn jit_quote(&self, amount_msat: u64) -> Result<crate::receive::JitQuote, Lsps2Error> {
+        let (liquidity_source, runtime_handle) = self.liquidity_handles()?;
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        runtime_handle.spawn(async move {
+            let _ = result_sender.send(liquidity_source.jit_quote(amount_msat).await);
+        });
+        result_receiver
+            .blocking_recv()
+            .unwrap_or(Err(Lsps2Error::Shutdown))
+    }
+
+    /// U7 phase B (F2 buy step): consumes the quote token, clamps the
+    /// invoice expiry to the quote's remaining validity (R6: `valid_until`
+    /// − 30 s, capped at 3600 s, under 60 s → the typed
+    /// [`Lsps2Error::QuoteExpired`] re-quote signal BEFORE any `buy`), then
+    /// buys and mints the wrapped invoice. On success the invoice is ALSO
+    /// pushed as `InvoiceReady` with the clamped expiry; failures are pushed
+    /// as `Lsps2Failed`. Blocking: call from a background dispatcher.
+    pub fn jit_accept(
+        &self,
+        quote_token: u64,
+        amount_msat: u64,
+    ) -> Result<crate::receive::JitInvoice, Lsps2Error> {
+        let (liquidity_source, runtime_handle) = self.liquidity_handles()?;
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        runtime_handle.spawn(async move {
+            let _ = result_sender.send(liquidity_source.jit_accept(quote_token, amount_msat).await);
+        });
+        let result = result_receiver
+            .blocking_recv()
+            .unwrap_or(Err(Lsps2Error::Shutdown));
+
+        match result {
+            Ok((invoice, expires_at_unix, opening_fee_msat)) => {
+                let bolt11 = invoice.to_string();
+                self.event_sink.emit(CoreEvent::InvoiceReady {
+                    bolt11: bolt11.clone(),
+                    expiry_unix_secs: expires_at_unix,
+                });
+                Ok(crate::receive::JitInvoice {
+                    bolt11,
+                    payment_hash: hex_str(&invoice.payment_hash().to_byte_array()),
+                    opening_fee_msat,
+                    expires_at_unix,
+                })
+            }
+            Err(error) => {
+                self.event_sink.emit(CoreEvent::Lsps2Failed {
+                    reason: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// The JIT numpad floor in sats (U7, R6, AE4): one amountless `get_info`
+    /// per receive session (`refresh = true` starts a new session), cached
+    /// and NEVER an error — failures and empty menus degrade to the static
+    /// 3,000-sat floor, as does a stopped node. Mirrors the PWA's
+    /// only-when-it-can-matter gate (`Receive.tsx:158-161`): when usable
+    /// inbound capacity already covers the static floor the fetch is skipped
+    /// entirely — any below-floor amount is served by existing capacity.
+    /// Blocking on a fetch: call from a background dispatcher.
+    pub fn min_receive_sats(&self, refresh: bool) -> u64 {
+        let (liquidity_source, runtime_handle, channel_manager) = {
+            let state_lock = self.state.lock().unwrap();
+            match state_lock.as_ref() {
+                None => return crate::receive::MIN_JIT_RECEIVE_SATS,
+                Some(state) => (
+                    Arc::clone(&state.liquidity_source),
+                    state.runtime.handle().clone(),
+                    Arc::clone(&state.components.channel_manager),
+                ),
+            }
+        };
+        let usable_inbound_msat: u64 = channel_manager
+            .list_channels()
+            .iter()
+            .filter(|details| details.is_usable)
+            .map(|details| details.inbound_capacity_msat)
+            .sum();
+        if usable_inbound_msat >= crate::receive::MIN_JIT_RECEIVE_SATS * 1_000 {
+            return crate::receive::MIN_JIT_RECEIVE_SATS;
+        }
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        runtime_handle.spawn(async move {
+            let _ = result_sender.send(liquidity_source.min_receive_sats(refresh).await);
+        });
+        result_receiver
+            .blocking_recv()
+            .unwrap_or(crate::receive::MIN_JIT_RECEIVE_SATS)
+    }
+
+    /// A standard (non-JIT) BOLT11 invoice via the channel manager's
+    /// `create_inbound_payment`-based builder (U7): description
+    /// `Zinqq Wallet`, 3600 s expiry, amountless allowed — the PWA's
+    /// `createInvoice` verbatim. Returns `(bolt11, payment_hash_hex)`; paid
+    /// detection rides the payment store (U5).
+    pub fn standard_invoice(
+        &self,
+        amount_msat: Option<u64>,
+    ) -> Result<(String, String), crate::receive::ReceiveError> {
+        let channel_manager = {
+            let state_lock = self.state.lock().unwrap();
+            let state = state_lock
+                .as_ref()
+                .ok_or(crate::receive::ReceiveError::NotRunning)?;
+            Arc::clone(&state.components.channel_manager)
+        };
+        let invoice = channel_manager
+            .create_bolt11_invoice(crate::receive::standard_invoice_params(amount_msat))
+            .map_err(|_| crate::receive::ReceiveError::InvoiceCreationFailed)?;
+        Ok((
+            invoice.to_string(),
+            hex_str(&invoice.payment_hash().to_byte_array()),
+        ))
+    }
+
+    /// The one receive call the shells render (U7, R6): on-chain address,
+    /// standard invoice when capacity covers the request (`needs_jit` false),
+    /// the unified BIP321 URI in copy and QR forms, the persisted offer when
+    /// a usable channel exists, the session floor, and the capacity decision.
+    /// Never touches the network: the floor is the session-cached value (use
+    /// [`Node::min_receive_sats`] to fetch), and only the ALREADY-persisted
+    /// offer is included (use [`Node::get_or_create_offer`] to mint one) —
+    /// offer creation never blocks receive.
+    pub fn receive_bundle(
+        &self,
+        amount_msat: Option<u64>,
+    ) -> Result<crate::receive::ReceiveBundle, crate::receive::ReceiveError> {
+        use crate::receive::{self, ReceiveError};
+
+        let (kv_store, liquidity_source) = {
+            let state_lock = self.state.lock().unwrap();
+            let state = state_lock.as_ref().ok_or(ReceiveError::NotRunning)?;
+            (
+                Arc::clone(&state.components.kv_store),
+                Arc::clone(&state.liquidity_source),
+            )
+        };
+        let address =
+            self.next_receive_address()
+                .map_err(|e| ReceiveError::AddressUnavailable {
+                    detail: e.to_string(),
+                })?;
+        let channels = self.list_channels().map_err(|_| ReceiveError::NotRunning)?;
+
+        let needs_jit = receive::needs_jit(&channels, amount_msat);
+        let (bolt11, payment_hash, invoice_error) = if needs_jit {
+            // JIT path (amounted) or amountless-with-no-capacity: the PWA
+            // renders the on-chain QR and drives the quote flow separately.
+            (None, None, None)
+        } else {
+            match self.standard_invoice(amount_msat) {
+                Ok((bolt11, payment_hash)) => (Some(bolt11), Some(payment_hash), None),
+                // Receive.tsx:289-291: the failure copy renders only for an
+                // amounted request; the on-chain QR still shows either way.
+                Err(error) => (
+                    None,
+                    None,
+                    amount_msat
+                        .filter(|amount| *amount > 0)
+                        .map(|_| error.to_string()),
+                ),
+            }
+        };
+
+        let amount_sats = amount_msat.map(|msat| msat / 1_000);
+        let bip321_uri = receive::build_bip321_uri(&address, amount_sats, bolt11.as_deref());
+        // QR alphanumeric mode uppercases the WHOLE URI (Receive.tsx:640).
+        let qr_value = bip321_uri.to_uppercase();
+
+        // showBolt12 gating (Receive.tsx:372): an offer page exists only
+        // when an offer is persisted AND a usable channel can pay it.
+        let offer = if receive::has_usable_channel(&channels) {
+            receive::read_persisted_offer(&kv_store)
+        } else {
+            None
+        };
+        let offer_qr_value = offer
+            .as_deref()
+            .map(|offer| receive::build_bolt12_page_uri(offer).to_uppercase());
+
+        Ok(receive::ReceiveBundle {
+            address,
+            bolt11,
+            payment_hash,
+            invoice_error,
+            bip321_uri,
+            qr_value,
+            offer,
+            offer_qr_value,
+            needs_jit,
+            min_receive_sats: liquidity_source
+                .cached_jit_floor_sats()
+                .unwrap_or(receive::MIN_JIT_RECEIVE_SATS),
+        })
+    }
+
+    /// The persistent BOLT12 offer (U7, R6): returns the persisted one when
+    /// it exists; otherwise creates it via `create_offer_builder` (chain
+    /// mainnet, description `zinqq wallet` — the PWA's builder calls,
+    /// `context.tsx:1655-1658`), retrying on the 3/6/12/24/48 s schedule
+    /// because blinded paths need the RGS-synced graph. Persisted under a
+    /// stable local key on success. `None` on a stopped node or when every
+    /// attempt failed — offer creation NEVER blocks receive. Blocking (up to
+    /// the retry schedule): call from a background dispatcher.
+    pub fn get_or_create_offer(&self) -> Option<String> {
+        use crate::config::BOLT12_OFFER_DESCRIPTION;
+
+        let (channel_manager, kv_store, runtime_handle, logger) = {
+            let state_lock = self.state.lock().unwrap();
+            let state = state_lock.as_ref()?;
+            (
+                Arc::clone(&state.components.channel_manager),
+                Arc::clone(&state.components.kv_store),
+                state.runtime.handle().clone(),
+                Arc::clone(&state.components.logger),
+            )
+        };
+        if let Some(existing) = crate::receive::read_persisted_offer(&kv_store) {
+            return Some(existing);
+        }
+
+        let network = self.config.network;
+        let attempt_logger = Arc::clone(&logger);
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        runtime_handle.spawn(async move {
+            let result = crate::receive::create_offer_with_retry(
+                || {
+                    let build = || -> Result<String, String> {
+                        let offer = channel_manager
+                            .create_offer_builder()
+                            .map_err(|e| format!("create_offer_builder: {e:?}"))?
+                            .chain(network)
+                            .description(BOLT12_OFFER_DESCRIPTION.to_string())
+                            .build()
+                            .map_err(|e| format!("offer build: {e:?}"))?;
+                        Ok(offer.to_string())
+                    };
+                    build().inspect_err(|reason| {
+                        log_error!(
+                            attempt_logger,
+                            "BOLT12 offer creation attempt failed (graph not ready?): {reason}"
+                        );
+                    })
+                },
+                &crate::receive::OFFER_RETRY_DELAYS,
+            )
+            .await;
+            let _ = result_sender.send(result);
+        });
+        let offer = result_receiver.blocking_recv().ok().flatten()?;
+
+        // PWA parity (context.tsx:1663): the offer is exposed only once
+        // persisted, so every later session serves the SAME offer string.
+        match crate::receive::persist_offer(&kv_store, &offer) {
+            Ok(()) => Some(offer),
+            Err(e) => {
+                log_error!(logger, "Failed to persist the BOLT12 offer: {e}");
+                None
+            }
+        }
+    }
+
+    /// Whether the BOLT12 offer pager page should exist (U7, R6): a
+    /// persisted offer AND at least one usable channel (the PWA's
+    /// `showBolt12`, `Receive.tsx:372`). `false` while stopped.
+    pub fn offer_available(&self) -> bool {
+        let (channel_manager, kv_store) = {
+            let state_lock = self.state.lock().unwrap();
+            match state_lock.as_ref() {
+                None => return false,
+                Some(state) => (
+                    Arc::clone(&state.components.channel_manager),
+                    Arc::clone(&state.components.kv_store),
+                ),
+            }
+        };
+        channel_manager
+            .list_channels()
+            .iter()
+            .any(|details| details.is_usable)
+            && crate::receive::read_persisted_offer(&kv_store).is_some()
     }
 
     /// Pays a mainnet BOLT11 invoice (U5). Blocking (route computation): call
@@ -667,14 +970,7 @@ impl Node {
     pub(crate) fn lsps2_get_info_live(
         &self,
     ) -> Result<Vec<lightning_liquidity::lsps2::msgs::LSPS2OpeningFeeParams>, Lsps2Error> {
-        let (liquidity_source, runtime_handle) = {
-            let state_lock = self.state.lock().unwrap();
-            let state = state_lock.as_ref().ok_or(Lsps2Error::NotRunning)?;
-            (
-                Arc::clone(&state.liquidity_source),
-                state.runtime.handle().clone(),
-            )
-        };
+        let (liquidity_source, runtime_handle) = self.liquidity_handles()?;
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         runtime_handle.spawn(async move {
             let result = async {
@@ -2147,6 +2443,121 @@ mod tests {
         // The reveal survives the restart (address-reveal learning).
         node.start().expect("offline degraded restart");
         assert_eq!(node.next_receive_address().unwrap(), address);
+        node.stop().unwrap();
+    }
+
+    /// U7 at the Node seam: receive endpoints follow the lifecycle. An
+    /// offline degraded start (fresh wallet, zero channels) serves the
+    /// on-chain-only bundle; the standard invoice carries the PWA's
+    /// description/expiry and allows amountless; a persisted offer stays
+    /// gated on usable channels (and survives a restart under its stable
+    /// key); a bogus accept token fails typed and queues `Lsps2Failed`.
+    #[test]
+    fn receive_endpoints_follow_the_node_lifecycle() {
+        use crate::receive::{ReceiveError, MIN_JIT_RECEIVE_SATS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(CapturingSink::default());
+        let node = Node::with_event_sink(offline_config(dir.path()), Arc::clone(&sink) as _);
+
+        // Stopped: typed NotRunning; the floor and offer degrade safely.
+        assert_eq!(
+            node.jit_quote(1_000_000).unwrap_err(),
+            Lsps2Error::NotRunning
+        );
+        assert_eq!(
+            node.jit_accept(1, 1_000_000).unwrap_err(),
+            Lsps2Error::NotRunning
+        );
+        assert_eq!(
+            node.receive_bundle(None).unwrap_err(),
+            ReceiveError::NotRunning
+        );
+        assert_eq!(
+            node.standard_invoice(None).unwrap_err(),
+            ReceiveError::NotRunning
+        );
+        assert_eq!(node.min_receive_sats(false), MIN_JIT_RECEIVE_SATS);
+        assert_eq!(node.get_or_create_offer(), None);
+        assert!(!node.offer_available());
+
+        node.start().expect("offline degraded start");
+
+        // Fresh wallet, amountless: the on-chain-only QR state
+        // (Receive.tsx:209-218) — needs_jit, no invoice, no error copy.
+        let bundle = node.receive_bundle(None).unwrap();
+        assert!(bundle.needs_jit, "no usable channel");
+        assert_eq!(bundle.bolt11, None);
+        assert_eq!(bundle.payment_hash, None);
+        assert_eq!(bundle.invoice_error, None);
+        assert!(bundle.address.starts_with("bc1q"), "BIP84 mainnet address");
+        assert_eq!(
+            bundle.bip321_uri,
+            format!("bitcoin:{}", bundle.address.to_uppercase())
+        );
+        assert_eq!(bundle.qr_value, bundle.bip321_uri.to_uppercase());
+        assert_eq!(bundle.offer, None);
+        assert_eq!(bundle.offer_qr_value, None);
+        assert_eq!(bundle.min_receive_sats, MIN_JIT_RECEIVE_SATS);
+
+        // Amounted while JIT is needed: the amount rides the URI (the QR
+        // stays scannable on-chain) and no lightning param exists yet.
+        let bundle = node.receive_bundle(Some(5_000_000)).unwrap();
+        assert!(bundle.needs_jit);
+        assert_eq!(bundle.bolt11, None);
+        assert!(
+            bundle.bip321_uri.ends_with("?amount=0.00005000"),
+            "unexpected URI: {}",
+            bundle.bip321_uri
+        );
+
+        // The standard invoice mirrors the PWA's createInvoice: amountless
+        // allowed, description 'Zinqq Wallet', 3600 s expiry, and the
+        // returned hash matches the invoice's.
+        let (bolt11, payment_hash_hex) = node.standard_invoice(None).unwrap();
+        let invoice = lightning_invoice::Bolt11Invoice::from_str(&bolt11).unwrap();
+        assert_eq!(invoice.amount_milli_satoshis(), None, "amountless allowed");
+        assert_eq!(invoice.expiry_time(), Duration::from_secs(3_600));
+        assert_eq!(invoice.description().to_string(), "Zinqq Wallet");
+        assert_eq!(
+            payment_hash_hex,
+            hex_str(&invoice.payment_hash().to_byte_array())
+        );
+        let (amounted, _) = node.standard_invoice(Some(250_000)).unwrap();
+        assert_eq!(
+            lightning_invoice::Bolt11Invoice::from_str(&amounted)
+                .unwrap()
+                .amount_milli_satoshis(),
+            Some(250_000)
+        );
+
+        // A persisted offer does NOT surface with zero usable channels
+        // (showBolt12 gating), but get_or_create_offer serves it verbatim
+        // instead of minting a new one.
+        let kv_store = FilesystemStore::new(dir.path().join(KV_STORE_SUBDIR));
+        crate::receive::persist_offer(&kv_store, "lno1testoffer").unwrap();
+        assert!(!node.offer_available(), "zero usable channels → no page");
+        assert_eq!(node.receive_bundle(None).unwrap().offer, None);
+        assert_eq!(node.get_or_create_offer().as_deref(), Some("lno1testoffer"));
+
+        // A bogus accept token: typed error, Lsps2Failed queued, no buy.
+        assert_eq!(
+            node.jit_accept(999, 1_000_000).unwrap_err(),
+            Lsps2Error::QuoteNotFound
+        );
+        assert!(
+            sink.0.lock().unwrap().iter().any(|event| matches!(
+                event,
+                CoreEvent::Lsps2Failed { reason } if reason.contains("no longer available")
+            )),
+            "the failure must reach the event queue"
+        );
+
+        node.stop().unwrap();
+
+        // The offer is restart-stable under its stable key.
+        node.start().expect("offline degraded restart");
+        assert_eq!(node.get_or_create_offer().as_deref(), Some("lno1testoffer"));
         node.stop().unwrap();
     }
 

@@ -75,6 +75,11 @@ pub const RECEIVE_INVOICE_DESCRIPTION: &str = "Zinqq Wallet";
 /// 'zinqq wallet' — deliberately distinct from the standard-receive string).
 pub const JIT_INVOICE_DESCRIPTION: &str = "zinqq wallet";
 
+/// Description on the persistent BOLT12 offer, matching the PWA's
+/// `builder.description('zinqq wallet')` (`src/ldk/context.tsx:1657`) — the
+/// same lowercase string the JIT invoices carry (U7, R6).
+pub const BOLT12_OFFER_DESCRIPTION: &str = "zinqq wallet";
+
 /// Shared JIT channel constants (U12/KTD-10), the single source of truth for
 /// the two settings a JIT (LSP-opened, 0-conf) receive depends on — mirroring
 /// the PWA's `jit-channel-config.ts`. They are applied in two places that

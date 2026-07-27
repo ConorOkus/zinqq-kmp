@@ -21,6 +21,7 @@ use crate::liquidity::Lsps2Error;
 use crate::node::Node;
 use crate::onchain_send::{FeeEstimate, MaxSendEstimate, OnchainSendError};
 use crate::payment::SendError;
+use crate::receive::{JitInvoice, JitQuote, ReceiveBundle, ReceiveError};
 use crate::restore::RestoreError;
 use crate::send::{self, Classified, HttpNameResolver, LnurlPayMetadata, ResolveError};
 use crate::types::Logger;
@@ -331,6 +332,11 @@ pub enum WalletError {
     /// The LSPS2 JIT flow failed; `reason` is the same distinct reason the
     /// corresponding [`Event::Lsps2Failed`] carries.
     Lsps2 { reason: String },
+    /// `jit_accept` found the quote too stale to mint a payable invoice
+    /// (U7, R6: under 60 s of life after the 30 s flight margin) — request a
+    /// fresh quote via `jit_quote`. Raised BEFORE any `buy`, so nothing was
+    /// committed LSP-side.
+    JitReQuoteRequired,
     /// `send()` with a bolt11 string that failed to parse or verify.
     InvalidInvoice { detail: String },
     /// `send()` with an invoice that is already expired.
@@ -438,6 +444,10 @@ impl std::fmt::Display for WalletError {
             WalletError::NoMnemonic => write!(f, "no wallet mnemonic exists yet"),
             WalletError::NoPendingEvent => write!(f, "no event is pending an ack"),
             WalletError::Lsps2 { reason } => write!(f, "LSPS2 request failed: {reason}"),
+            // The PWA's JitQuoteFreshnessError copy, verbatim.
+            WalletError::JitReQuoteRequired => {
+                write!(f, "{}", Lsps2Error::QuoteExpired)
+            }
             WalletError::InvalidInvoice { detail } => {
                 write!(f, "invalid bolt11 invoice: {detail}")
             }
@@ -650,6 +660,34 @@ impl From<OnchainSendError> for WalletError {
     }
 }
 
+impl From<Lsps2Error> for WalletError {
+    fn from(error: Lsps2Error) -> Self {
+        match error {
+            Lsps2Error::NotRunning => WalletError::NotRunning,
+            // The typed re-quote signal (U7, R6) stays distinguishable so
+            // the shells re-quote instead of rendering a generic failure.
+            Lsps2Error::QuoteExpired => WalletError::JitReQuoteRequired,
+            other => WalletError::Lsps2 {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<ReceiveError> for WalletError {
+    fn from(error: ReceiveError) -> Self {
+        match error {
+            ReceiveError::NotRunning => WalletError::NotRunning,
+            // The address reveal is an on-chain wallet operation; its
+            // failure maps like next_receive_address's does.
+            other @ (ReceiveError::AddressUnavailable { .. }
+            | ReceiveError::InvoiceCreationFailed) => WalletError::OnchainSendFailed {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl From<ResolveError> for WalletError {
     fn from(error: ResolveError) -> Self {
         // The Display strings ARE the PWA's user-facing copy (send.rs).
@@ -751,6 +789,21 @@ pub fn derive_debug_info(mnemonic: String) -> Result<String, WalletError> {
     keys::derive_debug_info(&mnemonic).map_err(WalletError::from)
 }
 
+/// The unified BIP321 receive URI (U7, R6), byte-exact with the PWA's
+/// `buildBip321Uri`: `bitcoin:{ADDRESS uppercased}` with `amount` (BTC,
+/// fixed 8 decimals, only when > 0) then `lightning={invoice}`. This is the
+/// copy/share form; uppercase the WHOLE string for QR alphanumeric mode
+/// (as `ReceiveBundle::qr_value` already does). Pure — usable while the
+/// node is stopped (e.g. re-composing the URI around a fresh JIT invoice).
+#[uniffi::export]
+pub fn build_bip321_uri(
+    address: String,
+    amount_sats: Option<u64>,
+    invoice: Option<String>,
+) -> String {
+    crate::receive::build_bip321_uri(&address, amount_sats, invoice.as_deref())
+}
+
 /// The one FFI object: a node handle plus the persisted event queue.
 ///
 /// The queue owns its own `FilesystemStore` handle over the same store
@@ -830,12 +883,77 @@ impl Wallet {
         self.node
             .receive_jit(amount_msat)
             .map(|_bolt11_and_expiry| ())
-            .map_err(|error| match error {
-                Lsps2Error::NotRunning => WalletError::NotRunning,
-                other => WalletError::Lsps2 {
-                    reason: other.to_string(),
-                },
-            })
+            .map_err(WalletError::from)
+    }
+
+    /// Everything the receive screen renders in one call (U7, R6): on-chain
+    /// address, standard invoice when inbound capacity covers `amount_msat`
+    /// (amountless allowed), the unified BIP321 URI (copy + QR forms), the
+    /// persisted BOLT12 offer when a usable channel exists, the session JIT
+    /// floor, and the `needs_jit` capacity decision. When `needs_jit` is
+    /// `true` with an amount, drive [`Wallet::jit_quote`] →
+    /// [`Wallet::jit_accept`]; amountless with no capacity renders the
+    /// on-chain-only QR (the PWA's Receive flow). Never blocks on the
+    /// network. Requires a running node.
+    pub fn receive_bundle(&self, amount_msat: Option<u64>) -> Result<ReceiveBundle, WalletError> {
+        self.node
+            .receive_bundle(amount_msat)
+            .map_err(WalletError::from)
+    }
+
+    /// JIT phase A (U7, F2): fetch a quote — fee, net amount, validity,
+    /// freshness, and a single-use token — WITHOUT committing anything
+    /// LSP-side, so the review screen can disclose the setup fee first.
+    /// Below-floor amounts fail typed here, before any `buy` (AE4).
+    /// Blocking (LSP round-trip): call from a background dispatcher.
+    pub fn jit_quote(&self, amount_msat: u64) -> Result<JitQuote, WalletError> {
+        self.node.jit_quote(amount_msat).map_err(WalletError::from)
+    }
+
+    /// JIT phase B (U7, F2): commit the reviewed quote — buy, then mint the
+    /// wrapped invoice with its expiry clamped to the quote's remaining
+    /// validity (R6). A quote with under 60 s of payable life left fails
+    /// with [`WalletError::JitReQuoteRequired`] BEFORE the buy — request a
+    /// fresh quote. The invoice also arrives as [`Event::InvoiceReady`] with
+    /// the clamped expiry; failures as [`Event::Lsps2Failed`]. Blocking:
+    /// call from a background dispatcher.
+    pub fn jit_accept(
+        &self,
+        quote_token: u64,
+        amount_msat: u64,
+    ) -> Result<JitInvoice, WalletError> {
+        self.node
+            .jit_accept(quote_token, amount_msat)
+            .map_err(WalletError::from)
+    }
+
+    /// The JIT numpad floor in sats (U7, R6, AE4): one amountless
+    /// `lsps2.get_info` per receive session — pass `refresh = true` on
+    /// entering the receive screen to start a session, `false` afterwards to
+    /// read the cached value. NEVER errors: failures, empty menus, and a
+    /// stopped node all degrade to the static 3,000-sat floor. Blocking on a
+    /// fetch: call from a background dispatcher.
+    pub fn min_receive_sats(&self, refresh: bool) -> u64 {
+        self.node.min_receive_sats(refresh)
+    }
+
+    /// The persistent BOLT12 offer (U7, R6): the persisted one when it
+    /// exists, else created via LDK's offer builder (mainnet chain,
+    /// description `zinqq wallet`) with the PWA's 3/6/12/24/48 s retry
+    /// backoff — blinded paths need the RGS-synced graph — and persisted
+    /// under a stable key so every session serves the same offer. `None`
+    /// when stopped or when creation keeps failing: offer problems NEVER
+    /// block receive. Blocking (up to the retry schedule): call from a
+    /// background dispatcher.
+    pub fn get_or_create_offer(&self) -> Option<String> {
+        self.node.get_or_create_offer()
+    }
+
+    /// Whether the BOLT12 offer pager page should render (U7, R6): a
+    /// persisted offer exists AND at least one channel is usable. `false`
+    /// while stopped.
+    pub fn offer_available(&self) -> bool {
+        self.node.offer_available()
     }
 
     /// Pays a fixed-amount mainnet BOLT11 invoice (compat shim for the
@@ -1323,6 +1441,45 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Lightning Address callback domain mismatch"
+        );
+    }
+
+    /// U7: the LSPS2 error mapping keeps the re-quote signal typed —
+    /// `QuoteExpired` becomes `JitReQuoteRequired` (the PWA freshness copy
+    /// verbatim) while other failures fold into `Lsps2 { reason }` with
+    /// their distinct reasons.
+    #[test]
+    fn lsps2_errors_map_with_a_distinct_requote_signal() {
+        assert_eq!(
+            WalletError::from(Lsps2Error::QuoteExpired),
+            WalletError::JitReQuoteRequired
+        );
+        assert_eq!(
+            WalletError::JitReQuoteRequired.to_string(),
+            "Fee quote expired, please try again"
+        );
+        assert_eq!(
+            WalletError::from(Lsps2Error::NotRunning),
+            WalletError::NotRunning
+        );
+        assert_eq!(
+            WalletError::from(Lsps2Error::QuoteNotFound),
+            WalletError::Lsps2 {
+                reason: Lsps2Error::QuoteNotFound.to_string()
+            }
+        );
+    }
+
+    /// U7: the FFI BIP321 export is byte-exact with the PWA's copy form.
+    #[test]
+    fn build_bip321_uri_export_matches_the_pwa_copy_form() {
+        assert_eq!(
+            build_bip321_uri(
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                Some(3_000),
+                Some("lnbc30u1invoice".to_string()),
+            ),
+            "bitcoin:BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4?amount=0.00003000&lightning=lnbc30u1invoice"
         );
     }
 
