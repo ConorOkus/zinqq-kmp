@@ -262,6 +262,20 @@ pub(crate) struct ValidatedMonitor {
     pub bytes: Vec<u8>,
     /// Server version, seeding the post-restore version cache.
     pub version: i64,
+    /// Whether the plaintext VSS key re-derived from this monitor's funding
+    /// outpoint reproduces the key the blob is actually stored under, so
+    /// PUBLISHING it in the `_monitor_keys` manifest names a key that exists
+    /// remotely.
+    ///
+    /// True by construction for a manifest-listed download (the key came FROM
+    /// the manifest and the blob was fetched under it). Only the adoption path
+    /// ([`verify_unexplained_keys`]) can produce `false`: it learns the
+    /// plaintext key by RE-DERIVING it from the monitor, and obfuscation is a
+    /// one-way HMAC, so when the derived key's obfuscated form does not match
+    /// the stored key there is no way to recover what the blob is really
+    /// filed under. Such a key is safe to track locally but must never be
+    /// published — see [`RestorePlan::publishable_monitor_keys`].
+    pub key_verified: bool,
 }
 
 /// Everything a restore/recovery downloads, fully validated BEFORE any local
@@ -296,10 +310,47 @@ impl RestorePlan {
         versions
     }
 
-    /// The `_monitor_keys` set the plan carries.
+    /// The `_monitor_keys` set the plan carries: EVERY monitor the plan writes
+    /// locally, adopted ones included.
+    ///
+    /// This is the set the caller seeds `VssBackedStore` with, i.e. the
+    /// manifest membership that gates new-channel completion and that the
+    /// store's own manifest writes carry forward. It must stay total: a
+    /// monitor we now track locally and could be asked to update must be in
+    /// the store's set, or the next manifest write would DROP a key another
+    /// device tracks. It is deliberately NOT the set to publish — that is
+    /// [`Self::publishable_monitor_keys`].
     pub(crate) fn monitor_keys(&self) -> BTreeSet<String> {
         self.monitors
             .iter()
+            .map(|monitor| monitor.vss_key.clone())
+            .collect()
+    }
+
+    /// The subset of [`Self::monitor_keys`] that may be PUBLISHED into the
+    /// remote `_monitor_keys` manifest: keys proven to name a blob that exists
+    /// remotely ([`ValidatedMonitor::key_verified`]).
+    ///
+    /// Why the split (R4, fund recovery): `download_and_validate` treats a
+    /// manifest entry with no blob behind it as a hard
+    /// [`RestoreError::BackupInconsistent`] — the correct verdict, since a
+    /// missing monitor may belong to a live channel. So backfilling a key we
+    /// re-derived but could not confirm would turn a RECOVERABLE backup into a
+    /// permanently failing restore (and, on the startup door,
+    /// [`BuildError::VssRecoveryFailed`] — a node that refuses to boot,
+    /// forever) over a monitor we in fact recovered successfully. The manifest
+    /// stores PLAINTEXT keys while the stored key is a one-way HMAC, so
+    /// publishing the key the blob really lives under is impossible;
+    /// publishing nothing for it is the only correct option. The wallet stays
+    /// safe either way — the monitor is durable locally, which is what
+    /// recovers the funds — and the manifest merely stays as incomplete as the
+    /// writing client left it (the PWA's `writeManifest()` is fire-and-forget,
+    /// so an incomplete manifest is the normal cross-client state this engine
+    /// already tolerates).
+    pub(crate) fn publishable_monitor_keys(&self) -> BTreeSet<String> {
+        self.monitors
+            .iter()
+            .filter(|monitor| monitor.key_verified)
             .map(|monitor| monitor.vss_key.clone())
             .collect()
     }
@@ -612,20 +663,30 @@ pub(crate) async fn verify_unexplained_keys(
         let (bytes, version) = fetched;
         match deserialize_monitor(&bytes, keys_manager, signer_provider) {
             Ok(parsed) => {
-                if transport.obfuscate(&parsed.derived_vss_key) != *obfuscated_key {
-                    // The blob IS one of our monitors, so adopting it still
-                    // recovers more state than aborting — but the writer that
-                    // stored it derived a different plaintext key than
-                    // `monitor_vss_key` does, so future writes would land on a
-                    // second key and this one would go stale. That is a
-                    // key-format divergence between clients, not a backup
-                    // fault; the byte-order vector tests exist to keep it from
-                    // ever happening silently.
+                // Does the re-derived plaintext key reproduce the key this blob
+                // is ACTUALLY stored under? The blob IS one of our monitors
+                // either way, so adopting it still recovers more state than
+                // aborting — but if it does not, the writer that stored it
+                // derived a different plaintext key than `monitor_vss_key`
+                // does, so future writes would land on a second key and this
+                // one would go stale. That is a key-format divergence between
+                // clients, not a backup fault; the byte-order vector tests
+                // exist to keep it from ever happening silently.
+                //
+                // The comparison is also the ONLY evidence that the derived key
+                // may be published: obfuscation is one-way, so on a mismatch we
+                // can never learn the plaintext the blob is filed under.
+                let key_verified = transport.obfuscate(&parsed.derived_vss_key) == *obfuscated_key;
+                if !key_verified {
                     log_error!(
                         logger,
-                        "Adopted monitor {} was stored under a remote key its funding outpoint \
-                         does not reproduce; monitor VSS key derivation may have diverged from \
-                         the writing client",
+                        "Adopted monitor {} is stored under a remote key its funding outpoint \
+                         does not reproduce (monitor VSS key derivation has diverged from the \
+                         writing client). The monitor IS recovered locally and its funds are \
+                         safe, but its key is deliberately NOT added to the _monitor_keys \
+                         manifest: a manifest entry with no blob behind it makes every later \
+                         restore fail as an inconsistent backup. The manifest stays incomplete \
+                         until this monitor is written again under our own key.",
                         parsed.derived_vss_key
                     );
                 }
@@ -639,6 +700,7 @@ pub(crate) async fn verify_unexplained_keys(
                     local_key: parsed.local_key,
                     bytes,
                     version,
+                    key_verified,
                 });
             }
             Err(e) => {
@@ -913,6 +975,10 @@ pub(crate) async fn download_and_validate(
                 local_key: parsed.local_key,
                 bytes,
                 version,
+                // Verified by construction: the key came FROM the manifest and
+                // the blob was just fetched under it, so re-publishing it can
+                // only ever name a key that exists remotely.
+                key_verified: true,
             });
         }
     }
@@ -1279,10 +1345,15 @@ pub(crate) fn run_restore(
     // The restore is complete and durable from here on: the manifest backfill
     // is a courtesy to the NEXT restore (so it needs no identification pass),
     // and a failure must never turn a finished restore into a failed one.
+    //
+    // PUBLISHABLE, not the full set: a monitor whose stored key we could not
+    // confirm is recovered locally but must not be named in the manifest, or
+    // the courtesy would brick the next restore
+    // (`RestorePlan::publishable_monitor_keys`).
     if adopted_count > 0 {
         runtime.block_on(backfill_manifest(
             &*transport,
-            &plan.monitor_keys(),
+            &plan.publishable_monitor_keys(),
             plan.manifest_version.unwrap_or(0),
             &logger,
         ));
@@ -1493,6 +1564,61 @@ mod tests {
             (listed.raw_key, listed.bytes),
             (unlisted.raw_key, unlisted.bytes),
         )
+    }
+
+    /// The same PWA-shaped backup as [`seed_pwa_shaped_backup`], except the
+    /// UNLISTED monitor blob is filed under a key its own funding outpoint does
+    /// NOT reproduce: the reversed (display-order) txid spelling — precisely the
+    /// cross-client key-derivation divergence
+    /// `derived_monitor_vss_keys_use_the_pwa_raw_txid_byte_order` guards our own
+    /// writes against, and the only shape in which adoption can learn a
+    /// plaintext key that names nothing remotely.
+    ///
+    /// The mock's `obfuscate` is the identity, so the plaintext seeded here IS
+    /// the stored key the listing reports, which is what lets the adoption path
+    /// observe the mismatch it would observe against a real server.
+    ///
+    /// Returns `(listed key, (derived key, stored key, unlisted bytes))`.
+    #[allow(clippy::type_complexity)]
+    fn seed_backup_with_a_divergently_stored_monitor(
+        transport: &MockTransport,
+    ) -> (String, (String, String, Vec<u8>)) {
+        let mut vectors = monitor_vectors();
+        let unlisted = vectors.pop().expect("fixture has two monitors");
+        let listed = vectors.pop().expect("fixture has two monitors");
+        assert_ne!(
+            unlisted.display_key, unlisted.raw_key,
+            "the fixture's two spellings must differ for this scenario to exist"
+        );
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![listed.raw_key.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&listed.raw_key, &listed.bytes, 1);
+        transport.seed(&unlisted.display_key, &unlisted.bytes, 1);
+        (
+            listed.raw_key,
+            (unlisted.raw_key, unlisted.display_key, unlisted.bytes),
+        )
+    }
+
+    /// Every `_monitor_keys` set the client actually ASKED the transport to
+    /// store, in attempt order. The manifest hazard is about what gets
+    /// PUBLISHED, so the assertions read the transport's received payloads
+    /// rather than an in-process accessor.
+    fn published_manifest_sets(transport: &MockTransport) -> Vec<BTreeSet<String>> {
+        transport
+            .put_payloads_for(MONITOR_MANIFEST_KEY)
+            .iter()
+            .map(|bytes| {
+                parse_monitor_manifest(bytes)
+                    .expect("every published manifest must be valid JSON")
+                    .into_iter()
+                    .collect()
+            })
+            .collect()
     }
 
     /// Runs U3's startup phases over `dir` exactly as `builder::build` does —
@@ -2286,6 +2412,158 @@ mod tests {
         );
     }
 
+    // ---------- adoption vs. PUBLICATION (R4 fund recovery) ----------
+
+    /// The fund-recovery hazard in adoption's own courtesy write: an adopted
+    /// monitor whose stored key its funding outpoint does NOT reproduce must be
+    /// recovered locally and tracked in the manifest GATE, yet must never be
+    /// PUBLISHED into the remote `_monitor_keys` manifest.
+    ///
+    /// Publishing it would name a key no blob exists under, and
+    /// `download_and_validate` treats manifest-listed-but-missing as a hard
+    /// `BackupInconsistent` (correctly — a missing monitor may belong to a live
+    /// channel). So the courtesy write would convert a RECOVERABLE backup into a
+    /// permanently failing restore, and on this startup door into a permanent
+    /// `BuildError::VssRecoveryFailed`, over a monitor that in fact recovered
+    /// fine. The manifest holds PLAINTEXT keys while the stored key is a one-way
+    /// HMAC, so publishing the key the blob really lives under is impossible;
+    /// publishing nothing for it is the only correct option, and the funds are
+    /// safe either way because the local write is what recovers them.
+    #[test]
+    fn an_adopted_monitor_stored_under_a_divergent_key_is_recovered_but_never_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let (listed_key, (derived_key, stored_key, unlisted_bytes)) =
+            seed_backup_with_a_divergently_stored_monitor(&transport);
+
+        let state = run_silent_recovery(dir.path(), &transport)
+            .expect("a divergently-stored orphan must still be adopted, never refuse the start");
+
+        // Recovered: the blob is on disk byte-for-byte — the write that saves
+        // the funds happens exactly as before.
+        let written: BTreeSet<Vec<u8>> = local_monitor_blobs(dir.path()).into_values().collect();
+        assert_eq!(written.len(), 2, "listed + adopted");
+        assert!(
+            written.contains(&unlisted_bytes),
+            "the divergently-stored monitor must still be written locally"
+        );
+
+        // GATE: total, adopted monitor included. Narrowing this would let the
+        // store's next manifest write drop a key another device tracks.
+        assert_eq!(
+            state.monitor_keys,
+            BTreeSet::from([listed_key.clone(), derived_key.clone()]),
+            "the adopted monitor must stay in the manifest set the store is seeded with"
+        );
+        assert_eq!(
+            state.versions.get(&derived_key),
+            Some(&1),
+            "its server version is still seeded"
+        );
+
+        // PUBLISHED: only the verified key — asserted against what the transport
+        // actually received, not against the accessor.
+        assert_eq!(
+            published_manifest_sets(&transport),
+            vec![BTreeSet::from([listed_key.clone()])],
+            "the unverified key must be absent from every manifest payload published"
+        );
+        assert_eq!(
+            remote_manifest_keys(&transport),
+            BTreeSet::from([listed_key])
+        );
+        // Nothing was moved or rewritten remotely: the blob still sits under
+        // the key the other client filed it under.
+        assert_eq!(transport.value(&stored_key).unwrap().0, unlisted_bytes);
+        assert!(
+            transport.value(&derived_key).is_none(),
+            "we cannot invent the blob under our own key either"
+        );
+    }
+
+    /// The no-regression half: an adopted key that DOES reproduce its stored key
+    /// is verified, so the backfill publishes it exactly as before. Asserted on
+    /// the transport's received manifest payload, so the publishable/gate split
+    /// cannot silently start withholding the ordinary case.
+    #[test]
+    fn a_verified_adopted_key_is_still_published_in_the_backfilled_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let ((listed_key, _), (unlisted_key, _)) = seed_pwa_shaped_backup(&transport);
+
+        let state = run_silent_recovery(dir.path(), &transport).expect("silent recovery");
+
+        let both = BTreeSet::from([listed_key, unlisted_key]);
+        assert_eq!(
+            published_manifest_sets(&transport),
+            vec![both.clone()],
+            "a verified adopted key MUST be published — that is what makes the next \
+             reconciliation need no identification pass"
+        );
+        assert_eq!(state.monitor_keys, both, "gate and publication agree here");
+    }
+
+    /// THE regression this split prevents, end to end: a divergent adoption must
+    /// leave the backup RESTORABLE.
+    ///
+    /// Before the fix the backfill published the re-derived key, so the remote
+    /// manifest named a monitor that did not exist: every later restore over
+    /// that state died in `download_and_validate` with `BackupInconsistent`
+    /// ("listed in manifest but missing from VSS"), and every later start on the
+    /// silent door died with `BuildError::VssRecoveryFailed` — a wallet whose
+    /// funds were fully recoverable, bricked by its own courtesy write. Both
+    /// doors are checked here, over the state the FIRST restore left behind.
+    #[test]
+    fn a_divergent_adoption_leaves_the_backup_restorable_on_both_doors() {
+        let transport = Arc::new(MockTransport::new());
+        let (listed_key, (derived_key, _stored_key, _)) =
+            seed_backup_with_a_divergently_stored_monitor(&transport);
+
+        let first = tempfile::tempdir().unwrap();
+        run_restore(
+            &vss_config(first.path(), &transport),
+            crate::keys::tests::TEST_MNEMONIC,
+            &LoggingEventSink::new(),
+            None,
+        )
+        .expect("the first restore adopts the divergently-stored monitor");
+        let recovered = local_monitor_blobs(first.path());
+        assert_eq!(recovered.len(), 2, "listed + adopted");
+        assert!(
+            !published_manifest_sets(&transport)
+                .iter()
+                .any(|set| set.contains(&derived_key)),
+            "no manifest payload may ever name the unverifiable key"
+        );
+
+        // Door 1 — explicit restore over the state the first restore left.
+        let second = tempfile::tempdir().unwrap();
+        run_restore(
+            &vss_config(second.path(), &transport),
+            crate::keys::tests::TEST_MNEMONIC,
+            &LoggingEventSink::new(),
+            None,
+        )
+        .expect("a restore after the divergent adoption must NOT be BackupInconsistent");
+        assert_eq!(
+            local_monitor_blobs(second.path()),
+            recovered,
+            "the second restore recovers the same monitor set, adopted one included"
+        );
+
+        // Door 2 — silent recovery over that same state must boot, not refuse.
+        let third = tempfile::tempdir().unwrap();
+        let state = run_silent_recovery(third.path(), &transport)
+            .expect("a start after the divergent adoption must NOT be VssRecoveryFailed");
+        assert!(state.recovered);
+        assert_eq!(local_monitor_blobs(third.path()), recovered);
+        assert_eq!(
+            state.monitor_keys,
+            BTreeSet::from([listed_key, derived_key]),
+            "and the gate still covers the adopted monitor on every later start"
+        );
+    }
+
     // ---------- scenario 2: rollback / original intact ----------
 
     /// A corrupt monitor blob in the set fails validation BEFORE any local
@@ -2355,12 +2633,14 @@ mod tests {
                     local_key: format!("{}_0", "aa".repeat(32)),
                     bytes: vec![2u8; 16],
                     version: 4,
+                    key_verified: true,
                 },
                 ValidatedMonitor {
                     vss_key: format!("{}:1", "bb".repeat(32)),
                     local_key: format!("{}_1", "bb".repeat(32)),
                     bytes: vec![3u8; 16],
                     version: 5,
+                    key_verified: true,
                 },
             ],
             peers: Some((parse_known_peers(PEERS_JSON.as_bytes()).unwrap(), 2)),

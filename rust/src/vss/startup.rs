@@ -451,10 +451,17 @@ fn silent_recovery(
     // start (so it needs no identification pass), and a failure must never turn
     // a finished recovery into a failed one — same best-effort contract, same
     // trigger, as the explicit path.
+    //
+    // And the same set as the explicit path: only the PUBLISHABLE keys
+    // (`RestorePlan::publishable_monitor_keys`). Backfilling a re-derived key
+    // whose blob is stored elsewhere would name a monitor that does not exist
+    // remotely, and this very branch treats manifest-listed-but-missing as
+    // fatal — the courtesy write would turn this recovery into a permanent
+    // `BuildError::VssRecoveryFailed` on every later start.
     if adopted_count > 0 {
         runtime.block_on(crate::restore::backfill_manifest(
             &*transport,
-            &plan.monitor_keys(),
+            &plan.publishable_monitor_keys(),
             plan.manifest_version.unwrap_or(0),
             logger,
         ));

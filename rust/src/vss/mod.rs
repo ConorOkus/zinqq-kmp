@@ -111,6 +111,22 @@ pub(crate) mod test_support {
                 .count()
         }
 
+        /// Every payload the client has ASKED this transport to store under
+        /// `key`, in attempt order (failed attempts included). Lets a test
+        /// assert what a write path actually PUBLISHED rather than what an
+        /// accessor claims it would — the difference that matters for the
+        /// `_monitor_keys` manifest, where a published key naming no blob is
+        /// what makes later restores fail.
+        pub(crate) fn put_payloads_for(&self, key: &str) -> Vec<Vec<u8>> {
+            self.put_attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _, _)| k == key)
+                .map(|(_, value, _)| value.clone())
+                .collect()
+        }
+
         pub(crate) fn put_many_calls(&self) -> Vec<BatchItems> {
             self.put_many_calls.lock().unwrap().clone()
         }
