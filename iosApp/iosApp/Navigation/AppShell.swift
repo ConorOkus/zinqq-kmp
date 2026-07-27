@@ -18,6 +18,17 @@ struct AppShell: View {
     /// string, cleared by any navigation that leaves Send, and re-classified
     /// from scratch by the Send screen — never a parsed object.
     @State private var scannedInput: String?
+    /// Peers → OpenChannel handoff (U22): the validated `pubkey@host:port`
+    /// from the connect form, the PWA's `location.state` / Android's
+    /// savedStateHandle twin; missing state redirects back to Peers.
+    @State private var openChannelPeer: String?
+    /// Peers → CloseChannel handoff (U22): target channel + initial force.
+    @State private var closeChannelTarget: CloseChannelTarget?
+
+    struct CloseChannelTarget: Equatable {
+        let channelId: String
+        let force: Bool
+    }
 
     private var current: Route { path.last ?? .home }
 
@@ -68,8 +79,11 @@ struct AppShell: View {
     private func navigate(_ route: Route) {
         // The scan handoff is consumed by exactly one Send visit (U20):
         // navigating anywhere else clears it, so a later Home → Send entry
-        // starts fresh.
+        // starts fresh. Same discipline for the Peers → Open/Close Channel
+        // handoffs (U22).
         if route != .send { scannedInput = nil }
+        if route != .peersOpenChannel { openChannelPeer = nil }
+        if route != .peersCloseChannel { closeChannelTarget = nil }
         path = route.backChain
     }
 
@@ -125,21 +139,68 @@ struct AppShell: View {
         case .recover:
             RecoverFundsScreen(model: model, onBack: { navigate(.home) })
         case .settings:
-            PlaceholderScreen(title: "Settings", route: route, onNavigate: navigate)
+            SettingsScreen(
+                model: model,
+                onBack: backAction(for: route),
+                onOpenRow: navigate
+            )
         case .settingsBackup:
-            PlaceholderScreen(title: "Backup", route: route, onNavigate: navigate)
+            BackupScreen(
+                port: model,
+                onBack: backAction(for: route),
+                onDone: { navigate(.settings) }
+            )
         case .settingsRestore:
-            PlaceholderScreen(title: "Restore", route: route, onNavigate: navigate)
+            RestoreScreen(
+                model: model,
+                onBack: backAction(for: route),
+                onRestored: { navigate(.home) }
+            )
         case .settingsAdvanced:
-            PlaceholderScreen(title: "Advanced", route: route, onNavigate: navigate)
+            AdvancedScreen(
+                model: model,
+                onBack: backAction(for: route),
+                onOpenRow: navigate
+            )
         case .advancedBalance:
-            PlaceholderScreen(title: "Balance", route: route, onNavigate: navigate)
+            BalanceScreen(model: model, onBack: backAction(for: route))
         case .advancedPeers:
-            PlaceholderScreen(title: "Peers", route: route, onNavigate: navigate)
+            PeersScreen(
+                port: model,
+                onBack: backAction(for: route),
+                onOpenChannel: { address in
+                    openChannelPeer = address
+                    navigate(.peersOpenChannel)
+                },
+                onCloseChannel: { channelId, force in
+                    closeChannelTarget = CloseChannelTarget(channelId: channelId, force: force)
+                    navigate(.peersCloseChannel)
+                }
+            )
         case .peersOpenChannel:
-            PlaceholderScreen(title: "Open Channel", route: route, onNavigate: navigate)
+            OpenChannelScreen(
+                port: model,
+                peerAddress: openChannelPeer,
+                onBack: { navigate(.advancedPeers) },
+                onDone: { navigate(.home) },
+                onMissingPeer: { navigate(.advancedPeers) }
+            )
         case .peersCloseChannel:
-            PlaceholderScreen(title: "Close Channel", route: route, onNavigate: navigate)
+            CloseChannelScreen(
+                port: model,
+                channelId: closeChannelTarget?.channelId,
+                initialForce: closeChannelTarget?.force ?? false,
+                onBack: { navigate(.advancedPeers) },
+                onTrackProgress: { navigate(.activityCloseDetail(channelId: $0)) },
+                onDone: { navigate(.home) },
+                onMissingChannel: { navigate(.advancedPeers) }
+            )
         }
+    }
+
+    /// The declared backTo destination as a navigation closure (nil on the
+    /// tab-bar screens, matching the PWA's headers without a back arrow).
+    private func backAction(for route: Route) -> (() -> Void)? {
+        route.backTo.map { target in { navigate(target) } }
     }
 }

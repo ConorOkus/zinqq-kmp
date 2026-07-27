@@ -35,6 +35,9 @@ enum WalletEvent {
     /// Another client took over this seed's VSS namespace (KTD-3, plan
     /// System-Wide Impact): the core fenced itself durably and halted.
     case fenced(detail: String)
+    /// Restore-from-seed progress (U22, F3): the PWA's exact step copy,
+    /// reduced into `WalletModel.restore` while a restore is in progress.
+    case restoreProgress(step: String)
     /// Sealed in Kotlin, but Swift cannot prove exhaustiveness over the
     /// exported class hierarchy; unknown events are ignored by the reducer.
     case unknown
@@ -74,6 +77,8 @@ enum WalletEvent {
             return .recoveryStateChanged
         case let e as Event.Fenced:
             return .fenced(detail: e.detail)
+        case let e as Event.RestoreProgress:
+            return .restoreProgress(step: e.step)
         default:
             return .unknown
         }
@@ -178,6 +183,16 @@ final class WalletModel: ObservableObject {
     @Published private(set) var pendingSweep: PendingSweepView?
     /// The close-detail screen's current query result.
     @Published private(set) var closeDetail: CloseDetailUi?
+    /// The Restore flow's live phase (U22, F3); nil = no restore running.
+    /// Owned here, not on the screen, because the model owns the whole
+    /// stop → restore → restart sequence: leaving the screen mid-restore
+    /// cannot orphan a stopped node, and the screen re-attaches to whatever
+    /// phase is current (Android's `UiState.restore` twin).
+    @Published private(set) var restore: RestoreUi?
+    /// Cached `nodeId()` for the Advanced screen (U22): queried per refresh —
+    /// it needs a running node — but the pubkey is stable for the wallet's
+    /// lifetime, so it stays readable across stops.
+    @Published private(set) var nodeId: String?
     /// Fatal start failure — Home replaces its content with the PWA's
     /// "Something went wrong" state (`Home.tsx:29-42`).
     @Published private(set) var startError: String?
@@ -218,6 +233,10 @@ final class WalletModel: ObservableObject {
     /// Called on scenePhase .active. Starts the node and schedules the event
     /// loop; peer reconnect after a suspend is the core's job.
     func start() {
+        // A running restore owns the node lifecycle (stop → restore →
+        // restart); a foreground start racing it would make the core's
+        // stopped-only restore() fail with AlreadyRunning (U22, F3).
+        if case .inProgress = restore { return }
         guard !startRequested else { return }
         startRequested = true
         Task { [weak self] in
@@ -342,11 +361,15 @@ final class WalletModel: ObservableObject {
             // real answer (no recovery / nothing pending), not a failure.
             let recovery = try? await Self.runBlockingFFI { wallet.recoveryState() }
             let sweep = try? await Self.runBlockingFFI { wallet.pendingSweep() }
+            // Cached across stops (U22): nodeId() needs a running node, but
+            // the pubkey is stable for the wallet's lifetime.
+            let freshNodeId = try? await Self.runBlockingFFI { try wallet.nodeId() }
             guard let self else { return }
             if let balances {
                 self.balances = balances
                 self.balanceMsat = balances.lightningMsat
             }
+            self.nodeId = freshNodeId ?? self.nodeId
             self.activity = activity ?? self.activity
             self.recoveryState = recovery ?? nil
             self.pendingSweep = sweep ?? nil
@@ -495,6 +518,10 @@ final class WalletModel: ObservableObject {
             // destination behind the fenced screen until the user restores
             // or quits (U18); never cleared by an event.
             fenced = true
+        case .restoreProgress:
+            // U22/F3: only advances an in-progress restore — a stray late
+            // event can neither start one nor resurrect a terminal outcome.
+            restore = reduceRestore(restore, event)
         case .unknown:
             break
         }
@@ -505,6 +532,103 @@ final class WalletModel: ObservableObject {
     /// failure means the durable fence is set.
     private static func isFencedError(_ error: Error) -> Bool {
         (error as NSError).userInfo["KotlinException"] is WalletException.Fenced
+    }
+
+    // MARK: Restore lifecycle (U22, F3)
+
+    /// F3: replace the current wallet from 12 validated words, mirroring
+    /// Android's `WalletHolder.startRestore` adapted to this model's chained
+    /// event loop (U19). The core's `restore()` is valid only from a stopped
+    /// node, so the model owns the whole sequence:
+    ///
+    /// 1. `stop()` — pushes the terminal NodeStopped, which lets the current
+    ///    loop run drain and exit (a NotRunning stop pushes nothing).
+    /// 2. `scheduleEventLoop(wallet)` — Android's `ensureEventLoop` twin:
+    ///    the chained scheduling first awaits the old run's exit (the
+    ///    `loopJob.join()` half), then the fresh run parks in `nextEvent`
+    ///    and drains `RestoreProgress` events live while `restore()` blocks.
+    /// 3. Blocking `restore()` off the MainActor.
+    /// 4. `restartAfterRestore` — foreground-gated `start()` WITHOUT another
+    ///    `scheduleEventLoop`: the restore's run is still the live consumer
+    ///    (it only exits on the next NodeStopped), exactly like Android's
+    ///    idempotent `ensureEventLoop` no-op.
+    ///
+    /// Runs in an unscoped task: leaving the screen mid-restore cannot orphan
+    /// a stopped node, and the screen re-attaches to whatever phase is
+    /// current.
+    func startRestore(mnemonic: String) {
+        if case .inProgress = restore { return }
+        restore = .inProgress(step: restoreInitialStep)
+        Task { [weak self] in
+            guard let self else { return }
+            let wallet: Wallet
+            do {
+                wallet = try self.ensureWallet()
+            } catch {
+                self.restore = .failed(message: restoreErrorMessage(error))
+                return
+            }
+            // The restore sequence owns the node lifecycle from here: the
+            // node is (about to be) stopped, so scenePhase stop() must not
+            // race it, and start() is gated on the in-progress restore.
+            self.startRequested = false
+            do {
+                try await Self.runBlockingFFI { try wallet.stop() }
+            } catch {
+                // NotRunning: nothing to stop (pushes nothing). A stop with a
+                // failed final persist still transitioned and still pushed
+                // the terminal NodeStopped (see api.rs stop()).
+            }
+            // Drain RestoreProgress events live while restore() blocks.
+            self.scheduleEventLoop(wallet)
+            do {
+                try await Self.runBlockingFFI { try wallet.restore(mnemonic: mnemonic) }
+            } catch {
+                // The typed failures leave local state untouched — restart
+                // the existing wallet so the app stays usable behind the
+                // error screen (a still-fenced wallet re-fences here).
+                await self.restartAfterRestore(wallet)
+                self.restore = .failed(message: restoreErrorMessage(error))
+                return
+            }
+            // The restored wallet replaced the old one — any fence fell with
+            // it; a start failure still surfaces through startError on Home.
+            self.fenced = false
+            await self.restartAfterRestore(wallet)
+            self.restore = .succeeded
+        }
+    }
+
+    /// Restore's exit restart, foreground-gated (KTD-10): a restore that
+    /// finishes while the app is backgrounded must not leave a headless node
+    /// running past its missed scenePhase stop — the next foreground start
+    /// covers it. Deliberately does NOT schedule another event-loop run: the
+    /// restore's chained run is still the single live consumer.
+    private func restartAfterRestore(_ wallet: Wallet) async {
+        guard UIApplication.shared.applicationState != .background else { return }
+        do {
+            try await Self.runBlockingFFI { try wallet.start() }
+            startRequested = true
+            startError = nil
+            refreshWalletData()
+        } catch {
+            if kotlinThrowable(error) is WalletException.AlreadyRunning {
+                // A no-op success (Android's startCore parity).
+                startRequested = true
+                startError = nil
+                refreshWalletData()
+            } else if Self.isFencedError(error) {
+                fenced = true
+            } else {
+                startError = error.localizedDescription
+            }
+        }
+    }
+
+    /// The Restore screen's Try-Again/exit ack; a running restore stays owned.
+    func clearRestore() {
+        if case .inProgress = restore { return }
+        restore = nil
     }
 
     // MARK: Storage
@@ -718,4 +842,67 @@ extension WalletModel: ReceivePort {
             )
         }
     }
+}
+
+// MARK: - SettingsPort (U22, R14)
+
+/// Thin passthroughs to the core's mnemonic and channels/peers FFI,
+/// mirroring Android's `WalletHolder` SettingsPort section: bounds, guards,
+/// close estimates, and the connect protocol all live in Rust; blocking
+/// calls hop off the MainActor via `runBlockingFFI`.
+extension WalletModel: SettingsPort {
+    func revealMnemonic() async throws -> String {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { try wallet.revealMnemonic() }
+    }
+
+    func validateMnemonic(_ mnemonic: String) async -> Bool {
+        // deriveDebugInfo is the exported BIP39 check (U1): it fails typed
+        // (InvalidMnemonic) on anything but valid 12 English words.
+        (try? await Self.runBlockingFFI {
+            try Wallet_core_nativeKt.deriveDebugInfo(mnemonic: mnemonic)
+        }) != nil
+    }
+
+    func listPeers() async throws -> [PeerView] {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { try wallet.listPeers() }
+    }
+
+    func listChannels() async throws -> [ChannelView] {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { try wallet.listChannels() }
+    }
+
+    func forgetPeer(pubkey: String) async throws {
+        let wallet = try requireWallet()
+        try await Self.runBlockingFFI { try wallet.forgetPeer(pubkey: pubkey) }
+    }
+
+    func openChannel(peerAddress: String, amountSats: UInt64) async throws -> String {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI {
+            try wallet.openChannel(peerAddress: peerAddress, amountSats: amountSats)
+        }
+    }
+
+    func estimateOpenFee() async throws -> OpenFeeEstimate {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { try wallet.estimateOpenFee() }
+    }
+
+    func estimateClose(channelId: String) async throws -> CloseEstimate {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { wallet.estimateClose(channelId: channelId) }
+    }
+
+    func closeChannel(channelId: String, force: Bool) async throws {
+        let wallet = try requireWallet()
+        try await Self.runBlockingFFI {
+            try wallet.closeChannel(channelId: channelId, force: force)
+        }
+    }
+
+    // `onchainBalanceSats()` is shared with SendPort above: the PWA's
+    // trusted-spendable on-chain figure (total − untrusted pending).
 }
