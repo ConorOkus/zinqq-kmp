@@ -17,7 +17,9 @@ fn test_wallet(storage_dir: &Path) -> Wallet {
         esplora_url: Some(UNREACHABLE_ESPLORA.to_string()),
         rgs_url: Some(UNREACHABLE_RGS.to_string()),
         vss_url: None,
-        vss_disabled: false,
+        // Offline suite: local-only persistence (the U3 VSS paths are
+        // covered by in-crate tests with an injected mock transport).
+        vss_disabled: true,
         explorer_url: None,
         lsp_node_id: None,
         lsp_host: None,

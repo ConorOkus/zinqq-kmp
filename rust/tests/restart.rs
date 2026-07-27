@@ -28,6 +28,9 @@ fn test_config(storage_dir: &Path) -> Config {
     let mut config = Config::new(storage_dir.to_str().unwrap().to_string());
     config.esplora_url = UNREACHABLE_ESPLORA.to_string();
     config.rgs_url = UNREACHABLE_RGS.to_string();
+    // Offline suite: local-only persistence (the U3 VSS paths are covered by
+    // in-crate tests with an injected mock transport).
+    config.vss_disabled = true;
     config
 }
 

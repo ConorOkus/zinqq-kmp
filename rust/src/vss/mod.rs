@@ -16,14 +16,244 @@
 //! envelope is incompatible with PWA blobs and its transport hides the HTTP
 //! status the PWA's 404-to-None mapping needs, so both are unused.
 //!
-//! U3 builds the dual-write persistence (composite store, fencing) on top.
+//! U3 (KTD-3, R3) builds the dual-write persistence on top: [`store`] (the
+//! custom monitor `Persist`, the CM dual-write `KVStoreSync`, version cache,
+//! manifest, and fence), [`startup`] (silent recovery / migration / mandatory
+//! version seeding), and [`known_peers`] (`_known_peers` whole-map LWW).
 
 pub mod auth;
 pub mod client;
 pub mod crypto;
+pub(crate) mod known_peers;
+pub(crate) mod startup;
+pub mod store;
 
 pub use client::{VssRetryPolicy, VssWireClient};
 pub use crypto::CryptoError;
+pub use store::{DualWriteKvStore, VssBackedStore};
+
+/// Deterministic in-process transport for tests: an in-memory versioned map
+/// with injectable failures, so U3's failure/conflict/crash-seam scenarios
+/// run without a network. Obfuscation is the identity function, keeping
+/// listing entries matchable against plaintext keys in assertions.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use super::store::{BoxFuture, VersionedValue, VssTransport};
+    use super::VssError;
+
+    /// One `(plaintext key, value, version)` batch item.
+    pub(crate) type BatchItems = Vec<(String, Vec<u8>, i64)>;
+
+    #[derive(Default)]
+    pub(crate) struct MockTransport {
+        state: Mutex<HashMap<String, (Vec<u8>, i64)>>,
+        pub fail_puts: AtomicBool,
+        pub fail_gets: AtomicBool,
+        pub fail_list: AtomicBool,
+        pub fail_put_many: AtomicBool,
+        fail_puts_keys: Mutex<HashSet<String>>,
+        /// Keys whose GET fails (scripted recovery failures).
+        fail_gets_keys: Mutex<HashSet<String>>,
+        put_attempts: Mutex<BatchItems>,
+        put_many_calls: Mutex<Vec<BatchItems>>,
+        get_calls: Mutex<Vec<String>>,
+    }
+
+    impl MockTransport {
+        pub(crate) fn new() -> Self {
+            Self::default()
+        }
+
+        /// Plants `(bytes, version)` under `key`, as if another client wrote.
+        pub(crate) fn seed(&self, key: &str, bytes: &[u8], version: i64) {
+            self.state
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (bytes.to_vec(), version));
+        }
+
+        pub(crate) fn value(&self, key: &str) -> Option<(Vec<u8>, i64)> {
+            self.state.lock().unwrap().get(key).cloned()
+        }
+
+        pub(crate) fn snapshot(&self) -> HashMap<String, (Vec<u8>, i64)> {
+            self.state.lock().unwrap().clone()
+        }
+
+        /// Total put ATTEMPTS (including failed ones) across single puts.
+        pub(crate) fn put_attempt_count(&self) -> usize {
+            self.put_attempts.lock().unwrap().len()
+        }
+
+        pub(crate) fn put_attempts_for(&self, key: &str) -> usize {
+            self.put_attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _, _)| k == key)
+                .count()
+        }
+
+        pub(crate) fn put_many_calls(&self) -> Vec<BatchItems> {
+            self.put_many_calls.lock().unwrap().clone()
+        }
+
+        pub(crate) fn get_calls_for(&self, key: &str) -> usize {
+            self.get_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| *k == key)
+                .count()
+        }
+
+        pub(crate) fn fail_puts_for(&self, key: &str, fail: bool) {
+            let mut keys = self.fail_puts_keys.lock().unwrap();
+            if fail {
+                keys.insert(key.to_string());
+            } else {
+                keys.remove(key);
+            }
+        }
+
+        pub(crate) fn fail_gets_for(&self, key: &str, fail: bool) {
+            let mut keys = self.fail_gets_keys.lock().unwrap();
+            if fail {
+                keys.insert(key.to_string());
+            } else {
+                keys.remove(key);
+            }
+        }
+
+        fn put_sync(&self, key: &str, value: &[u8], version: i64) -> Result<i64, VssError> {
+            self.put_attempts
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.to_vec(), version));
+            if self.fail_puts.load(Ordering::SeqCst)
+                || self.fail_puts_keys.lock().unwrap().contains(key)
+            {
+                return Err(VssError::InternalServer {
+                    message: "mock: put failure injected".to_string(),
+                });
+            }
+            let mut state = self.state.lock().unwrap();
+            let current = state.get(key).map(|(_, v)| *v).unwrap_or(0);
+            if version != current {
+                return Err(VssError::Conflict {
+                    message: format!("mock: version {version} != current {current}"),
+                });
+            }
+            state.insert(key.to_string(), (value.to_vec(), version + 1));
+            Ok(version + 1)
+        }
+    }
+
+    impl VssTransport for MockTransport {
+        fn get<'a>(
+            &'a self,
+            plaintext_key: &'a str,
+        ) -> BoxFuture<'a, Result<VersionedValue, VssError>> {
+            self.get_calls
+                .lock()
+                .unwrap()
+                .push(plaintext_key.to_string());
+            let result = if self.fail_gets.load(Ordering::SeqCst)
+                || self.fail_gets_keys.lock().unwrap().contains(plaintext_key)
+            {
+                Err(VssError::Network {
+                    message: "mock: get failure injected".to_string(),
+                })
+            } else {
+                Ok(self.state.lock().unwrap().get(plaintext_key).cloned())
+            };
+            Box::pin(std::future::ready(result))
+        }
+
+        fn put<'a>(
+            &'a self,
+            plaintext_key: &'a str,
+            value: &'a [u8],
+            version: i64,
+        ) -> BoxFuture<'a, Result<i64, VssError>> {
+            let result = self.put_sync(plaintext_key, value, version);
+            Box::pin(std::future::ready(result))
+        }
+
+        fn put_many<'a>(
+            &'a self,
+            items: Vec<(String, Vec<u8>, i64)>,
+        ) -> BoxFuture<'a, Result<(), VssError>> {
+            self.put_many_calls.lock().unwrap().push(items.clone());
+            let result = if self.fail_put_many.load(Ordering::SeqCst) {
+                Err(VssError::InternalServer {
+                    message: "mock: put_many failure injected".to_string(),
+                })
+            } else {
+                // Transactional: all versions must match before any applies.
+                let mut state = self.state.lock().unwrap();
+                let conflict = items.iter().find(|(key, _, version)| {
+                    let current = state.get(key).map(|(_, v)| *v).unwrap_or(0);
+                    *version != current
+                });
+                if let Some((key, _, _)) = conflict {
+                    Err(VssError::Conflict {
+                        message: format!("mock: transactional conflict on {key}"),
+                    })
+                } else {
+                    for (key, value, version) in items {
+                        state.insert(key, (value, version + 1));
+                    }
+                    Ok(())
+                }
+            };
+            Box::pin(std::future::ready(result))
+        }
+
+        fn delete<'a>(
+            &'a self,
+            plaintext_key: &'a str,
+            version: i64,
+        ) -> BoxFuture<'a, Result<(), VssError>> {
+            let mut state = self.state.lock().unwrap();
+            let result = match state.get(plaintext_key) {
+                Some((_, current)) if *current != version => Err(VssError::Conflict {
+                    message: format!("mock: delete at {version} != current {current}"),
+                }),
+                _ => {
+                    state.remove(plaintext_key);
+                    Ok(())
+                }
+            };
+            Box::pin(std::future::ready(result))
+        }
+
+        fn list_key_versions<'a>(&'a self) -> BoxFuture<'a, Result<Vec<(String, i64)>, VssError>> {
+            let result = if self.fail_list.load(Ordering::SeqCst) {
+                Err(VssError::Network {
+                    message: "mock: list failure injected".to_string(),
+                })
+            } else {
+                Ok(self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, (_, v))| (k.clone(), *v))
+                    .collect())
+            };
+            Box::pin(std::future::ready(result))
+        }
+
+        fn obfuscate(&self, plaintext_key: &str) -> String {
+            plaintext_key.to_string()
+        }
+    }
+}
 
 /// Typed VSS failures. The taxonomy mirrors the PWA's `VssError.errorCode`
 /// handling: each protocol `ErrorCode` stays distinguishable, and transport
@@ -187,6 +417,7 @@ mod tests {
         let mut config = crate::Config::new(dir_a.path().to_str().unwrap().to_string());
         config.esplora_url = "http://127.0.0.1:1".to_string();
         config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        config.vss_disabled = true;
         let node_a = crate::Node::new(config);
         node_a.start().expect("offline degraded start");
         let node_id = node_a.node_id().unwrap();
@@ -226,6 +457,7 @@ mod tests {
         let mut config_b = crate::Config::new(dir_b.path().to_str().unwrap().to_string());
         config_b.esplora_url = "http://127.0.0.1:1".to_string();
         config_b.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        config_b.vss_disabled = true;
         let node_b = crate::Node::new(config_b);
         node_b
             .start()
@@ -441,14 +673,21 @@ mod tests {
         drop(signer_provider);
         drop(store);
 
-        let config = crate::Config::new(dir.path().to_str().unwrap().to_string());
+        let mut config = crate::Config::new(dir.path().to_str().unwrap().to_string());
+        // The fixture proves deserialization; the live namespace is left
+        // alone (single-client discipline).
+        config.vss_disabled = true;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
-        let components = crate::builder::build(&config, &rt)
-            .expect("PWA channel_manager must deserialize through the full restore path");
+        let components = crate::builder::build(
+            &config,
+            &rt,
+            std::sync::Arc::new(crate::node::LoggingEventSink::new()),
+        )
+        .expect("PWA channel_manager must deserialize through the full restore path");
         eprintln!(
             "PWA blob interop OK: node id {}",
             components.channel_manager.get_our_node_id()

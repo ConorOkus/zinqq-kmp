@@ -39,16 +39,17 @@ pub(crate) type Router = DefaultRouter<
 
 pub(crate) type MessageRouter = DefaultMessageRouter<Arc<Graph>, Arc<Logger>, Arc<KeysManager>>;
 
-/// The `Persist` implementation is the blanket `impl Persist for K: KVStoreSync`
-/// on [`FilesystemStore`]: full-monitor writes under LDK's persist key
-/// constants, durable before `Completed` (KTD-4).
+/// The `Persist` slot carries U3's [`VssBackedStore`] (KTD-3): full-monitor
+/// VSS-first dual writes returning `InProgress` with per-channel serialized
+/// completion, degrading to synchronous local durable-before-`Completed`
+/// writes when VSS is disabled.
 pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
     InMemorySigner,
     Arc<ChainSource>,
     Arc<Broadcaster>,
     Arc<CachedFeeEstimator>,
     Arc<Logger>,
-    Arc<FilesystemStore>,
+    Arc<crate::vss::store::VssBackedStore>,
     Arc<KeysManager>,
 >;
 
@@ -111,12 +112,15 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 pub(crate) type RapidGossipSync =
     lightning_rapid_gossip_sync::RapidGossipSync<Arc<Graph>, Arc<Logger>>;
 
+/// The sweeper persists through the same `KVStoreSync` the background
+/// processor uses (the BP's generics require it); its `output_sweeper` key
+/// routes local-only inside [`crate::vss::DualWriteKvStore`].
 pub(crate) type Sweeper = OutputSweeperSync<
     Arc<Broadcaster>,
     Arc<OnchainWallet>,
     Arc<CachedFeeEstimator>,
     Arc<ChainSource>,
-    Arc<FilesystemStore>,
+    Arc<crate::vss::DualWriteKvStore>,
     Arc<Logger>,
     Arc<KeysManager>,
 >;

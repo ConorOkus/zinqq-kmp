@@ -174,6 +174,22 @@ impl LspConfig {
     }
 }
 
+/// Test-only seam (U3): replaces the VSS wire transport with an in-process
+/// fake so startup branches (recovery / migration / seeding / fence) run
+/// deterministically without a network. Never constructed outside tests.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct VssTransportOverride(
+    pub(crate) std::sync::Arc<dyn crate::vss::store::VssTransport>,
+);
+
+#[cfg(test)]
+impl std::fmt::Debug for VssTransportOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VssTransportOverride(..)")
+    }
+}
+
 /// A peer the node keeps connected while running (direct TCP per R7).
 /// U4 configures Megalith here.
 #[derive(Clone, Debug)]
@@ -215,6 +231,9 @@ pub struct Config {
     /// pubkey). Seeded with Megalith; the configured [`Config::lsp`] is
     /// always trusted too (mirroring the PWA's `trustedLspIds`).
     pub trusted_lsps: Vec<PublicKey>,
+    /// Test-only in-process VSS transport (see [`VssTransportOverride`]).
+    #[cfg(test)]
+    pub(crate) vss_transport_override: Option<VssTransportOverride>,
 }
 
 impl Config {
@@ -232,6 +251,8 @@ impl Config {
             lsp: LspConfig::megalith(),
             trusted_lsps: vec![PublicKey::from_str(MEGALITH_LSP_NODE_ID)
                 .expect("Megalith node id constant is a valid public key")],
+            #[cfg(test)]
+            vss_transport_override: None,
         }
     }
 

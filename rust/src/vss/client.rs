@@ -143,6 +143,13 @@ impl VssWireClient {
         Ok(Some((plaintext, kv.version)))
     }
 
+    /// The obfuscated (HMAC-SHA256) wire form of `plaintext_key` — what the
+    /// server's `listKeyVersions` returns. U3's startup phases use it to
+    /// recognize known keys in a listing without ever sending plaintext.
+    pub fn obfuscated_key(&self, plaintext_key: &str) -> String {
+        crypto::obfuscate_key(&self.encryption_key, plaintext_key)
+    }
+
     /// Writes one object as a single-item transactional `PutObjectRequest`
     /// to `/putObjects` at `version` (0 for the first write) and returns the
     /// incremented client-side version, exactly like the PWA's `putObject`.
@@ -173,6 +180,32 @@ impl VssWireClient {
             return Err(parse_error(status, &payload));
         }
         Ok(version + 1)
+    }
+
+    /// Writes several objects in ONE transactional `PutObjectRequest` — the
+    /// U3 migration's "single putObjects transactional request" (KTD-3): all
+    /// items land atomically at their given versions or none do. Each value
+    /// is encrypted exactly once, like [`VssWireClient::put_object`].
+    pub async fn put_objects(&self, items: Vec<(String, Vec<u8>, i64)>) -> Result<(), VssError> {
+        let transaction_items = items
+            .into_iter()
+            .map(|(plaintext_key, value, version)| KeyValue {
+                key: crypto::obfuscate_key(&self.encryption_key, &plaintext_key),
+                version,
+                value: crypto::encrypt(&self.encryption_key, &value),
+            })
+            .collect();
+        let request = PutObjectRequest {
+            store_id: self.store_id.clone(),
+            global_version: None,
+            transaction_items,
+            delete_items: Vec::new(),
+        };
+        let (status, payload) = self.post("putObjects", request.encode_to_vec()).await?;
+        if !(200..300).contains(&status) {
+            return Err(parse_error(status, &payload));
+        }
+        Ok(())
     }
 
     /// Deletes `plaintext_key` at `version` (the VSS delete is idempotent for
@@ -523,6 +556,39 @@ mod tests {
         assert_eq!(
             crypto::decrypt(&VECTOR_ENC_KEY, &item.value).unwrap(),
             b"my-value".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_objects_sends_every_item_in_one_transactional_request() {
+        // U3 migration (KTD-3): the batch put is ONE transactional request.
+        let stub = spawn_stub(vec![(200, Vec::new())]);
+        let client = test_client(stub.url.clone());
+        client
+            .put_objects(vec![
+                ("channel_manager".to_string(), b"cm-bytes".to_vec(), 0),
+                (format!("{}:0", "aa".repeat(32)), b"mon-bytes".to_vec(), 0),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(stub.request_count(), 1, "one request, all items");
+        let head = stub.head(0);
+        assert!(head.starts_with("post /putobjects http/1.1"), "{head}");
+        let sent = PutObjectRequest::decode(&stub.body(0)[..]).unwrap();
+        assert_eq!(sent.transaction_items.len(), 2);
+        assert!(sent.delete_items.is_empty());
+        let cm = &sent.transaction_items[0];
+        assert_eq!(
+            cm.key,
+            crypto::obfuscate_key(&VECTOR_ENC_KEY, "channel_manager"),
+            "keys go over the wire obfuscated"
+        );
+        assert_eq!(cm.version, 0);
+        assert_eq!(
+            crypto::decrypt(&VECTOR_ENC_KEY, &cm.value).unwrap(),
+            b"cm-bytes".to_vec(),
+            "values go over the wire encrypted"
         );
     }
 

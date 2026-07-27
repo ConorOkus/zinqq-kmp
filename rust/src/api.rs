@@ -97,6 +97,10 @@ pub enum WalletError {
     NotRunning,
     /// The node failed to start (restore/persistence/config problem).
     Startup { detail: String },
+    /// Another client took over this seed's cloud store; the wallet is
+    /// fenced (U3/KTD-3). Queries stay readable so the fenced screen can
+    /// render; `start()` is refused until the user wipes and restores.
+    Fenced,
     /// A mnemonic that is not a valid BIP39 English 12-word mnemonic (U1).
     InvalidMnemonic,
     /// `event_handled()` with no event pending — an ack without a handle.
@@ -135,6 +139,10 @@ impl std::fmt::Display for WalletError {
             ),
             WalletError::NotRunning => write!(f, "the node is not running"),
             WalletError::Startup { detail } => write!(f, "failed to start the node: {detail}"),
+            WalletError::Fenced => write!(
+                f,
+                "this wallet is active on another device; restore from backup to take over here"
+            ),
             WalletError::InvalidMnemonic => write!(
                 f,
                 "the mnemonic is not a valid BIP39 English 12-word mnemonic"
@@ -170,6 +178,7 @@ impl From<BuildError> for WalletError {
             BuildError::AlreadyRunning => WalletError::AlreadyRunning,
             BuildError::InstanceAlreadyRunning => WalletError::InstanceAlreadyRunning,
             BuildError::NotRunning => WalletError::NotRunning,
+            BuildError::Fenced => WalletError::Fenced,
             other => WalletError::Startup {
                 detail: other.to_string(),
             },

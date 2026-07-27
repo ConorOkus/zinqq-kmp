@@ -87,14 +87,11 @@ impl std::error::Error for KeysError {}
 pub(crate) struct WalletKeys {
     /// 32-byte seed for LDK's `KeysManager` (privkey at `m/535'/0'`).
     pub(crate) ldk_seed: [u8; 32],
-    /// VSS client-side encryption key (`m/535'/1'`). Consumed by U2.
-    #[allow(dead_code)]
+    /// VSS client-side encryption key (`m/535'/1'`). Consumed by U2/U3.
     pub(crate) vss_encryption_key: [u8; 32],
-    /// VSS auth signing key (`m/535'/2'`). Consumed by U2.
-    #[allow(dead_code)]
+    /// VSS auth signing key (`m/535'/2'`). Consumed by U2/U3.
     pub(crate) vss_signing_key: [u8; 32],
-    /// Deterministic VSS store id: hex(SHA-256(ldk_seed)). Consumed by U2.
-    #[allow(dead_code)]
+    /// Deterministic VSS store id: hex(SHA-256(ldk_seed)). Consumed by U2/U3.
     pub(crate) vss_store_id: String,
     /// HMAC key for `generate_channel_keys_id` (R2): the master seed is never
     /// handed to the signer, only this purpose-limited key.

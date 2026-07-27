@@ -550,7 +550,9 @@ mod tests {
         let mut config = Config::new(dir.to_str().unwrap().to_string());
         config.esplora_url = "http://127.0.0.1:1".to_string();
         config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
-        let components = build(&config, rt).expect("offline build must succeed");
+        config.vss_disabled = true;
+        let components = build(&config, rt, Arc::new(crate::node::LoggingEventSink::new()))
+            .expect("offline build must succeed");
         Arc::new(LiquiditySource::from_components(
             &components,
             config.lsp.clone(),
@@ -600,8 +602,10 @@ mod tests {
         let mut config = Config::new(dir.path().to_str().unwrap().to_string());
         config.esplora_url = "http://127.0.0.1:1".to_string();
         config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        config.vss_disabled = true;
         config.trusted_lsps.push(extra_trusted);
-        let components = build(&config, &rt).expect("offline build must succeed");
+        let components = build(&config, &rt, Arc::new(crate::node::LoggingEventSink::new()))
+            .expect("offline build must succeed");
         let source = LiquiditySource::from_components(
             &components,
             config.lsp.clone(),

@@ -20,6 +20,7 @@ use lightning::log_error;
 use lightning::log_info;
 use lightning::types::payment::PaymentHash;
 use lightning::util::logger::Logger as _;
+use lightning::util::ser::Writeable as _;
 use lightning_background_processor::{process_events_async_with_kv_store_sync, GossipSync};
 use lightning_persister::fs_store::FilesystemStore;
 use tokio::runtime::Runtime;
@@ -82,12 +83,11 @@ pub(crate) enum CoreEvent {
         reason: String,
     },
     /// A cloud-backup (VSS) write is failing; local persistence continues
-    /// (U2 fires this; the variant lands with U5's FFI surface).
-    #[allow(dead_code)] // Placeholder until the VSS path fires it (U2/U5).
+    /// (U3 fires this from the dual-write store after 10 s of failure, and
+    /// from a failed migration batch).
     BackupDegraded { detail: String },
-    /// Another client took over this seed's VSS store — the node is fenced
-    /// (fired by later units; defined now so the FFI is stable).
-    #[allow(dead_code)] // Placeholder until the VSS fence fires it.
+    /// Another client took over this seed's VSS store — the node fenced
+    /// itself (U3: durable flag, zero further puts, halt; KTD-3).
     Fenced { detail: String },
     /// The sweep pipeline's state changed (fired by U11).
     #[allow(dead_code)] // Placeholder until U11 fires it.
@@ -114,8 +114,17 @@ pub struct OnchainBalances {
     pub untrusted_pending_sats: u64,
 }
 
-struct LoggingEventSink {
+pub(crate) struct LoggingEventSink {
     logger: Arc<Logger>,
+}
+
+impl LoggingEventSink {
+    /// A log-only sink (tests and the default `Node::new` path).
+    pub(crate) fn new() -> Self {
+        Self {
+            logger: Arc::new(Logger),
+        }
+    }
 }
 
 impl EventSink for LoggingEventSink {
@@ -163,10 +172,7 @@ impl Node {
     /// going to the log only. The FFI surface uses [`Node::with_event_sink`]
     /// to route them into the persisted public event queue instead.
     pub fn new(config: Config) -> Self {
-        let event_sink = Arc::new(LoggingEventSink {
-            logger: Arc::new(Logger),
-        });
-        Self::with_event_sink(config, event_sink)
+        Self::with_event_sink(config, Arc::new(LoggingEventSink::new()))
     }
 
     /// Creates a stopped node handle whose [`CoreEvent`]s go to `event_sink`
@@ -198,6 +204,17 @@ impl Node {
             return Err(BuildError::AlreadyRunning);
         }
 
+        // U3 (KTD-3): a fenced wallet never starts — another client owns the
+        // VSS store; readable queries (history, event queue) stay available
+        // while stopped, per KTD-5. Checked before any lock or state touch
+        // (build() re-checks defensively).
+        if PathBuf::from(&self.config.storage_dir)
+            .join(crate::vss::store::FENCED_FLAG_FILE_NAME)
+            .exists()
+        {
+            return Err(BuildError::Fenced);
+        }
+
         // Before building anything: refuse to start if another node already owns
         // this storage directory. Acquired first so a rejected start touches no
         // persisted state.
@@ -211,7 +228,7 @@ impl Node {
             .build()
             .map_err(|_| BuildError::RuntimeSetupFailed)?;
 
-        let components = build(&self.config, &runtime)?;
+        let components = build(&self.config, &runtime, Arc::clone(&self.event_sink))?;
 
         // U5 startup reconcile: a pending history row with no LDK
         // counterpart past the grace was a dispatch interrupted by process
@@ -273,6 +290,30 @@ impl Node {
 
         let (stop_sender, _) = watch::channel(());
         let (bp_stop_sender, _) = watch::channel(());
+
+        // U3 fence watcher: when the store fences itself (divergent-content
+        // 409 — another client owns this seed's VSS store), halt the node's
+        // tasks and the background processor. The durable flag already blocks
+        // the next start; the Fenced event drives the UI.
+        {
+            let mut fence_rx = components.vss_store.subscribe_fence();
+            let stop_tx = stop_sender.clone();
+            let bp_stop_tx = bp_stop_sender.clone();
+            let logger = Arc::clone(&components.logger);
+            runtime.spawn(async move {
+                loop {
+                    if *fence_rx.borrow() {
+                        break;
+                    }
+                    if fence_rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                log_error!(logger, "Fence tripped: halting node tasks");
+                let _ = stop_tx.send(());
+                let _ = bp_stop_tx.send(());
+            });
+        }
 
         self.spawn_broadcast_task(&runtime, &components, stop_sender.subscribe());
         // U12/KTD-9: rebroadcast any pending transactions persisted by a
@@ -493,8 +534,9 @@ impl Node {
 
         // The background processor already persisted on exit; this is the
         // belt-and-braces write for the paths where it never got to run.
+        // Through the dual store: bounded VSS attempt, local write always.
         let persist_res =
-            persist_channel_manager(&components.channel_manager, &components.kv_store);
+            persist_channel_manager(&components.channel_manager, &components.dual_kv_store);
         if let Err(e) = persist_res {
             log_error!(
                 components.logger,
@@ -627,6 +669,7 @@ impl Node {
         let sweeper = Arc::clone(&components.sweeper);
         let onchain_wallet = Arc::clone(&components.onchain_wallet);
         let gossip_source = Arc::clone(&components.gossip_source);
+        let dual_kv_store = Arc::clone(&components.dual_kv_store);
         let logger = Arc::clone(&components.logger);
         let event_sink = Arc::clone(&self.event_sink);
 
@@ -664,6 +707,13 @@ impl Node {
                                 CoreEvent::ChainSyncFailed
                             });
                         }
+                        // U3 (KTD-3 CM semantics): a channel-manager write
+                        // whose bounded VSS attempt failed left a dirty flag;
+                        // this tick retries it without ever blocking the
+                        // background processor.
+                        if dual_kv_store.cm_dirty() {
+                            dual_kv_store.retry_cm(channel_manager.encode()).await;
+                        }
                     }
                     _ = onchain_interval.tick() => {
                         if let Err(e) = chain_source.sync_onchain_wallet(&onchain_wallet).await {
@@ -690,10 +740,10 @@ impl Node {
         });
     }
 
-    /// The peers the reconnect loop keeps dialed (U12): today the configured
-    /// static peers; U3's known-peers store plugs in here so the reconnect
-    /// set grows without touching the loop. The configured LSP is part of the
-    /// reconnect set too, but is dialed via
+    /// The static half of the reconnect set (U12): the configured peers.
+    /// U3's known-peers store contributes the dynamic half inside the loop
+    /// (read per tick, so peers saved during the session get dialed). The
+    /// configured LSP is part of the reconnect set too, but is dialed via
     /// `LiquiditySource::ensure_lsp_connected` (see the loop body) so its
     /// dial lock is honored.
     fn reconnect_targets(&self) -> Vec<crate::config::PeerInfo> {
@@ -714,6 +764,7 @@ impl Node {
         // LSPS2 request on the dropped socket.
         let peers = self.reconnect_targets();
         let peer_manager = Arc::clone(&components.peer_manager);
+        let known_peers = Arc::clone(&components.known_peers);
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(PEER_RECONNECT_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -726,7 +777,15 @@ impl Node {
                             .iter()
                             .map(|details| details.counterparty_node_id)
                             .collect();
-                        for peer in &peers {
+                        // U3: configured peers plus the saved known peers,
+                        // read fresh each tick, deduplicated by node id.
+                        let mut targets = peers.clone();
+                        targets.extend(known_peers.reconnect_targets());
+                        let mut dialed: HashSet<PublicKey> = HashSet::new();
+                        for peer in &targets {
+                            if !dialed.insert(peer.node_id) {
+                                continue;
+                            }
                             if !connected.contains(&peer.node_id) {
                                 if let Some(connection) = lightning_net_tokio::connect_outbound(
                                     Arc::clone(&peer_manager),
@@ -1001,7 +1060,11 @@ fn spawn_background_processor(
     event_sink: Arc<dyn EventSink>,
     bp_stop_receiver: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
-    let kv_store = Arc::clone(&components.kv_store);
+    // U3: the background processor persists through the dual-write store —
+    // channel-manager writes get the bounded VSS-then-local treatment,
+    // graph/scorer/sweeper/liquidity stay local-only. Monitors do NOT come
+    // through here (they use the ChainMonitor's custom async `Persist`).
+    let kv_store = Arc::clone(&components.dual_kv_store);
     let chain_monitor = Arc::clone(&components.chain_monitor);
     let channel_manager = Arc::clone(&components.channel_manager);
     let liquidity_manager = Arc::clone(&components.liquidity_manager);
@@ -1104,6 +1167,9 @@ mod tests {
         let mut config = Config::new(dir.to_str().unwrap().to_string());
         config.esplora_url = "http://127.0.0.1:1".to_string();
         config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        // Offline suites run local-only; the VSS-enabled paths are covered by
+        // the U3 tests with an injected mock transport.
+        config.vss_disabled = true;
         config
     }
 
