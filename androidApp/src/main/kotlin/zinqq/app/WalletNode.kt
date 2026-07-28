@@ -3,7 +3,7 @@ package zinqq.app
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.Wallet
 import uniffi.wallet_core.WalletException
-import zinqq.spike.WalletCore
+import zinqq.main.WalletCore
 
 /**
  * The slice of the wallet the foreground node lifecycle drives (KTD-10):

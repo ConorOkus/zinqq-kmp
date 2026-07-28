@@ -3,7 +3,7 @@ package zinqq.app.screens.settings
 import uniffi.wallet_core.Balances
 import zinqq.app.nav.Route
 import zinqq.app.theme.AppearanceMode
-import zinqq.spike.msatToSatFloor
+import zinqq.main.msatToSatFloor
 
 /**
  * Pure derivations for the Settings, Advanced, and Balance screens (U17,

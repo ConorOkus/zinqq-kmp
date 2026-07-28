@@ -41,7 +41,7 @@ import zinqq.app.components.rememberCopiedFlash
 import zinqq.app.midTruncate
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.formatBtc
+import zinqq.main.formatBtc
 
 /**
  * The PWA's RecoverFunds (U14, R9; `RecoverFunds.tsx`): dark room with the

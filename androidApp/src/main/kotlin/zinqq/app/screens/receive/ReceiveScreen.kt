@@ -55,7 +55,7 @@ import zinqq.app.components.ResultTemplate
 import zinqq.app.components.rememberCopiedFlash
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.formatBtc
+import zinqq.main.formatBtc
 
 /**
  * The Receive screen (U16, F2, R6 UI, R12): the PWA's `Receive.tsx` overlay

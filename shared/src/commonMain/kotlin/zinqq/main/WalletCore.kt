@@ -1,4 +1,4 @@
-package zinqq.spike
+package zinqq.main
 
 // The uniffi.wallet_core package is generated at build time by the Gobley
 // uniffi plugin (library mode) from the wallet-core cdylib; UniFFI lower-camels

@@ -44,7 +44,7 @@ import zinqq.app.screens.settings.SettingsPort
 import zinqq.app.screens.settings.restoreErrorMessage
 import zinqq.app.theme.AppearanceMode
 import zinqq.app.theme.SettingsRepository
-import zinqq.spike.WalletCore
+import zinqq.main.WalletCore
 
 /**
  * Process-scoped owner of the wallet, its event loop, and the foreground-only

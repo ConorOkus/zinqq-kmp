@@ -53,7 +53,7 @@ import zinqq.app.nav.ScreenHeader
 import zinqq.app.needsDeposit
 import zinqq.app.theme.ZinqqTheme
 import zinqq.app.totalFeesSats
-import zinqq.spike.formatBtc
+import zinqq.main.formatBtc
 
 /**
  * The PWA's ChannelCloseDetail (U14, R9/R11; `ChannelCloseDetail.tsx`):

@@ -1,4 +1,4 @@
-package zinqq.spike
+package zinqq.main
 
 /**
  * Shared numpad digit-entry reducer (U13, R12): the PWA's

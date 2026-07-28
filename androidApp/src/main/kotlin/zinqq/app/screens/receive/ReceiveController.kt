@@ -15,9 +15,9 @@ import uniffi.wallet_core.JitInvoice
 import uniffi.wallet_core.JitQuote
 import uniffi.wallet_core.ReceiveBundle
 import zinqq.app.screens.send.walletErrorMessage
-import zinqq.spike.NumpadKey
-import zinqq.spike.msatToSatCeil
-import zinqq.spike.numpadDigitReducer
+import zinqq.main.NumpadKey
+import zinqq.main.msatToSatCeil
+import zinqq.main.numpadDigitReducer
 
 /**
  * The receive flow's window onto the wallet (U16, R14): every call is a thin

@@ -7,11 +7,11 @@ import uniffi.wallet_core.FeeEstimate
 import uniffi.wallet_core.LnurlPayView
 import uniffi.wallet_core.MaxSendEstimate
 import uniffi.wallet_core.WalletException
-import zinqq.spike.NumpadKey
-import zinqq.spike.formatBtc
-import zinqq.spike.msatToSatCeil
-import zinqq.spike.msatToSatFloor
-import zinqq.spike.numpadDigitReducer
+import zinqq.main.NumpadKey
+import zinqq.main.formatBtc
+import zinqq.main.msatToSatCeil
+import zinqq.main.msatToSatFloor
+import zinqq.main.numpadDigitReducer
 
 /**
  * The pure half of the send flow (U15, F1, R5/R7 UI, R14): the PWA's

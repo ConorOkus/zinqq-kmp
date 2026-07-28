@@ -42,8 +42,8 @@ import zinqq.app.R
 import zinqq.app.components.CenteredNote
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.formatBtc
-import zinqq.spike.msatToSatFloor
+import zinqq.main.formatBtc
+import zinqq.main.msatToSatFloor
 
 /** The PWA CloseChannel's step machine (`CloseChannel.tsx:27-30`). */
 private sealed interface CloseStep {
