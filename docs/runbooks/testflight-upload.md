@@ -10,23 +10,25 @@ Uploads go through **Xcode Organizer** (or the Transporter app). Never `altool` 
 - Xcode with the iOS SDK, `xcodegen` (`brew install xcodegen`), and a JDK 21 for Gradle.
 - The Rust device target: `rustup target add aarch64-apple-ios` (the Gobley plugin also auto-installs it on first build).
 
-**Java note (known hazard):** Gradle runs inside Xcode's build-phase shell, which does not inherit your interactive shell's Java setup. If the archive's "Build Shared KMP Framework" phase dies immediately with a Java-location error, point Gradle at a JDK explicitly — e.g. add to `~/.gradle/gradle.properties`:
+**Java note (known hazard):** Gradle runs inside Xcode's build-phase shell, which does not inherit your interactive shell's Java setup — and the Gradle *wrapper* must find a `java` executable before Gradle reads any properties, so `org.gradle.java.home` alone cannot rescue a machine where `java` is not discoverable. If the archive's "Build Shared KMP Framework" phase dies immediately with a Java-location error, make a JDK 21 discoverable system-wide. With Homebrew:
 
-```properties
-org.gradle.java.home=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+```bash
+brew install openjdk@21
+sudo ln -sfn /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk \
+  /Library/Java/JavaVirtualMachines/openjdk-21.jdk
 ```
 
-(Adjust the path to your JDK. A user-level file keeps machine paths out of the repo.)
+After that, `/usr/libexec/java_home -v 21` resolves and GUI-launched Xcode finds Java. Optionally add `org.gradle.java.home=<jdk-home>` to `~/.gradle/gradle.properties` — that setting only selects the JVM Gradle's daemon runs on; it is not a substitute for a discoverable `java`.
 
 ## First-time setup
 
 1. **Fill in the Team ID.** In `iosApp/project.yml`, replace the `DEVELOPMENT_TEAM: ZZZZZZZZZZ` placeholder with your Team ID (App Store Connect → Membership details). Then regenerate:
 
    ```bash
-   cd iosApp && xcodegen generate
+   (cd iosApp && xcodegen generate)
    ```
 
-2. **Pre-warm the Release device chain** (catches toolchain/config errors before the slow first archive — this is the first half of what an archive does):
+2. **Pre-warm the Release device chain** (catches toolchain/config errors before the slow first archive — this is the first half of what an archive does). From the repository root:
 
    ```bash
    ./gradlew :shared:linkReleaseFrameworkIosArm64
@@ -42,11 +44,11 @@ org.gradle.java.home=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/H
 
 6. **Export compliance.** The build declares `ITSAppUsesNonExemptEncryption: true` (standard-algorithm crypto not provided by the OS: ChaCha20-Poly1305 for VSS blobs, LDK protocol crypto). Answer App Store Connect's questionnaire consistently with that: uses encryption → standard algorithms. The **French App Store declaration** applies only if the app is made available in France — decide availability accordingly at this step.
 
-7. **Add internal testers.** App Store Connect → Users and Access: add each tester with the **least-privileged role that grants TestFlight access** (e.g. Customer Support — not Developer or App Manager). Only the account owner should hold upload capability. Then App → TestFlight → Internal Testing: create a group and add them. Builds are installable the moment processing finishes — no review.
+7. **Add internal testers.** App Store Connect → Users and Access: add each tester with **Marketing** — the least-privileged of the roles eligible to be internal testers (Account Holder, Admin, App Manager, Developer, Marketing); Marketing cannot upload or manage builds. Only the account owner should hold upload capability. Then App → TestFlight → Internal Testing: create a group (leave **Enable automatic distribution** on) and add them. Builds are installable the moment processing finishes — no review.
 
 ## Routine upload
 
-1. Bump the build number: in `iosApp/project.yml`, increment `CURRENT_PROJECT_VERSION` (bump `MARKETING_VERSION` only for a user-visible version change). Regenerate: `cd iosApp && xcodegen generate`.
+1. Bump the build number: in `iosApp/project.yml`, increment `CURRENT_PROJECT_VERSION` (bump `MARKETING_VERSION` only for a user-visible version change). Regenerate: `(cd iosApp && xcodegen generate)`.
 2. Run the pre-upload sanity check (below).
 3. Product → Archive in Xcode, then Organizer → Distribute App → Upload.
 4. Internal testers are notified automatically once processing completes.
