@@ -1,35 +1,51 @@
-//! Outbound BOLT11 payment flow (U5).
+//! Outbound Lightning payment flow (U5, extended by U6 for R5).
 //!
-//! `send` parses and validates the invoice (mainnet, unexpired, fixed-amount)
-//! and pays it through the `ChannelManager` with a stable [`PaymentId`]
-//! derived from the payment hash. LDK persists pending outbound payments
-//! inside the channel manager, so after a restart a re-send of the same
-//! invoice is rejected with `RetryableSendFailure::DuplicatePayment` instead
-//! of double-paying — the derivation IS the idempotency key.
+//! BOLT11: `send_bolt11` parses and validates the invoice (mainnet,
+//! unexpired) and pays it through the `ChannelManager` with a stable
+//! [`PaymentId`] derived from the payment hash. LDK persists pending
+//! outbound payments inside the channel manager, so after a restart a
+//! re-send of the same invoice is rejected with
+//! `RetryableSendFailure::DuplicatePayment` instead of double-paying — the
+//! derivation IS the idempotency key. U6 adds the amount override for
+//! amountless invoices (PWA `sendBolt11Payment`): an override is REQUIRED
+//! for an amountless invoice and REJECTED on an amounted one.
+//!
+//! BOLT12 (U6): `send_bolt12` validates the offer (mainnet, unexpired, the
+//! same amount-override matrix) and pays via `pay_for_offer` with a caller-
+//! supplied 32-byte random [`PaymentId`] and optional payer note (PWA
+//! `sendBolt12Payment`). Retries are `Retry::Attempts(3)` for both flows —
+//! the PWA's `Retry.constructor_attempts(3)`.
 //!
 //! Outcomes surface through the persisted event queue: LDK's `PaymentSent` /
 //! `PaymentFailed` events map to the public `PaymentSuccessful` /
-//! `PaymentFailed { reason }` (see `node::handle_ldk_event`). Failures of the
-//! initial attempt (e.g. route-not-found) are returned synchronously by LDK
-//! WITHOUT an event, so `Node::send_payment` pushes `PaymentFailed` itself
-//! for those.
+//! `PaymentFailed { reason }` (see `node::handle_ldk_event`), with reasons
+//! rendered by [`describe_failure_reason`] — the PWA's
+//! `describePaymentFailure` strings VERBATIM (`event-handler.ts:919-942`).
+//! Failures of the initial attempt (e.g. route-not-found) are returned
+//! synchronously by LDK WITHOUT an event, so `Node::send_payment` /
+//! `Node::pay_offer` push `PaymentFailed` themselves for those.
 
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use bitcoin::constants::ChainHash;
 use bitcoin::hashes::Hash as _;
 use bitcoin::Network;
 use lightning::events::PaymentFailureReason;
-use lightning::ln::channelmanager::{Bolt11PaymentError, PaymentId, Retry, RetryableSendFailure};
+use lightning::ln::channelmanager::{
+    Bolt11PaymentError, OptionalOfferPaymentParams, PaymentId, Retry, RetryableSendFailure,
+};
+use lightning::offers::offer::{Amount as OfferAmount, Offer};
+use lightning::offers::parse::Bolt12SemanticError;
 use lightning::routing::router::RouteParametersConfig;
 use lightning_invoice::Bolt11Invoice;
 
 use crate::types::ChannelManager;
 
-/// Retry budget for one send: LDK keeps retrying failed paths for this long
-/// (à la ldk-node's `LDK_PAYMENT_RETRY_TIMEOUT`).
-pub(crate) const SEND_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Retry strategy for one send: three attempts, the PWA's
+/// `Retry.constructor_attempts(3)` (`context.tsx:997,1063`; F1 "retry ×3").
+pub(crate) const SEND_RETRY: Retry = Retry::Attempts(3);
 
 /// Typed send failures. Every variant renders to a DISTINCT message (see
 /// `Display`); the attempt-phase ones also feed `PaymentFailed { reason }`.
@@ -43,9 +59,17 @@ pub enum SendError {
     InvoiceExpired,
     /// The invoice is for a different network than the node's (mainnet).
     WrongNetwork { expected: Network, found: Network },
-    /// The invoice carries no amount; the spike sends fixed-amount only
-    /// (there is no amount argument to supply one).
+    /// An amountless invoice/offer with no amount override supplied.
     AmountMissing,
+    /// An amount override supplied for an invoice/offer that already carries
+    /// an amount (U6: overrides are for amountless requests only).
+    AmountOverrideNotAllowed,
+    /// The offer string failed to parse or verify (U6).
+    InvalidOffer(String),
+    /// The offer is for a different network than the node's (U6).
+    OfferWrongNetwork,
+    /// The offer is already expired (U6).
+    OfferExpired,
     /// A payment for the same payment hash is already pending in the channel
     /// manager — paying again would risk paying twice.
     DuplicatePayment,
@@ -67,10 +91,21 @@ impl fmt::Display for SendError {
                 f,
                 "the invoice is for the {found} network, this wallet only pays {expected} invoices"
             ),
+            // The PWA's copy, verbatim (context.tsx:981).
             SendError::AmountMissing => write!(
                 f,
-                "the invoice has no amount; amountless invoices are not supported"
+                "Amount is required for invoices without an embedded amount"
             ),
+            SendError::AmountOverrideNotAllowed => write!(
+                f,
+                "an amount override is only allowed for requests without an embedded amount"
+            ),
+            SendError::InvalidOffer(message) => write!(f, "invalid bolt12 offer: {message}"),
+            SendError::OfferWrongNetwork => write!(
+                f,
+                "the offer is for a different network, this wallet only pays bitcoin offers"
+            ),
+            SendError::OfferExpired => write!(f, "the offer is expired"),
             SendError::DuplicatePayment => {
                 write!(f, "a payment for this invoice is already pending")
             }
@@ -101,12 +136,14 @@ pub(crate) fn payment_id_for(invoice: &Bolt11Invoice) -> PaymentId {
 
 /// The seam between the send flow and LDK's payment machinery, so tests can
 /// intercept the attempt (and fabricate LDK failures LDK won't produce
-/// offline, e.g. `DuplicatePayment`).
+/// offline, e.g. `DuplicatePayment`). `amount_msat` is the U6 amount
+/// override — `Some` exactly when the invoice is amountless.
 pub(crate) trait Bolt11Payer {
     fn pay(
         &self,
         invoice: &Bolt11Invoice,
         payment_id: PaymentId,
+        amount_msat: Option<u64>,
         retry: Retry,
     ) -> Result<(), Bolt11PaymentError>;
 }
@@ -116,28 +153,69 @@ impl Bolt11Payer for ChannelManager {
         &self,
         invoice: &Bolt11Invoice,
         payment_id: PaymentId,
+        amount_msat: Option<u64>,
         retry: Retry,
     ) -> Result<(), Bolt11PaymentError> {
-        // No amount override (fixed-amount invoices only) and default route
-        // params; routing runs over the RGS-fed graph + scorer (U2's router).
+        // Default route params; routing runs over the RGS-fed graph + scorer
+        // (U2's router). `amount_msats` is LDK's override slot, used only
+        // for amountless invoices (as in the PWA, context.tsx:989-999).
         self.pay_for_bolt11_invoice(
             invoice,
             payment_id,
-            None,
+            amount_msat,
             RouteParametersConfig::default(),
             retry,
         )
     }
 }
 
+/// The BOLT12 counterpart of [`Bolt11Payer`] (U6).
+pub(crate) trait Bolt12Payer {
+    fn pay_offer(
+        &self,
+        offer: &Offer,
+        amount_msat: Option<u64>,
+        payment_id: PaymentId,
+        payer_note: Option<String>,
+        retry: Retry,
+    ) -> Result<(), Bolt12SemanticError>;
+}
+
+impl Bolt12Payer for ChannelManager {
+    fn pay_offer(
+        &self,
+        offer: &Offer,
+        amount_msat: Option<u64>,
+        payment_id: PaymentId,
+        payer_note: Option<String>,
+        retry: Retry,
+    ) -> Result<(), Bolt12SemanticError> {
+        // PWA context.tsx:1050-1061: pay_for_offer with optional amount
+        // override, payer note, default route params, retry ×3.
+        self.pay_for_offer(
+            offer,
+            amount_msat,
+            payment_id,
+            OptionalOfferPaymentParams {
+                payer_note,
+                route_params_config: RouteParametersConfig::default(),
+                retry_strategy: retry,
+            },
+        )
+    }
+}
+
 /// Parses and validates a bolt11 string: well-formed, right network,
-/// unexpired at `now_since_epoch`, and carrying a fixed amount. Each
+/// unexpired at `now_since_epoch`, and a consistent amount picture (U6):
+/// an override is required for amountless invoices and rejected on amounted
+/// ones. Returns the invoice and the resolved amount to send. Each
 /// rejection is a distinct [`SendError`].
 pub(crate) fn parse_and_validate(
     bolt11: &str,
     network: Network,
     now_since_epoch: Duration,
-) -> Result<Bolt11Invoice, SendError> {
+    amount_override_msat: Option<u64>,
+) -> Result<(Bolt11Invoice, u64), SendError> {
     let invoice =
         Bolt11Invoice::from_str(bolt11).map_err(|e| SendError::InvalidInvoice(e.to_string()))?;
     let found = invoice.network();
@@ -150,27 +228,110 @@ pub(crate) fn parse_and_validate(
     if invoice.would_expire(now_since_epoch) {
         return Err(SendError::InvoiceExpired);
     }
-    if invoice.amount_milli_satoshis().is_none() {
-        return Err(SendError::AmountMissing);
-    }
-    Ok(invoice)
+    let amount_msat = resolve_amount(invoice.amount_milli_satoshis(), amount_override_msat)?;
+    Ok((invoice, amount_msat))
 }
 
-/// The full send flow: validate → derive the stable `PaymentId` → pay with a
-/// bounded retry. Returns the derived `PaymentId` on a successful handoff to
-/// LDK (the payment outcome itself arrives later as an LDK event).
+/// The U6 amount-override matrix, shared by BOLT11 and BOLT12: embedded
+/// amounts must not be overridden; amountless requests require one.
+pub(crate) fn resolve_amount(
+    embedded_msat: Option<u64>,
+    override_msat: Option<u64>,
+) -> Result<u64, SendError> {
+    match (embedded_msat, override_msat) {
+        (Some(_), Some(_)) => Err(SendError::AmountOverrideNotAllowed),
+        (Some(embedded), None) => Ok(embedded),
+        (None, Some(override_amount)) => Ok(override_amount),
+        (None, None) => Err(SendError::AmountMissing),
+    }
+}
+
+/// Parses and validates a bolt12 offer string (U6): well-formed, supports
+/// the node's chain (an offer with no chains field implicitly targets
+/// mainnet), unexpired. Returns the offer and its bitcoin-denominated
+/// embedded amount (fiat-denominated offers count as amountless, PWA
+/// parity).
+pub(crate) fn validate_offer(
+    offer_str: &str,
+    network: Network,
+    now_since_epoch: Duration,
+) -> Result<(Offer, Option<u64>), SendError> {
+    let offer =
+        Offer::from_str(offer_str).map_err(|e| SendError::InvalidOffer(format!("{e:?}")))?;
+    if !offer.supports_chain(ChainHash::using_genesis_block(network)) {
+        return Err(SendError::OfferWrongNetwork);
+    }
+    if offer.is_expired_no_std(now_since_epoch) {
+        return Err(SendError::OfferExpired);
+    }
+    let embedded_msat = match offer.amount() {
+        Some(OfferAmount::Bitcoin { amount_msats }) => Some(amount_msats),
+        _ => None,
+    };
+    Ok((offer, embedded_msat))
+}
+
+/// The full BOLT11 send flow: validate → derive the stable `PaymentId` →
+/// pay with retry ×3. Returns the derived `PaymentId` on a successful
+/// handoff to LDK (the payment outcome itself arrives later as an LDK
+/// event).
 pub(crate) fn send_bolt11(
     payer: &dyn Bolt11Payer,
     bolt11: &str,
     network: Network,
     now_since_epoch: Duration,
+    amount_override_msat: Option<u64>,
 ) -> Result<PaymentId, SendError> {
-    let invoice = parse_and_validate(bolt11, network, now_since_epoch)?;
+    let (invoice, _amount_msat) =
+        parse_and_validate(bolt11, network, now_since_epoch, amount_override_msat)?;
     let payment_id = payment_id_for(&invoice);
+    // LDK's override slot must be Some exactly for amountless invoices;
+    // parse_and_validate guarantees the override is None otherwise.
+    let ldk_amount = match invoice.amount_milli_satoshis() {
+        Some(_) => None,
+        None => amount_override_msat,
+    };
     payer
-        .pay(&invoice, payment_id, Retry::Timeout(SEND_RETRY_TIMEOUT))
+        .pay(&invoice, payment_id, ldk_amount, SEND_RETRY)
         .map_err(map_pay_error)?;
     Ok(payment_id)
+}
+
+/// The full BOLT12 send flow (U6): validate → amount matrix → pay_for_offer
+/// with the caller-supplied random `PaymentId`, payer note, and retry ×3.
+/// Returns the resolved amount (embedded or override) for the history row.
+pub(crate) fn send_bolt12(
+    payer: &dyn Bolt12Payer,
+    offer_str: &str,
+    network: Network,
+    now_since_epoch: Duration,
+    amount_override_msat: Option<u64>,
+    payer_note: Option<String>,
+    payment_id: PaymentId,
+) -> Result<u64, SendError> {
+    let (offer, embedded_msat) = validate_offer(offer_str, network, now_since_epoch)?;
+    let resolved_msat = resolve_amount(embedded_msat, amount_override_msat)?;
+    // The pay-time override slot is Some exactly for amountless offers
+    // (PWA context.tsx:754-757 passes the entered amount only then).
+    let ldk_amount = match embedded_msat {
+        Some(_) => None,
+        None => Some(resolved_msat),
+    };
+    payer
+        .pay_offer(&offer, ldk_amount, payment_id, payer_note, SEND_RETRY)
+        .map_err(map_offer_error)?;
+    Ok(resolved_msat)
+}
+
+/// Maps LDK's synchronous `pay_for_offer` failures onto typed [`SendError`]s.
+fn map_offer_error(error: Bolt12SemanticError) -> SendError {
+    match error {
+        Bolt12SemanticError::DuplicatePaymentId => SendError::DuplicatePayment,
+        Bolt12SemanticError::AlreadyExpired => SendError::OfferExpired,
+        Bolt12SemanticError::UnsupportedChain => SendError::OfferWrongNetwork,
+        Bolt12SemanticError::MissingAmount => SendError::AmountMissing,
+        other => SendError::SendFailed(format!("{other:?}")),
+    }
 }
 
 /// Maps LDK's pay-time failures onto the typed [`SendError`]s.
@@ -193,30 +354,32 @@ fn map_pay_error(error: Bolt11PaymentError) -> SendError {
 }
 
 /// Renders LDK's `PaymentFailureReason` for the public
-/// `PaymentFailed { reason }` event; distinct text per reason.
+/// `PaymentFailed { reason }` event AND the U5 settle path's stored
+/// `failure_reason` — the ONE failure-taxonomy mapping (U6, R5). Strings are
+/// the PWA's `describePaymentFailure` VERBATIM (`event-handler.ts:919-942`),
+/// including the "Payment failed" default for unknown/absent reasons.
 pub(crate) fn describe_failure_reason(reason: Option<PaymentFailureReason>) -> String {
-    match reason {
-        Some(PaymentFailureReason::RecipientRejected) => {
-            "the recipient rejected the payment".to_string()
+    let text = match reason {
+        Some(PaymentFailureReason::RecipientRejected) => "Payment was rejected by the recipient",
+        Some(PaymentFailureReason::UserAbandoned) => "Payment was cancelled",
+        Some(PaymentFailureReason::RetriesExhausted) => "No route found after multiple attempts",
+        Some(PaymentFailureReason::PaymentExpired) => "Payment expired",
+        Some(PaymentFailureReason::RouteNotFound) => "No route found to the recipient",
+        Some(PaymentFailureReason::UnexpectedError) => "An unexpected error occurred",
+        Some(PaymentFailureReason::UnknownRequiredFeatures) => {
+            "Recipient requires unsupported features"
         }
-        Some(PaymentFailureReason::UserAbandoned) => "the payment was abandoned".to_string(),
-        Some(PaymentFailureReason::RetriesExhausted) => {
-            "all retry attempts were exhausted".to_string()
+        Some(PaymentFailureReason::InvoiceRequestExpired) => {
+            "Invoice request timed out — recipient may be offline"
         }
-        Some(PaymentFailureReason::PaymentExpired) => {
-            "the payment expired while retrying".to_string()
+        Some(PaymentFailureReason::InvoiceRequestRejected) => {
+            "Invoice request was rejected by the recipient"
         }
-        Some(PaymentFailureReason::RouteNotFound) => {
-            "no route to the recipient was found while retrying".to_string()
-        }
-        Some(PaymentFailureReason::UnexpectedError) => {
-            "an unexpected routing error occurred".to_string()
-        }
-        // BOLT12/blinded-path reasons the spike's bolt11-only flow should
-        // never see; render their LDK name rather than losing information.
-        Some(other) => format!("payment failed: {other:?}"),
-        None => "unknown failure reason".to_string(),
-    }
+        // The PWA's default arm (event-handler.ts:939-940) — includes
+        // BlindedPathCreationFailed and any reason LDK adds later.
+        Some(_) | None => "Payment failed",
+    };
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -275,7 +438,7 @@ mod tests {
     /// Records every pay attempt and answers with a canned LDK result
     /// (consumed on first use — `Bolt11PaymentError` is not `Clone`).
     struct MockPayer {
-        calls: Mutex<Vec<(PaymentId, Retry)>>,
+        calls: Mutex<Vec<(PaymentId, Option<u64>, Retry)>>,
         response: Mutex<Option<Result<(), Bolt11PaymentError>>>,
     }
 
@@ -287,7 +450,7 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<(PaymentId, Retry)> {
+        fn calls(&self) -> Vec<(PaymentId, Option<u64>, Retry)> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -297,14 +460,65 @@ mod tests {
             &self,
             _invoice: &Bolt11Invoice,
             payment_id: PaymentId,
+            amount_msat: Option<u64>,
             retry: Retry,
         ) -> Result<(), Bolt11PaymentError> {
-            self.calls.lock().unwrap().push((payment_id, retry));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((payment_id, amount_msat, retry));
             self.response
                 .lock()
                 .unwrap()
                 .take()
                 .expect("MockPayer answered more than once")
+        }
+    }
+
+    /// One recorded offer-pay attempt: (offer, amount override, payment id,
+    /// payer note, retry).
+    type OfferCall = (String, Option<u64>, PaymentId, Option<String>, Retry);
+
+    /// The BOLT12 counterpart: records offer-pay attempts.
+    struct MockOfferPayer {
+        calls: Mutex<Vec<OfferCall>>,
+        response: Mutex<Option<Result<(), Bolt12SemanticError>>>,
+    }
+
+    impl MockOfferPayer {
+        fn answering(response: Result<(), Bolt12SemanticError>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(Some(response)),
+            }
+        }
+
+        fn calls(&self) -> Vec<OfferCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Bolt12Payer for MockOfferPayer {
+        fn pay_offer(
+            &self,
+            offer: &Offer,
+            amount_msat: Option<u64>,
+            payment_id: PaymentId,
+            payer_note: Option<String>,
+            retry: Retry,
+        ) -> Result<(), Bolt12SemanticError> {
+            self.calls.lock().unwrap().push((
+                offer.to_string(),
+                amount_msat,
+                payment_id,
+                payer_note,
+                retry,
+            ));
+            self.response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("MockOfferPayer answered more than once")
         }
     }
 
@@ -320,6 +534,7 @@ mod tests {
             &invoice.to_string(),
             Network::Bitcoin,
             just_after(NOW),
+            None,
         )
         .expect("valid invoice with an accepting payer must succeed");
 
@@ -331,9 +546,13 @@ mod tests {
         assert_eq!(calls.len(), 1, "exactly one pay attempt");
         assert_eq!(calls[0].0, payment_id, "the attempt used the derived id");
         assert_eq!(
-            calls[0].1,
-            Retry::Timeout(SEND_RETRY_TIMEOUT),
-            "bounded retry strategy"
+            calls[0].1, None,
+            "no LDK amount override for an amounted invoice"
+        );
+        assert_eq!(
+            calls[0].2,
+            Retry::Attempts(3),
+            "PWA-parity retry strategy (context.tsx:997)"
         );
     }
 
@@ -350,8 +569,14 @@ mod tests {
     #[test]
     fn malformed_invoice_is_rejected_before_any_pay_attempt() {
         let payer = MockPayer::answering(Ok(()));
-        let err =
-            send_bolt11(&payer, "not an invoice", Network::Bitcoin, just_after(NOW)).unwrap_err();
+        let err = send_bolt11(
+            &payer,
+            "not an invoice",
+            Network::Bitcoin,
+            just_after(NOW),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, SendError::InvalidInvoice(_)), "got {err:?}");
         assert!(payer.calls().is_empty(), "nothing may be paid");
     }
@@ -365,6 +590,7 @@ mod tests {
             &invoice.to_string(),
             Network::Bitcoin,
             Duration::from_secs(NOW + 61),
+            None,
         )
         .unwrap_err();
         assert_eq!(err, SendError::InvoiceExpired);
@@ -384,6 +610,7 @@ mod tests {
                 &invoice.to_string(),
                 Network::Bitcoin,
                 just_after(NOW),
+                None,
             )
             .unwrap_err();
             assert_eq!(
@@ -397,8 +624,10 @@ mod tests {
         assert!(payer.calls().is_empty(), "nothing may be paid");
     }
 
+    // ---------- U6 amount-override matrix ----------
+
     #[test]
-    fn amountless_invoice_is_rejected_before_any_pay_attempt() {
+    fn amountless_invoice_without_override_is_rejected_before_any_pay_attempt() {
         let invoice = test_invoice(Currency::Bitcoin, None, NOW, 3_600);
         let payer = MockPayer::answering(Ok(()));
         let err = send_bolt11(
@@ -406,10 +635,78 @@ mod tests {
             &invoice.to_string(),
             Network::Bitcoin,
             just_after(NOW),
+            None,
         )
         .unwrap_err();
         assert_eq!(err, SendError::AmountMissing);
+        // PWA copy, verbatim (context.tsx:981).
+        assert_eq!(
+            err.to_string(),
+            "Amount is required for invoices without an embedded amount"
+        );
         assert!(payer.calls().is_empty(), "nothing may be paid");
+    }
+
+    #[test]
+    fn amountless_invoice_with_override_pays_with_the_override() {
+        let invoice = test_invoice(Currency::Bitcoin, None, NOW, 3_600);
+        let payer = MockPayer::answering(Ok(()));
+        send_bolt11(
+            &payer,
+            &invoice.to_string(),
+            Network::Bitcoin,
+            just_after(NOW),
+            Some(12_345_000),
+        )
+        .expect("amountless invoice + override must pay");
+        let calls = payer.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1,
+            Some(12_345_000),
+            "the override rides LDK's amount slot"
+        );
+    }
+
+    #[test]
+    fn override_on_an_amounted_invoice_is_a_typed_rejection() {
+        let invoice = valid_mainnet_invoice();
+        let payer = MockPayer::answering(Ok(()));
+        let err = send_bolt11(
+            &payer,
+            &invoice.to_string(),
+            Network::Bitcoin,
+            just_after(NOW),
+            Some(1_000),
+        )
+        .unwrap_err();
+        assert_eq!(err, SendError::AmountOverrideNotAllowed);
+        assert!(payer.calls().is_empty(), "nothing may be paid");
+    }
+
+    #[test]
+    fn resolve_amount_matrix_is_exhaustive() {
+        assert_eq!(resolve_amount(Some(5), None), Ok(5));
+        assert_eq!(
+            resolve_amount(Some(5), Some(7)),
+            Err(SendError::AmountOverrideNotAllowed)
+        );
+        assert_eq!(resolve_amount(None, Some(7)), Ok(7));
+        assert_eq!(resolve_amount(None, None), Err(SendError::AmountMissing));
+    }
+
+    #[test]
+    fn parse_and_validate_returns_the_resolved_amount() {
+        let amounted = valid_mainnet_invoice().to_string();
+        let (_, amount) =
+            parse_and_validate(&amounted, Network::Bitcoin, just_after(NOW), None).unwrap();
+        assert_eq!(amount, 25_000_000);
+
+        let amountless = test_invoice(Currency::Bitcoin, None, NOW, 3_600).to_string();
+        let (_, amount) =
+            parse_and_validate(&amountless, Network::Bitcoin, just_after(NOW), Some(42_000))
+                .unwrap();
+        assert_eq!(amount, 42_000);
     }
 
     #[test]
@@ -423,6 +720,10 @@ mod tests {
                 found: Network::Testnet,
             },
             SendError::AmountMissing,
+            SendError::AmountOverrideNotAllowed,
+            SendError::InvalidOffer("bad bech32".to_string()),
+            SendError::OfferWrongNetwork,
+            SendError::OfferExpired,
             SendError::DuplicatePayment,
             SendError::RouteNotFound,
             SendError::SendFailed("onion packet too large".to_string()),
@@ -451,6 +752,7 @@ mod tests {
             &invoice.to_string(),
             Network::Bitcoin,
             just_after(NOW),
+            None,
         )
         .unwrap_err();
         assert_eq!(err, SendError::DuplicatePayment);
@@ -485,13 +787,264 @@ mod tests {
                 &invoice.to_string(),
                 Network::Bitcoin,
                 just_after(NOW),
+                None,
             )
             .unwrap_err();
             assert_eq!(err, expected);
         }
     }
 
-    // ---------- event reason rendering ----------
+    // ---------- U6: BOLT12 offer sends at the payer seam ----------
+
+    fn offer_signing_pubkey() -> bitcoin::secp256k1::PublicKey {
+        let secp = Secp256k1::new();
+        bitcoin::secp256k1::PublicKey::from_secret_key(
+            &secp,
+            &SecretKey::from_slice(&[0x3c; 32]).unwrap(),
+        )
+    }
+
+    fn amounted_offer(amount_msat: u64) -> String {
+        lightning::offers::offer::OfferBuilder::new(offer_signing_pubkey())
+            .description("bolt12 test".to_string())
+            .amount_msats(amount_msat)
+            .build()
+            .unwrap()
+            .to_string()
+    }
+
+    fn amountless_offer() -> String {
+        lightning::offers::offer::OfferBuilder::new(offer_signing_pubkey())
+            .description("bolt12 test".to_string())
+            .build()
+            .unwrap()
+            .to_string()
+    }
+
+    const RANDOM_ID: PaymentId = PaymentId([0x77; 32]);
+
+    #[test]
+    fn amounted_offer_pays_with_no_ldk_override_and_the_payer_note() {
+        let offer = amounted_offer(9_000);
+        let payer = MockOfferPayer::answering(Ok(()));
+        let recorded = send_bolt12(
+            &payer,
+            &offer,
+            Network::Bitcoin,
+            just_after(NOW),
+            None,
+            Some("thanks!".to_string()),
+            RANDOM_ID,
+        )
+        .expect("amounted offer must pay");
+        assert_eq!(recorded, 9_000, "the row records the embedded amount");
+        let calls = payer.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, None, "no override for an embedded amount");
+        assert_eq!(calls[0].2, RANDOM_ID, "the caller-supplied random id");
+        assert_eq!(calls[0].3.as_deref(), Some("thanks!"));
+        assert_eq!(calls[0].4, Retry::Attempts(3), "PWA retry ×3 parity");
+    }
+
+    #[test]
+    fn amountless_offer_requires_and_uses_the_override() {
+        let offer = amountless_offer();
+        let payer = MockOfferPayer::answering(Ok(()));
+        let err = send_bolt12(
+            &payer,
+            &offer,
+            Network::Bitcoin,
+            just_after(NOW),
+            None,
+            None,
+            RANDOM_ID,
+        )
+        .unwrap_err();
+        assert_eq!(err, SendError::AmountMissing);
+        assert!(payer.calls().is_empty(), "nothing may be paid");
+
+        let payer = MockOfferPayer::answering(Ok(()));
+        let recorded = send_bolt12(
+            &payer,
+            &offer,
+            Network::Bitcoin,
+            just_after(NOW),
+            Some(5_500),
+            None,
+            RANDOM_ID,
+        )
+        .unwrap();
+        assert_eq!(recorded, 5_500);
+        assert_eq!(payer.calls()[0].1, Some(5_500), "override in the LDK slot");
+    }
+
+    #[test]
+    fn override_on_an_amounted_offer_is_a_typed_rejection() {
+        let offer = amounted_offer(9_000);
+        let payer = MockOfferPayer::answering(Ok(()));
+        let err = send_bolt12(
+            &payer,
+            &offer,
+            Network::Bitcoin,
+            just_after(NOW),
+            Some(10_000),
+            None,
+            RANDOM_ID,
+        )
+        .unwrap_err();
+        assert_eq!(err, SendError::AmountOverrideNotAllowed);
+        assert!(payer.calls().is_empty(), "nothing may be paid");
+    }
+
+    #[test]
+    fn offer_validation_rejects_garbage_wrong_network_and_expired() {
+        let payer = MockOfferPayer::answering(Ok(()));
+        let err = send_bolt12(
+            &payer,
+            "lno1garbage",
+            Network::Bitcoin,
+            just_after(NOW),
+            Some(1),
+            None,
+            RANDOM_ID,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SendError::InvalidOffer(_)), "{err:?}");
+
+        let testnet = lightning::offers::offer::OfferBuilder::new(offer_signing_pubkey())
+            .description("t".to_string())
+            .chain(Network::Testnet)
+            .build()
+            .unwrap()
+            .to_string();
+        let err = send_bolt12(
+            &payer,
+            &testnet,
+            Network::Bitcoin,
+            just_after(NOW),
+            Some(1),
+            None,
+            RANDOM_ID,
+        )
+        .unwrap_err();
+        assert_eq!(err, SendError::OfferWrongNetwork);
+
+        let expired = lightning::offers::offer::OfferBuilder::new(offer_signing_pubkey())
+            .description("t".to_string())
+            .absolute_expiry(Duration::from_secs(NOW - 1))
+            .build()
+            .unwrap()
+            .to_string();
+        let err = send_bolt12(
+            &payer,
+            &expired,
+            Network::Bitcoin,
+            just_after(NOW),
+            Some(1),
+            None,
+            RANDOM_ID,
+        )
+        .unwrap_err();
+        assert_eq!(err, SendError::OfferExpired);
+        assert!(payer.calls().is_empty(), "nothing may be paid");
+    }
+
+    #[test]
+    fn offer_pay_failures_map_to_typed_errors() {
+        let cases = [
+            (
+                Bolt12SemanticError::DuplicatePaymentId,
+                SendError::DuplicatePayment,
+            ),
+            (
+                Bolt12SemanticError::UnsupportedChain,
+                SendError::OfferWrongNetwork,
+            ),
+            (Bolt12SemanticError::AlreadyExpired, SendError::OfferExpired),
+            (Bolt12SemanticError::MissingAmount, SendError::AmountMissing),
+            (
+                Bolt12SemanticError::MissingPaths,
+                SendError::SendFailed("MissingPaths".to_string()),
+            ),
+        ];
+        for (ldk_error, expected) in cases {
+            let offer = amounted_offer(9_000);
+            let payer = MockOfferPayer::answering(Err(ldk_error));
+            let err = send_bolt12(
+                &payer,
+                &offer,
+                Network::Bitcoin,
+                just_after(NOW),
+                None,
+                None,
+                RANDOM_ID,
+            )
+            .unwrap_err();
+            assert_eq!(err, expected);
+        }
+        assert!(
+            !SendError::DuplicatePayment.is_attempt_failure(),
+            "a BOLT12 duplicate must not push PaymentFailed either"
+        );
+    }
+
+    // ---------- event reason rendering: the U6 failure taxonomy ----------
+
+    #[test]
+    fn failure_reasons_map_to_the_pwa_describe_payment_failure_strings_verbatim() {
+        // event-handler.ts:919-942, case for case.
+        let table: [(Option<PaymentFailureReason>, &str); 11] = [
+            (
+                Some(PaymentFailureReason::RecipientRejected),
+                "Payment was rejected by the recipient",
+            ),
+            (
+                Some(PaymentFailureReason::UserAbandoned),
+                "Payment was cancelled",
+            ),
+            (
+                Some(PaymentFailureReason::RetriesExhausted),
+                "No route found after multiple attempts",
+            ),
+            (
+                Some(PaymentFailureReason::PaymentExpired),
+                "Payment expired",
+            ),
+            (
+                Some(PaymentFailureReason::RouteNotFound),
+                "No route found to the recipient",
+            ),
+            (
+                Some(PaymentFailureReason::UnexpectedError),
+                "An unexpected error occurred",
+            ),
+            (
+                Some(PaymentFailureReason::UnknownRequiredFeatures),
+                "Recipient requires unsupported features",
+            ),
+            (
+                Some(PaymentFailureReason::InvoiceRequestExpired),
+                "Invoice request timed out — recipient may be offline",
+            ),
+            (
+                Some(PaymentFailureReason::InvoiceRequestRejected),
+                "Invoice request was rejected by the recipient",
+            ),
+            // The default arm covers reasons the switch does not name.
+            (
+                Some(PaymentFailureReason::BlindedPathCreationFailed),
+                "Payment failed",
+            ),
+            (None, "Payment failed"),
+        ];
+        for (reason, expected) in table {
+            assert_eq!(
+                describe_failure_reason(reason),
+                expected,
+                "PWA describePaymentFailure parity for {reason:?}"
+            );
+        }
+    }
 
     #[test]
     fn failure_reasons_render_distinct_human_text() {
@@ -503,6 +1056,9 @@ mod tests {
             Some(PaymentFailureReason::PaymentExpired),
             Some(PaymentFailureReason::RouteNotFound),
             Some(PaymentFailureReason::UnexpectedError),
+            Some(PaymentFailureReason::UnknownRequiredFeatures),
+            Some(PaymentFailureReason::InvoiceRequestExpired),
+            Some(PaymentFailureReason::InvoiceRequestRejected),
         ];
         let rendered: Vec<String> = reasons.into_iter().map(describe_failure_reason).collect();
         for (i, a) in rendered.iter().enumerate() {
@@ -528,6 +1084,9 @@ mod tests {
         let mut config = Config::new(dir.to_str().unwrap().to_string());
         config.esplora_url = "http://127.0.0.1:1".to_string();
         config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        // A closed local port so the U6 BOLT12 LSP pre-connect fails fast
+        // and deterministically offline.
+        config.lsp.address = "127.0.0.1:1".parse().unwrap();
         config
     }
 
@@ -536,9 +1095,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::new(offline_config(dir.path()));
         assert_eq!(
-            node.send_payment("garbage, never parsed"),
+            node.send_payment("garbage, never parsed", None),
             Err(SendError::NotRunning)
         );
+        assert_eq!(
+            node.pay_offer("garbage, never parsed", None, None),
+            Err(SendError::NotRunning)
+        );
+    }
+
+    /// U6 node-level BOLT12: validation failures return typed errors with no
+    /// event; an unreachable LSP fails the pre-connect (PWA parity — the
+    /// thrown connectAndTrack) as an ATTEMPT failure that settles the row
+    /// and pushes PaymentFailed with a None payment hash (no invoice yet).
+    #[test]
+    fn offline_pay_offer_fails_at_the_lsp_preconnect_and_pushes_payment_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(CapturingSink::default());
+        let node = Node::with_event_sink(offline_config(dir.path()), Arc::clone(&sink) as _);
+        node.start().expect("offline degraded start");
+
+        // Validation failures first: typed errors, no events, nothing paid.
+        assert!(matches!(
+            node.pay_offer("lno1garbage", Some(1_000), None),
+            Err(SendError::InvalidOffer(_))
+        ));
+        let amounted = amounted_offer(9_000);
+        assert_eq!(
+            node.pay_offer(&amounted, Some(2_000), None),
+            Err(SendError::AmountOverrideNotAllowed)
+        );
+        let amountless = amountless_offer();
+        assert_eq!(
+            node.pay_offer(&amountless, None, None),
+            Err(SendError::AmountMissing)
+        );
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "validation failures must not push events"
+        );
+
+        // A valid offer reaches the LSP pre-connect, which is unreachable
+        // offline: the attempt fails, and exactly one PaymentFailed with no
+        // payment hash (BOLT12 pre-invoice) is pushed.
+        let err = node
+            .pay_offer(&amounted, None, Some("note".to_string()))
+            .unwrap_err();
+        assert!(
+            matches!(&err, SendError::SendFailed(reason) if reason.contains("LSP")),
+            "got {err:?}"
+        );
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![CoreEvent::PaymentFailed {
+                payment_hash: None,
+                reason: err.to_string(),
+            }]
+        );
+
+        node.stop().unwrap();
     }
 
     #[test]
@@ -554,14 +1170,18 @@ mod tests {
         // No channels, empty graph: the initial route attempt fails and LDK
         // abandons synchronously without queueing any event — the node must
         // push PaymentFailed itself instead of panicking or staying silent.
-        assert_eq!(node.send_payment(&bolt11), Err(SendError::RouteNotFound));
+        assert_eq!(
+            node.send_payment(&bolt11, None),
+            Err(SendError::RouteNotFound)
+        );
         let events = sink.0.lock().unwrap().clone();
         assert_eq!(
             events,
             vec![CoreEvent::PaymentFailed {
+                payment_hash: Some("11".repeat(32)),
                 reason: SendError::RouteNotFound.to_string(),
             }],
-            "exactly one PaymentFailed with the route-not-found reason"
+            "exactly one PaymentFailed with the invoice's hash and the route-not-found reason"
         );
 
         // Idempotency edge, honest offline shape: the first attempt failed
@@ -569,11 +1189,14 @@ mod tests {
         // registration), so the second send reports RouteNotFound again — not
         // DuplicatePayment, and crucially not a double-pay. The
         // DuplicatePayment surface is proven at the payer seam above.
-        assert_eq!(node.send_payment(&bolt11), Err(SendError::RouteNotFound));
+        assert_eq!(
+            node.send_payment(&bolt11, None),
+            Err(SendError::RouteNotFound)
+        );
 
         // Validation failures return typed errors WITHOUT pushing events.
         assert!(matches!(
-            node.send_payment("not an invoice"),
+            node.send_payment("not an invoice", None),
             Err(SendError::InvalidInvoice(_))
         ));
         let testnet = test_invoice(
@@ -583,7 +1206,7 @@ mod tests {
             3_600,
         );
         assert_eq!(
-            node.send_payment(&testnet.to_string()),
+            node.send_payment(&testnet.to_string(), None),
             Err(SendError::WrongNetwork {
                 expected: Network::Bitcoin,
                 found: Network::Testnet,

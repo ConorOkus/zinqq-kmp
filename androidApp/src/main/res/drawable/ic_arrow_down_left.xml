@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Transcribed from the PWA icons.tsx ArrowDownLeft (U14, R12); tinted at the call site. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M17,7 L7,17"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="2.5"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+    <path android:pathData="M17,17 L7,17 L7,7"
+        android:strokeColor="#FFFFFFFF" android:strokeWidth="2.5"
+        android:strokeLineCap="round" android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+</vector>

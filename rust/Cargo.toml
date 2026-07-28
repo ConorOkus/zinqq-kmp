@@ -11,6 +11,10 @@ name = "wallet_core"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+# U1 (KTD-4): BIP39 English mnemonic — the root of the whole key hierarchy.
+bip39 = "2.2"
+# U1: best-effort scrubbing of seed/key material after use.
+zeroize = "1"
 fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 # Exact pin: Gobley 0.3.7 pairs with uniffi 0.29.4 (KTD-2); a semver-open
 # requirement drifts to 0.29.5+.
@@ -35,6 +39,23 @@ esplora-client = { version = "0.12", default-features = false, features = ["toki
 # RGS snapshot download (KTD-6); reqwest is already in the graph via the
 # esplora async client, so this adds no new TLS stack.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# U2 (KTD-1): consumed for its prost message types for the standard LDK VSS
+# protocol ONLY. Its transport/StorableBuilder/KeyObfuscator are deliberately
+# unused: the Storable envelope is incompatible with PWA blobs (KTD-2) and its
+# client discards the HTTP status that the PWA's 404-to-None mapping needs, so
+# the transport is hand-rolled on the in-tree reqwest instead.
+# default-features = false drops the unused lnurl-auth stack.
+vss-client-ng = { version = "=0.4.1", default-features = false }
+# U2 (KTD-2): the PWA's exact VSS blob crypto — ChaCha20-Poly1305
+# `[nonce(12)][ciphertext+tag]` without AAD, HMAC-SHA256 key obfuscation.
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+# U6 (KTD-1, KTD-6): BIP353 resolution (DNSSEC-verifying DoH via dns.google)
+# and BOLT12/HRN parsing help for the unified send engine. Classification
+# dispatch order and LNURL semantics stay PWA-defined in `send.rs`; the
+# hand-rolled pieces are documented there.
+bitcoin-payment-instructions = { version = "0.7", features = ["std", "http"] }
 # bdk_wallet's ChangeSet is serde-serializable; we persist it as one JSON blob.
 serde_json = "1"
 # The public Event queue is serde-derived and persisted as JSON (KTD-8).
@@ -42,6 +63,9 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+# U8 tests fund bdk wallets offline via bdk's own insert_tx/insert_checkpoint
+# harness (feature-gated); test builds only.
+bdk_wallet = { version = "2.4.0", features = ["test-utils"] }
 
 [profile.release]
 opt-level = "z"

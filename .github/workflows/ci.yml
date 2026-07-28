@@ -93,6 +93,10 @@ jobs:
       - name: Bindings smoke test
         run: ./gradlew :shared:jvmTest --stacktrace
 
+      # Reducer/presentation/logic tests for the 16-screen shell (U13-U17).
+      - name: Android unit tests
+        run: ./gradlew :androidApp:testDebugUnitTest --stacktrace
+
       - name: Assemble debug APK
         run: ./gradlew :androidApp:assembleDebug --stacktrace
 
@@ -164,24 +168,27 @@ jobs:
         working-directory: iosApp
         run: xcodegen generate
 
-      # Compiles the SwiftUI shell against the generated framework, which is
-      # what caught Option<u64> exporting as a nullable KotlinULong?.
+      # Builds the SwiftUI shell against the generated framework AND runs the
+      # XCTest suite (U18-U22 logic/presentation tests), which is what caught
+      # Option<u64> exporting as a nullable KotlinULong?.
       # ARCHS=arm64 is load-bearing: the KMP module declares iosArm64 and
       # iosSimulatorArm64 only, so the framework has no x86_64 slice. Without
       # this, a generic simulator destination also builds x86_64 and the link
       # fails with "symbol(s) not found for architecture x86_64".
-      - name: Build app for simulator
+      - name: Build and test on simulator
         working-directory: iosApp
         run: |
           set -euo pipefail
+          device=$(xcrun simctl list devices available \
+            | grep -oE 'iPhone [0-9]+' | head -1)
+          echo "Using simulator: $device"
           xcodebuild \
             -project iosApp.xcodeproj \
             -scheme iosApp \
             -configuration Debug \
-            -sdk iphonesimulator \
-            -destination 'generic/platform=iOS Simulator' \
+            -destination "platform=iOS Simulator,name=$device" \
             -derivedDataPath build/dd \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            test

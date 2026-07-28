@@ -16,7 +16,17 @@ fn test_wallet(storage_dir: &Path) -> Wallet {
         storage_dir: storage_dir.to_str().unwrap().to_string(),
         esplora_url: Some(UNREACHABLE_ESPLORA.to_string()),
         rgs_url: Some(UNREACHABLE_RGS.to_string()),
+        vss_url: None,
+        // Offline suite: local-only persistence (the U3 VSS paths are
+        // covered by in-crate tests with an injected mock transport).
+        vss_disabled: true,
+        explorer_url: None,
+        lsp_node_id: None,
+        lsp_host: None,
+        lsp_port: None,
+        trusted_lsp_node_ids: Vec::new(),
     })
+    .expect("default overrides are valid")
 }
 
 /// A runtime standing in for the foreign executor that drives UniFFI async
@@ -226,36 +236,80 @@ fn send_failures_surface_as_typed_errors_and_payment_failed_events() {
 
     // Attempt failure: a valid mainnet invoice on a channel-less node has no
     // route. The typed error and the queued PaymentFailed carry the SAME
-    // distinct reason (KTD-8: the queue is the durable source of truth).
+    // distinct reason (KTD-8: the queue is the durable source of truth), and
+    // the U5 event carries the invoice's payment hash.
     let reason = match wallet.send(signed_mainnet_invoice()) {
         Err(WalletError::SendFailed { reason }) => reason,
         other => panic!("expected SendFailed, got {other:?}"),
     };
+    let payment_hash = "55".repeat(32); // the fixture invoice's payment hash
     assert_eq!(
         next_with_timeout(&rt, &wallet, 5),
-        Event::PaymentFailed { reason }
+        Event::PaymentFailed {
+            payment_hash: Some(payment_hash.clone()),
+            reason: reason.clone(),
+        }
     );
     wallet.event_handled().unwrap();
+
+    // U5: the dispatch wrote a history row and the failure settled it — the
+    // detail query exposes it (with the SAME reason) while the activity feed
+    // hides failed Lightning rows (KTD-7).
+    let detail = wallet
+        .payment_detail(payment_hash.clone())
+        .expect("the dispatched payment must have a history row");
+    assert_eq!(detail.status, wallet_core::PaymentStatus::Failed);
+    assert_eq!(detail.failure_reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(detail.direction, wallet_core::PaymentDirection::Outbound);
+    assert_eq!(detail.amount_msat, 50_000_000);
+    assert!(
+        wallet
+            .list_activity()
+            .unwrap()
+            .iter()
+            .all(|row| row.id != payment_hash),
+        "failed Lightning rows must be hidden from the activity feed"
+    );
 
     // The malformed send queued nothing: the queue is fully drained.
     assert_eq!(wallet.event_handled(), Err(WalletError::NoPendingEvent));
     wallet.stop().unwrap();
+
+    // History stays readable while stopped; the feed needs the node.
+    assert!(wallet.payment_detail(payment_hash).is_some());
+    assert!(matches!(
+        wallet.list_activity(),
+        Err(WalletError::NotRunning)
+    ));
 }
 
 #[test]
-fn balances_require_a_running_node_and_read_zero_on_fresh_start() {
+fn queries_require_a_running_node_and_read_empty_on_fresh_start() {
     let dir = tempfile::tempdir().unwrap();
     let wallet = test_wallet(dir.path());
 
     assert_eq!(wallet.balances(), Err(WalletError::NotRunning));
+    assert_eq!(wallet.node_id(), Err(WalletError::NotRunning));
 
     wallet.start().unwrap();
     let balances = wallet.balances().unwrap();
     assert_eq!(balances.lightning_msat, 0);
-    assert_eq!(balances.onchain_sats, 0);
+    assert_eq!(balances.onchain_total_sats, 0);
+    assert_eq!(balances.onchain_spendable_sats, 0);
+    assert_eq!(balances.onchain_untrusted_pending_sats, 0);
+
+    let node_id = wallet.node_id().unwrap();
+    assert_eq!(node_id.len(), 66, "compressed pubkey hex: {node_id}");
+
+    assert!(
+        wallet.list_activity().unwrap().is_empty(),
+        "a fresh wallet has no activity"
+    );
+    assert_eq!(wallet.payment_detail("00".repeat(32)), None);
     wallet.stop().unwrap();
 
     assert_eq!(wallet.balances(), Err(WalletError::NotRunning));
+    assert_eq!(wallet.node_id(), Err(WalletError::NotRunning));
 }
 
 /// The Android back-press scenario: an activity is destroyed without stopping

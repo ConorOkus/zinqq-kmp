@@ -21,6 +21,7 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use crate::chain::{Broadcaster, ChainSource};
 use crate::fees::CachedFeeEstimator;
+use crate::signer::WalletSignerProvider;
 use crate::wallet::OnchainWallet;
 
 pub(crate) type Graph = NetworkGraph<Arc<Logger>>;
@@ -38,25 +39,30 @@ pub(crate) type Router = DefaultRouter<
 
 pub(crate) type MessageRouter = DefaultMessageRouter<Arc<Graph>, Arc<Logger>, Arc<KeysManager>>;
 
-/// The `Persist` implementation is the blanket `impl Persist for K: KVStoreSync`
-/// on [`FilesystemStore`]: full-monitor writes under LDK's persist key
-/// constants, durable before `Completed` (KTD-4).
+/// The `Persist` slot carries U3's [`VssBackedStore`] (KTD-3): full-monitor
+/// VSS-first dual writes returning `InProgress` with per-channel serialized
+/// completion, degrading to synchronous local durable-before-`Completed`
+/// writes when VSS is disabled.
 pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
     InMemorySigner,
     Arc<ChainSource>,
     Arc<Broadcaster>,
     Arc<CachedFeeEstimator>,
     Arc<Logger>,
-    Arc<FilesystemStore>,
+    Arc<crate::vss::store::VssBackedStore>,
     Arc<KeysManager>,
 >;
 
+/// The signer-provider slot (5th param) carries U1's custom
+/// [`WalletSignerProvider`] (KTD-4): PWA-parity `channel_keys_id` HMAC
+/// derivation and bdk-backed destination/shutdown scripts; entropy and node
+/// signing stay on the bare `KeysManager`.
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
     Arc<ChainMonitor>,
     Arc<Broadcaster>,
     Arc<KeysManager>,
     Arc<KeysManager>,
-    Arc<KeysManager>,
+    Arc<WalletSignerProvider>,
     Arc<CachedFeeEstimator>,
     Arc<Router>,
     Arc<MessageRouter>,
@@ -106,12 +112,19 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 pub(crate) type RapidGossipSync =
     lightning_rapid_gossip_sync::RapidGossipSync<Arc<Graph>, Arc<Logger>>;
 
+/// TYPE-ONLY (U11/KTD-8): no `OutputSweeperSync` instance exists anymore —
+/// the sweep pipeline is the core-owned descriptor store in
+/// [`crate::sweep`] (`OutputSweeper` was rejected: no untrack/release, its
+/// regenerate-and-rebroadcast cycle would race the subsidized path over the
+/// same outpoints, and it emits no per-tx attribution). This alias remains
+/// solely to type the background processor's `None` sweeper slot, whose
+/// generic bound demands a concrete `OutputSweeperSync` type.
 pub(crate) type Sweeper = OutputSweeperSync<
     Arc<Broadcaster>,
     Arc<OnchainWallet>,
     Arc<CachedFeeEstimator>,
     Arc<ChainSource>,
-    Arc<FilesystemStore>,
+    Arc<crate::vss::DualWriteKvStore>,
     Arc<Logger>,
     Arc<KeysManager>,
 >;

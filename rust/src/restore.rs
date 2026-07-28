@@ -1,0 +1,2891 @@
+//! Restore-from-seed & silent-recovery engine (U4; F3; R1 restore half, R4;
+//! KTD-3).
+//!
+//! One engine, two callers:
+//!
+//! - **Explicit restore** ([`run_restore`], surfaced as `Wallet::restore`):
+//!   derive keys from the ENTERED mnemonic → probe `listKeyVersions` (empty →
+//!   typed [`RestoreError::NoBackupFound`], local state untouched) → manifest
+//!   reconciliation: a remote key the manifest and the fixed key set do not
+//!   explain is FETCHED by its stored key and identified — one of this
+//!   wallet's monitors is adopted into the restore set (the PWA orphans such
+//!   keys by design), anything unidentifiable is a typed
+//!   [`RestoreError::BackupInconsistent`] before any write → download CM and
+//!   manifest→monitors (chunks of
+//!   [`RESTORE_CHUNK_SIZE`] in parallel, [`RESTORE_DOWNLOAD_BUDGET`] overall)
+//!   and known peers → validate EVERY blob by deserialization (monitors with
+//!   the restored wallet's `SignerProvider`) BEFORE any local write →
+//!   two-phase write: durable `restore_in_progress` marker → clear local
+//!   state → ordered writes (mnemonic, CM before monitors, monitors, peers)
+//!   → remove marker. Progress steps surface as `RestoreProgress` events
+//!   matching the PWA's copy exactly (`zinq/src/pages/Restore.tsx`).
+//! - **Silent recovery** (U3's `vss::startup` branch for an empty/voided
+//!   local store) delegates the download/validate/write mechanics to the same
+//!   [`fetch_manifest`] / [`adopt_unexplained_monitors`] /
+//!   [`download_and_validate`] / [`merge_adopted_monitors`] /
+//!   [`write_plan_local`] engine and keeps only its own branch logic and
+//!   fatality rules. It reconciles the remote listing exactly as the explicit
+//!   path does — same functions, same order, same budget — because WHICH DOOR
+//!   the user walked through must not decide whether a monitor is recovered:
+//!   the PWA's fire-and-forget `writeManifest()` means a missing manifest
+//!   entry can belong to a LIVE channel, and silently omitting that monitor
+//!   risks its funds. The only difference is the verdict on an unidentifiable
+//!   key: the explicit path reports [`RestoreError::BackupInconsistent`],
+//!   while silent recovery refuses to start
+//!   ([`crate::builder::BuildError::VssRecoveryFailed`]) after rolling back its
+//!   partial local writes — its existing never-fresh-over-backup stance.
+//!
+//! Crash-prefix safety: the marker is written BEFORE anything destructive and
+//! contains the full restore context (`{mnemonic, started_at_ms}` as JSON),
+//! so EVERY crash prefix — after marker, after clear, after mnemonic, after
+//! CM, mid-monitors — resumes: startup ([`prepare_marker_resume`], wired in
+//! `builder::build`) re-adopts the marker's mnemonic, voids local LDK state,
+//! and re-runs silent recovery (idempotent — everything is still remote).
+//! While the marker exists a missing mnemonic never auto-generates fresh
+//! words (U1, `keys::read_or_generate_mnemonic`).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
+use std::fs;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bitcoin::BlockHash;
+use lightning::chain::channelmonitor::ChannelMonitor;
+use lightning::sign::{InMemorySigner, KeysManager};
+use lightning::util::logger::Logger as _;
+use lightning::util::persist::{
+    KVStoreSync, CHANNEL_MANAGER_PERSISTENCE_KEY, CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+    CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE, CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+    CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+};
+use lightning::util::ser::ReadableArgs;
+use lightning::{log_error, log_info};
+use lightning_persister::fs_store::FilesystemStore;
+use serde::{Deserialize, Serialize};
+
+use crate::builder::{make_vss_transport, BuildError, KV_STORE_SUBDIR};
+use crate::config::Config;
+use crate::keys::{
+    derive_wallet_keys, parse_mnemonic, write_mnemonic, MNEMONIC_FILE_NAME,
+    RESTORE_IN_PROGRESS_FILE_NAME,
+};
+use crate::lock::DataDirLock;
+use crate::node::{CoreEvent, EventSink};
+use crate::signer::WalletSignerProvider;
+use crate::types::Logger;
+use crate::util::unix_now;
+use crate::vss::known_peers::{
+    parse_known_peers, write_local_known_peers, KnownPeer, KNOWN_PEERS_LOCAL_KEY,
+    KNOWN_PEERS_PRIMARY_NAMESPACE, KNOWN_PEERS_SECONDARY_NAMESPACE,
+};
+use crate::vss::store::{
+    monitor_vss_key, parse_monitor_manifest, VersionedValue, VssTransport, CHANNEL_MANAGER_VSS_KEY,
+    FENCED_FLAG_FILE_NAME, FIXED_REMOTE_KEYS, KNOWN_PEERS_VSS_KEY, MONITOR_MANIFEST_KEY,
+};
+use crate::vss::VssError;
+use crate::wallet::OnchainWallet;
+
+/// Monitors are downloaded in parallel chunks of this size (PWA
+/// `VSS_RECOVERY_CHUNK_SIZE`).
+pub(crate) const RESTORE_CHUNK_SIZE: usize = 10;
+
+/// Overall monitor-download budget (PWA `VSS_RECOVERY_TIMEOUT_MS`).
+pub(crate) const RESTORE_DOWNLOAD_BUDGET: Duration = Duration::from_secs(120);
+
+// Progress-step copy, byte-identical to the PWA's Restore.tsx messages.
+pub(crate) const STEP_DERIVING_KEYS: &str = "Deriving keys...";
+pub(crate) const STEP_CHECKING_SERVER: &str = "Checking backup server...";
+pub(crate) const STEP_STOPPING_WALLET: &str = "Stopping wallet...";
+pub(crate) const STEP_CLEARING_DATA: &str = "Clearing local data...";
+pub(crate) const STEP_WRITING_DATA: &str = "Writing restored data...";
+pub(crate) const STEP_RESTARTING: &str = "Restarting wallet...";
+
+/// The PWA's `Downloading ${keys.length} item(s)...` step.
+pub(crate) fn step_downloading(item_count: usize) -> String {
+    format!("Downloading {item_count} item(s)...")
+}
+
+/// Typed restore failures (U4). Everything before the two-phase write leaves
+/// local state UNTOUCHED; a failure after the marker is written leaves a
+/// resumable marker, never a partial boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreError {
+    /// `restore()` while the node is running — restore is only valid from the
+    /// stopped state (F3: stop-and-flush before clearing).
+    NodeRunning,
+    /// The entered words are not a valid BIP39 English 12-word mnemonic.
+    InvalidMnemonic,
+    /// VSS is disabled by configuration; there is no backup to restore from.
+    VssDisabled,
+    /// Restore plumbing (runtime, VSS client, scratch wallet) failed to set
+    /// up. Nothing was touched.
+    Setup {
+        /// What failed to set up.
+        detail: String,
+    },
+    /// `listKeyVersions` returned empty: no backup exists for these words.
+    /// Local state untouched.
+    NoBackupFound,
+    /// The remote key set is not explained by the manifest plus the fixed key
+    /// set (or the manifest/CM relationship is broken): restoring could lose
+    /// a monitor another client tracks. Aborted before any write.
+    BackupInconsistent {
+        /// What is inconsistent.
+        detail: String,
+    },
+    /// A download failed (network, server, or the overall time budget).
+    DownloadFailed {
+        /// The failing download.
+        detail: String,
+    },
+    /// A downloaded blob failed validation-by-deserialization. Nothing was
+    /// written locally.
+    ValidationFailed {
+        /// The failing blob.
+        detail: String,
+    },
+    /// A local write in the two-phase phase failed. The durable marker (if
+    /// already written) makes the next start resume the restore.
+    LocalWriteFailed {
+        /// The failing write.
+        detail: String,
+    },
+    /// Test-only: a simulated process death injected via
+    /// [`CrashPoint`]. Production callers never pass a crash point.
+    Interrupted,
+}
+
+impl fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RestoreError::NodeRunning => {
+                write!(f, "the node is running; stop it before restoring")
+            }
+            RestoreError::InvalidMnemonic => write!(
+                f,
+                "the mnemonic is not a valid BIP39 English 12-word mnemonic"
+            ),
+            RestoreError::VssDisabled => {
+                write!(f, "cloud backup is disabled; there is no backup to restore")
+            }
+            RestoreError::Setup { detail } => write!(f, "restore setup failed: {detail}"),
+            RestoreError::NoBackupFound => write!(
+                f,
+                "No backup found for this wallet. Make sure you entered the correct seed phrase."
+            ),
+            RestoreError::BackupInconsistent { detail } => {
+                write!(f, "backup inconsistent: {detail}")
+            }
+            RestoreError::DownloadFailed { detail } => {
+                write!(f, "backup download failed: {detail}")
+            }
+            RestoreError::ValidationFailed { detail } => {
+                write!(f, "backup validation failed: {detail}")
+            }
+            RestoreError::LocalWriteFailed { detail } => {
+                write!(f, "local write during restore failed: {detail}")
+            }
+            RestoreError::Interrupted => write!(f, "restore interrupted (simulated crash)"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {}
+
+/// Test-only crash injection points for the two-phase write (the crash-prefix
+/// matrix). Production passes `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrashPoint {
+    /// Die right after the durable marker write.
+    Marker,
+    /// Die right after clearing local state.
+    Clear,
+    /// Die right after the mnemonic write.
+    Mnemonic,
+    /// Die right after the channel-manager write, before any monitor.
+    Manager,
+}
+
+/// The durable restore context, stored INSIDE the marker file as JSON so
+/// every crash prefix can resume — including the prefix where the old
+/// mnemonic was cleared but the new one was never written. The data dir is
+/// app-private and the mnemonic file itself is plaintext, so the marker
+/// holding the words adds no exposure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RestoreMarker {
+    /// The TARGET wallet's 12 words (normalized, space-separated).
+    pub mnemonic: String,
+    /// When the restore started (UNIX ms) — diagnostics only.
+    pub started_at_ms: u64,
+}
+
+/// Writes the marker durably (write + fsync + best-effort dir sync).
+pub(crate) fn write_marker(storage_dir: &Path, marker: &RestoreMarker) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = storage_dir.join(RESTORE_IN_PROGRESS_FILE_NAME);
+    let mut file = fs::File::create(&path)?;
+    file.write_all(&serde_json::to_vec(marker).expect("marker always serializes"))?;
+    file.sync_all()?;
+    if let Ok(dir) = fs::File::open(storage_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Reads the marker's restore context. `None` when the marker is absent OR
+/// holds no parsable context (a legacy/void marker still voids local LDK
+/// state via the existing startup branch; it just cannot supply a mnemonic).
+pub(crate) fn read_marker(storage_dir: &Path) -> Option<RestoreMarker> {
+    let bytes = fs::read(storage_dir.join(RESTORE_IN_PROGRESS_FILE_NAME)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Removes the marker (restore complete).
+pub(crate) fn remove_marker(storage_dir: &Path) -> std::io::Result<()> {
+    match fs::remove_file(storage_dir.join(RESTORE_IN_PROGRESS_FILE_NAME)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// One downloaded-and-validated monitor, ready for its ordered local write.
+pub(crate) struct ValidatedMonitor {
+    /// PWA VSS key `{txid_hex}:{index}` (raw txid byte order).
+    pub vss_key: String,
+    /// Local `FilesystemStore` key (`MonitorName::to_string()`), derived from
+    /// the DESERIALIZED monitor so `read_channel_monitors` finds it again.
+    pub local_key: String,
+    /// The raw monitor bytes exactly as fetched.
+    pub bytes: Vec<u8>,
+    /// Server version, seeding the post-restore version cache.
+    pub version: i64,
+    /// Whether the plaintext VSS key re-derived from this monitor's funding
+    /// outpoint reproduces the key the blob is actually stored under, so
+    /// PUBLISHING it in the `_monitor_keys` manifest names a key that exists
+    /// remotely.
+    ///
+    /// True by construction for a manifest-listed download (the key came FROM
+    /// the manifest and the blob was fetched under it). Only the adoption path
+    /// ([`verify_unexplained_keys`]) can produce `false`: it learns the
+    /// plaintext key by RE-DERIVING it from the monitor, and obfuscation is a
+    /// one-way HMAC, so when the derived key's obfuscated form does not match
+    /// the stored key there is no way to recover what the blob is really
+    /// filed under. Such a key is safe to track locally but must never be
+    /// published — see [`RestorePlan::publishable_monitor_keys`].
+    pub key_verified: bool,
+}
+
+/// Everything a restore/recovery downloads, fully validated BEFORE any local
+/// write (R4).
+pub(crate) struct RestorePlan {
+    /// `_monitor_keys` server version, when a manifest exists.
+    pub manifest_version: Option<i64>,
+    /// The channel manager blob + version, when one exists remotely.
+    pub cm: Option<(Vec<u8>, i64)>,
+    /// Validated monitors, in manifest order.
+    pub monitors: Vec<ValidatedMonitor>,
+    /// Parsed known peers + version, when the blob exists remotely.
+    pub peers: Option<(BTreeMap<String, KnownPeer>, i64)>,
+}
+
+impl RestorePlan {
+    /// Version-cache seeds for [`crate::vss::store::VssBackedStore`].
+    pub(crate) fn versions(&self) -> HashMap<String, i64> {
+        let mut versions = HashMap::new();
+        if let Some(version) = self.manifest_version {
+            versions.insert(MONITOR_MANIFEST_KEY.to_string(), version);
+        }
+        if let Some((_, version)) = &self.cm {
+            versions.insert(CHANNEL_MANAGER_VSS_KEY.to_string(), *version);
+        }
+        for monitor in &self.monitors {
+            versions.insert(monitor.vss_key.clone(), monitor.version);
+        }
+        if let Some((_, version)) = &self.peers {
+            versions.insert(KNOWN_PEERS_VSS_KEY.to_string(), *version);
+        }
+        versions
+    }
+
+    /// The `_monitor_keys` set the plan carries: EVERY monitor the plan writes
+    /// locally, adopted ones included.
+    ///
+    /// This is the set the caller seeds `VssBackedStore` with, i.e. the
+    /// manifest membership that gates new-channel completion and that the
+    /// store's own manifest writes carry forward. It must stay total: a
+    /// monitor we now track locally and could be asked to update must be in
+    /// the store's set, or the next manifest write would DROP a key another
+    /// device tracks. It is deliberately NOT the set to publish — that is
+    /// [`Self::publishable_monitor_keys`].
+    pub(crate) fn monitor_keys(&self) -> BTreeSet<String> {
+        self.monitors
+            .iter()
+            .map(|monitor| monitor.vss_key.clone())
+            .collect()
+    }
+
+    /// The subset of [`Self::monitor_keys`] that may be PUBLISHED into the
+    /// remote `_monitor_keys` manifest: keys proven to name a blob that exists
+    /// remotely ([`ValidatedMonitor::key_verified`]).
+    ///
+    /// Why the split (R4, fund recovery): `download_and_validate` treats a
+    /// manifest entry with no blob behind it as a hard
+    /// [`RestoreError::BackupInconsistent`] — the correct verdict, since a
+    /// missing monitor may belong to a live channel. So backfilling a key we
+    /// re-derived but could not confirm would turn a RECOVERABLE backup into a
+    /// permanently failing restore (and, on the startup door,
+    /// [`BuildError::VssRecoveryFailed`] — a node that refuses to boot,
+    /// forever) over a monitor we in fact recovered successfully. The manifest
+    /// stores PLAINTEXT keys while the stored key is a one-way HMAC, so
+    /// publishing the key the blob really lives under is impossible;
+    /// publishing nothing for it is the only correct option. The wallet stays
+    /// safe either way — the monitor is durable locally, which is what
+    /// recovers the funds — and the manifest merely stays as incomplete as the
+    /// writing client left it (the PWA's `writeManifest()` is fire-and-forget,
+    /// so an incomplete manifest is the normal cross-client state this engine
+    /// already tolerates).
+    pub(crate) fn publishable_monitor_keys(&self) -> BTreeSet<String> {
+        self.monitors
+            .iter()
+            .filter(|monitor| monitor.key_verified)
+            .map(|monitor| monitor.vss_key.clone())
+            .collect()
+    }
+}
+
+fn download_err(e: VssError) -> RestoreError {
+    RestoreError::DownloadFailed {
+        detail: e.to_string(),
+    }
+}
+
+/// Downloads and parses the `_monitor_keys` manifest. `Ok(None)` when no
+/// manifest exists (a zero-channel backup).
+pub(crate) async fn fetch_manifest(
+    transport: &dyn VssTransport,
+) -> Result<Option<(Vec<String>, i64)>, RestoreError> {
+    match transport
+        .get(MONITOR_MANIFEST_KEY)
+        .await
+        .map_err(download_err)?
+    {
+        None => Ok(None),
+        Some((bytes, version)) => {
+            let keys = parse_monitor_manifest(&bytes)
+                .map_err(|detail| RestoreError::ValidationFailed { detail })?;
+            Ok(Some((keys, version)))
+        }
+    }
+}
+
+/// How many unexplained obfuscated keys the error names before eliding the
+/// rest. Obfuscated keys are HMACs of key NAMES, never of secrets, so quoting
+/// a few is safe — and without at least one the failure is un-triageable.
+const UNEXPLAINED_KEYS_IN_ERROR: usize = 3;
+
+/// The obfuscated listing keys that neither [`FIXED_REMOTE_KEYS`] nor the
+/// manifest explains, in listing order. Pure: no blob is fetched here.
+///
+/// Obfuscated keys are deterministic HMACs, so the obfuscated form of every
+/// EXPECTED plaintext key is computable client-side and set-diffed against the
+/// (obfuscated) listing. The reverse is impossible, which is why an
+/// unexplained key can only be identified by FETCHING it
+/// ([`verify_unexplained_keys`]).
+pub(crate) fn unexplained_remote_keys(
+    listing: &[(String, i64)],
+    manifest_keys: &[String],
+    transport: &dyn VssTransport,
+) -> Vec<String> {
+    let expected: HashSet<String> = FIXED_REMOTE_KEYS
+        .iter()
+        .copied()
+        .chain(manifest_keys.iter().map(String::as_str))
+        .map(|key| transport.obfuscate(key))
+        .collect();
+    listing
+        .iter()
+        .filter(|(obfuscated_key, _)| !expected.contains(obfuscated_key))
+        .map(|(obfuscated_key, _)| obfuscated_key.clone())
+        .collect()
+}
+
+/// STRICT manifest reconciliation (U4, adversarially reviewed —
+/// load-bearing): every key `listKeyVersions` reports must be EXPLAINED — the
+/// obfuscated form of a manifest entry or of one of [`FIXED_REMOTE_KEYS`]. An
+/// unexplained remote key may mean the manifest undercounts the monitors, and
+/// restoring on an undercounting manifest silently drops fund-safety state.
+///
+/// This is the invariant OUR OWN write path must keep, and the permanent
+/// regression guards (`node.rs`'s fresh-wallet lifecycle, `vss::store`'s
+/// completed-monitor-persist) assert it directly — which is why it stays a
+/// single named predicate. The RESTORE flow deliberately does NOT stop here:
+/// it composes the two halves itself ([`unexplained_remote_keys`] then
+/// [`verify_unexplained_keys`]) so a key that turns out to be one of this
+/// wallet's own monitors is ADOPTED instead of bricking the wallet — the PWA
+/// leaves such keys behind by design. Only an unidentifiable key still aborts,
+/// through the same [`backup_inconsistent`] report.
+#[cfg(test)]
+pub(crate) fn reconcile_backup_keys(
+    listing: &[(String, i64)],
+    manifest_keys: &[String],
+    transport: &dyn VssTransport,
+) -> Result<(), RestoreError> {
+    let unexplained = unexplained_remote_keys(listing, manifest_keys, transport);
+    if unexplained.is_empty() {
+        return Ok(());
+    }
+    Err(backup_inconsistent(
+        listing,
+        manifest_keys,
+        transport,
+        unexplained.len(),
+        &unexplained,
+        None,
+    ))
+}
+
+/// Builds the `BackupInconsistent` triage report: a triage report, not just a
+/// hash. It names how big the listing was, how much of it the manifest and the
+/// fixed keys each accounted for, WHICH fixed keys were present versus absent,
+/// the first few offending obfuscated keys, and — when the identification pass
+/// ran — how many unexplained keys were verified as this wallet's monitors
+/// versus rejected. All of that is derived from key NAMES and counts, so the
+/// mnemonic, the encryption key and plaintext values never enter the message.
+///
+/// `unexplained` is how many listing entries nothing explained; `offenders` are
+/// the ones to NAME (the unidentifiable subset once verification has run,
+/// otherwise all of them); `verified` is `(adopted, rejected)` when a
+/// verification pass ran.
+fn backup_inconsistent(
+    listing: &[(String, i64)],
+    manifest_keys: &[String],
+    transport: &dyn VssTransport,
+    unexplained: usize,
+    offenders: &[String],
+    verified: Option<(usize, usize)>,
+) -> RestoreError {
+    let fixed: Vec<(&str, String)> = FIXED_REMOTE_KEYS
+        .iter()
+        .map(|key| (*key, transport.obfuscate(key)))
+        .collect();
+    let manifest_obfuscated: HashSet<String> = manifest_keys
+        .iter()
+        .map(|key| transport.obfuscate(key))
+        .collect();
+
+    // Which side of the comparison came up short: the plaintext names are the
+    // only actionable fact a user or developer can relay.
+    let listed: HashSet<&str> = listing.iter().map(|(key, _)| key.as_str()).collect();
+    let mut present: Vec<&str> = Vec::new();
+    let mut absent: Vec<&str> = Vec::new();
+    for (plaintext, obfuscated) in &fixed {
+        if listed.contains(obfuscated.as_str()) {
+            present.push(plaintext);
+        } else {
+            absent.push(plaintext);
+        }
+    }
+    let explained_by_manifest = listing
+        .iter()
+        .filter(|(key, _)| manifest_obfuscated.contains(key))
+        .count();
+    let shown: Vec<&str> = offenders
+        .iter()
+        .take(UNEXPLAINED_KEYS_IN_ERROR)
+        .map(String::as_str)
+        .collect();
+    let elided = offenders.len().saturating_sub(shown.len());
+    // With a verification pass the named keys are the UNIDENTIFIABLE subset, so
+    // the label has to say so — otherwise the count and the list disagree.
+    let (verification, label) = match verified {
+        Some((adopted, rejected)) => (
+            format!(
+                " Of those, {adopted} decrypted and deserialized as this wallet's channel \
+                 monitor(s) and would have been adopted, but {rejected} could not be identified \
+                 (undecryptable, or decrypted to something that is not a channel monitor).",
+            ),
+            "Unidentifiable",
+        ),
+        None => (String::new(), "Unexplained"),
+    };
+    RestoreError::BackupInconsistent {
+        detail: format!(
+            "{} of the {} key(s) on the backup server are not explained. The monitor manifest \
+             declares {} monitor key(s) and accounts for {} of the listing; the expected wallet \
+             keys account for {} more. Expected keys found: [{}]. Expected keys absent: [{}]. \
+             {} obfuscated key(s): {}{}.{} This is usually a channel-monitor backup that was \
+             uploaded but never listed in the manifest, so restoring from it could silently drop \
+             channel state — nothing was written locally.",
+            unexplained,
+            listing.len(),
+            manifest_keys.len(),
+            explained_by_manifest,
+            present.len(),
+            present.join(", "),
+            absent.join(", "),
+            label,
+            shown.join(", "),
+            if elided > 0 {
+                format!(" (+{elided} more)")
+            } else {
+                String::new()
+            },
+            verification,
+        ),
+    }
+}
+
+/// What deserializing a monitor blob under the RESTORED wallet's signer stack
+/// establishes about it.
+struct DeserializedMonitor {
+    /// Local `FilesystemStore` key (`MonitorName::to_string()`), so
+    /// `read_channel_monitors` finds the blob again after the restore.
+    local_key: String,
+    /// The monitor's own VSS key, derived from its funding outpoint with the
+    /// SAME helper the write path uses ([`monitor_vss_key`]). For a
+    /// manifest-listed monitor this re-derives the key it was fetched under;
+    /// for an adopted unexplained blob it is the only way to learn a plaintext
+    /// key at all, since the listing carries HMACs.
+    derived_vss_key: String,
+}
+
+/// THE monitor validation step (R4): a blob is accepted only if it
+/// deserializes as a `ChannelMonitor` under the ENTERED seed's `KeysManager` +
+/// [`WalletSignerProvider`]. Every monitor on every restore path goes through
+/// here — manifest-listed downloads and adopted unexplained keys alike — so
+/// there is exactly one deserializer to audit.
+fn deserialize_monitor(
+    bytes: &[u8],
+    keys_manager: &KeysManager,
+    signer_provider: &WalletSignerProvider,
+) -> Result<DeserializedMonitor, String> {
+    let (_block_hash, monitor) = <(BlockHash, ChannelMonitor<InMemorySigner>)>::read(
+        &mut Cursor::new(bytes),
+        (keys_manager, signer_provider),
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    Ok(DeserializedMonitor {
+        local_key: monitor.persistence_key().to_string(),
+        derived_vss_key: monitor_vss_key(&monitor.get_funding_txo()),
+    })
+}
+
+/// The outcome of identifying the remote keys the manifest and the fixed key
+/// set do not explain.
+pub(crate) struct UnexplainedKeyVerdict {
+    /// Unexplained keys that decrypted AND deserialized as this wallet's
+    /// monitors, ready to join the restore set.
+    pub adopted: Vec<ValidatedMonitor>,
+    /// Unexplained keys that could not be identified: undecryptable with this
+    /// seed's encryption key, or decrypted to something that is not a channel
+    /// monitor. These are the genuine "foreign or corrupt data" case.
+    pub rejected: Vec<String>,
+}
+
+/// Identifies the remote keys nothing explains, by FETCHING each one under its
+/// stored (obfuscated) key and running it through the ordinary monitor
+/// validation ([`deserialize_monitor`]).
+///
+/// Why adopt rather than abort (the cross-client half of R4): the sibling PWA
+/// leaves unlisted monitor keys behind BY DESIGN — its manifest write is
+/// fire-and-forget, and archiving a channel deliberately orphans the monitor's
+/// VSS key ("orphaned VSS keys waste storage but do not affect fund safety").
+/// A blanket abort therefore makes every PWA wallet that ever closed a channel
+/// permanently un-restorable. Adoption is also the SAFE direction on the
+/// merits: restoring an already-archived (fully resolved) monitor is harmless —
+/// LDK re-reads it, sees nothing to claim, and archives it again — whereas
+/// dropping a monitor that is still live is fund loss. So the guard's real job,
+/// "never restore on a manifest that undercounts live monitors", is served
+/// strictly better by recovering the key than by refusing the wallet.
+///
+/// Two facts make an adoption safe to trust: the blob decrypted with the
+/// SEED-DERIVED encryption key (so it belongs to this wallet, not a colliding
+/// store), and it deserialized as a channel monitor under this seed's signer
+/// stack (so it is a monitor, not some other client's unrelated blob).
+/// Anything else stays a hard [`RestoreError::BackupInconsistent`].
+///
+/// `budget` time-boxes the whole pass the way [`download_and_validate`] boxes
+/// the monitor downloads: identification costs one fetch per unexplained key,
+/// and a store holding thousands of them must not turn a restore into an
+/// unbounded wait.
+pub(crate) async fn verify_unexplained_keys(
+    transport: &dyn VssTransport,
+    unexplained: &[String],
+    keys_manager: &KeysManager,
+    signer_provider: &WalletSignerProvider,
+    budget: Duration,
+    logger: &Arc<Logger>,
+) -> Result<UnexplainedKeyVerdict, RestoreError> {
+    let started = tokio::time::Instant::now();
+    let mut adopted = Vec::new();
+    let mut rejected = Vec::new();
+    for (index, obfuscated_key) in unexplained.iter().enumerate() {
+        if started.elapsed() > budget {
+            return Err(RestoreError::DownloadFailed {
+                detail: format!(
+                    "identifying the backup's unlisted keys timed out: checked {index}/{} in {}s. \
+                     Retry on a faster connection.",
+                    unexplained.len(),
+                    started.elapsed().as_secs()
+                ),
+            });
+        }
+        let fetched = match transport.get_by_stored_key(obfuscated_key).await {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                // The key vanished between the listing and this fetch (another
+                // client archiving a channel right now). Nothing is left to
+                // explain, and nothing is left to lose.
+                log_info!(
+                    logger,
+                    "Unexplained remote key {obfuscated_key} disappeared before it could be \
+                     identified; treating it as archived"
+                );
+                continue;
+            }
+            // An undecryptable value is a verdict about the DATA (a foreign or
+            // corrupt blob); any other transport failure is a network problem
+            // and must not be reported as an inconsistent backup.
+            Err(VssError::Crypto(e)) => {
+                log_error!(
+                    logger,
+                    "Unexplained remote key {obfuscated_key} does not decrypt with this seed's \
+                     key ({e}); it is foreign or corrupt data"
+                );
+                rejected.push(obfuscated_key.clone());
+                continue;
+            }
+            Err(e) => return Err(download_err(e)),
+        };
+        let (bytes, version) = fetched;
+        match deserialize_monitor(&bytes, keys_manager, signer_provider) {
+            Ok(parsed) => {
+                // Does the re-derived plaintext key reproduce the key this blob
+                // is ACTUALLY stored under? The blob IS one of our monitors
+                // either way, so adopting it still recovers more state than
+                // aborting — but if it does not, the writer that stored it
+                // derived a different plaintext key than `monitor_vss_key`
+                // does, so future writes would land on a second key and this
+                // one would go stale. That is a key-format divergence between
+                // clients, not a backup fault; the byte-order vector tests
+                // exist to keep it from ever happening silently.
+                //
+                // The comparison is also the ONLY evidence that the derived key
+                // may be published: obfuscation is one-way, so on a mismatch we
+                // can never learn the plaintext the blob is filed under.
+                let key_verified = transport.obfuscate(&parsed.derived_vss_key) == *obfuscated_key;
+                if !key_verified {
+                    log_error!(
+                        logger,
+                        "Adopted monitor {} is stored under a remote key its funding outpoint \
+                         does not reproduce (monitor VSS key derivation has diverged from the \
+                         writing client). The monitor IS recovered locally and its funds are \
+                         safe, but its key is deliberately NOT added to the _monitor_keys \
+                         manifest: a manifest entry with no blob behind it makes every later \
+                         restore fail as an inconsistent backup. The manifest stays incomplete \
+                         until this monitor is written again under our own key.",
+                        parsed.derived_vss_key
+                    );
+                }
+                log_info!(
+                    logger,
+                    "Adopting an unlisted remote monitor as {} (the manifest never listed it)",
+                    parsed.derived_vss_key
+                );
+                adopted.push(ValidatedMonitor {
+                    vss_key: parsed.derived_vss_key,
+                    local_key: parsed.local_key,
+                    bytes,
+                    version,
+                    key_verified,
+                });
+            }
+            Err(e) => {
+                log_error!(
+                    logger,
+                    "Unexplained remote key {obfuscated_key} decrypted but is not a channel \
+                     monitor ({e})"
+                );
+                rejected.push(obfuscated_key.clone());
+            }
+        }
+    }
+    Ok(UnexplainedKeyVerdict { adopted, rejected })
+}
+
+/// THE manifest-reconciliation pass, shared by BOTH entry points (explicit
+/// [`run_restore`] and `vss::startup::silent_recovery`): diff the listing
+/// against the manifest plus [`FIXED_REMOTE_KEYS`]
+/// ([`unexplained_remote_keys`], pure), then IDENTIFY whatever is left by
+/// fetching it ([`verify_unexplained_keys`]). Returns the monitors to adopt;
+/// an unidentifiable key is the hard [`RestoreError::BackupInconsistent`] with
+/// the full triage report.
+///
+/// This composite exists so the two doors cannot drift apart again. Silent
+/// recovery used to go straight from [`fetch_manifest`] to
+/// [`download_and_validate`], which meant a PWA-created backup holding a
+/// monitor blob the manifest never listed was silently OMITTED on that path
+/// while the explicit path adopted it — and because `writeManifest()` is
+/// fire-and-forget (`zinq/src/ldk/traits/persist.ts:98`), the unlisted monitor
+/// can belong to a LIVE channel, not only an archived one
+/// (ibid. 370-376). Booting without a live channel's monitor risks its funds,
+/// so the more permissive-looking path was the more dangerous one.
+///
+/// `budget` time-boxes the identification fetches; callers pass
+/// [`RESTORE_DOWNLOAD_BUDGET`], the same box [`download_and_validate`] gets,
+/// so a slow backend can neither hang a restore nor hang startup.
+pub(crate) async fn adopt_unexplained_monitors(
+    transport: &dyn VssTransport,
+    listing: &[(String, i64)],
+    manifest_keys: &[String],
+    keys_manager: &KeysManager,
+    signer_provider: &WalletSignerProvider,
+    budget: Duration,
+    logger: &Arc<Logger>,
+) -> Result<Vec<ValidatedMonitor>, RestoreError> {
+    let unexplained = unexplained_remote_keys(listing, manifest_keys, transport);
+    if unexplained.is_empty() {
+        // The common case: the manifest explains the whole listing, so not a
+        // single extra request is issued.
+        return Ok(Vec::new());
+    }
+    let verdict = verify_unexplained_keys(
+        transport,
+        &unexplained,
+        keys_manager,
+        signer_provider,
+        budget,
+        logger,
+    )
+    .await?;
+    if !verdict.rejected.is_empty() {
+        return Err(backup_inconsistent(
+            listing,
+            manifest_keys,
+            transport,
+            unexplained.len(),
+            &verdict.rejected,
+            Some((verdict.adopted.len(), verdict.rejected.len())),
+        ));
+    }
+    Ok(verdict.adopted)
+}
+
+/// Folds [`adopt_unexplained_monitors`]'s verdict into the downloaded plan, so
+/// adopted monitors reach the ordered local writes AND — through
+/// [`RestorePlan::monitor_keys`] / [`RestorePlan::versions`] — the manifest set
+/// and version cache the caller seeds. Shared by both entry points; returns how
+/// many were actually adopted (the backfill trigger).
+///
+/// A manifest-listed monitor wins any collision: it is the authoritative copy
+/// of that channel's state.
+pub(crate) fn merge_adopted_monitors(
+    plan: &mut RestorePlan,
+    adopted: Vec<ValidatedMonitor>,
+    logger: &Arc<Logger>,
+) -> Result<usize, RestoreError> {
+    let planned: HashSet<String> = plan
+        .monitors
+        .iter()
+        .map(|monitor| monitor.local_key.clone())
+        .collect();
+    let mut adopted_count = 0usize;
+    for monitor in adopted {
+        if planned.contains(&monitor.local_key) {
+            log_error!(
+                logger,
+                "Adopted monitor {} duplicates a manifest-listed one; keeping the listed copy",
+                monitor.vss_key
+            );
+            continue;
+        }
+        log_info!(
+            logger,
+            "Recovering adopted monitor {} that no manifest listed",
+            monitor.vss_key
+        );
+        plan.monitors.push(monitor);
+        adopted_count += 1;
+    }
+    if !plan.monitors.is_empty() && plan.cm.is_none() {
+        // The same invariant `download_and_validate` enforces for
+        // manifest-listed monitors: monitors without a channel manager cannot
+        // be booted into a working wallet (F3's CM-before-monitors ordering has
+        // nothing to order), so an adopted monitor may not smuggle that state
+        // past the check.
+        return Err(RestoreError::BackupInconsistent {
+            detail: "monitors present remotely but channel_manager missing".to_string(),
+        });
+    }
+    Ok(adopted_count)
+}
+
+/// Best-effort manifest backfill after a restore/recovery adopted unlisted
+/// monitors, so the NEXT reconciliation on this seed is clean with no
+/// identification pass at all. Never fails the caller: the adopted monitors are
+/// already durable locally, and an unwritten manifest only costs the next
+/// start another verification round.
+///
+/// The caller's seeded `_monitor_keys` version is deliberately left at the
+/// PRE-backfill value: `vss::store`'s manifest writers treat a 409 by
+/// refetching and MERGING the server's keys rather than fencing
+/// (`write_manifest_with_retry_locked`), so a stale-by-one manifest version
+/// costs one round trip and can never drop a key another device tracks —
+/// whereas seeding the post-backfill version would let the next manifest write
+/// overwrite a concurrent client's entries.
+pub(crate) async fn backfill_manifest(
+    transport: &dyn VssTransport,
+    monitor_keys: &BTreeSet<String>,
+    known_version: i64,
+    logger: &Arc<Logger>,
+) {
+    let mut keys: BTreeSet<String> = monitor_keys.clone();
+    let payload = serde_json::to_vec(&keys).expect("a set of strings always serializes to JSON");
+    match transport
+        .put(MONITOR_MANIFEST_KEY, &payload, known_version)
+        .await
+    {
+        Ok(_) => return,
+        Err(VssError::Conflict { .. }) => {}
+        Err(e) => {
+            log_error!(logger, "Post-restore manifest backfill failed: {e}");
+            return;
+        }
+    }
+    // Another client wrote the manifest meanwhile: merge its keys in (never
+    // drop a monitor another device tracks) and retry once at its version.
+    match transport.get(MONITOR_MANIFEST_KEY).await {
+        Ok(Some((remote_bytes, remote_version))) => {
+            match parse_monitor_manifest(&remote_bytes) {
+                Ok(remote_keys) => keys.extend(remote_keys),
+                Err(e) => log_error!(
+                    logger,
+                    "Remote manifest did not parse during the post-restore backfill ({e}); \
+                     writing our key set"
+                ),
+            }
+            let merged =
+                serde_json::to_vec(&keys).expect("a set of strings always serializes to JSON");
+            if let Err(e) = transport
+                .put(MONITOR_MANIFEST_KEY, &merged, remote_version)
+                .await
+            {
+                log_error!(logger, "Post-restore manifest backfill retry failed: {e}");
+            }
+        }
+        Ok(None) => log_error!(
+            logger,
+            "Post-restore manifest backfill conflicted but the manifest is gone; leaving it to \
+             the next session"
+        ),
+        Err(e) => log_error!(logger, "Post-restore manifest refetch failed: {e}"),
+    }
+}
+
+/// Downloads CM + monitors + known peers and validates EVERY blob by
+/// deserialization before returning (R4). Monitors download in parallel
+/// chunks of [`RESTORE_CHUNK_SIZE`] with `budget` as the overall time box
+/// (PWA `init.ts` recovery loop). Nothing is written anywhere.
+pub(crate) async fn download_and_validate(
+    transport: &Arc<dyn VssTransport>,
+    manifest: Option<(Vec<String>, i64)>,
+    keys_manager: &KeysManager,
+    signer_provider: &WalletSignerProvider,
+    budget: Duration,
+) -> Result<RestorePlan, RestoreError> {
+    let (manifest_keys, manifest_version) = match manifest {
+        Some((keys, version)) => (keys, Some(version)),
+        None => (Vec::new(), None),
+    };
+
+    let cm = transport
+        .get(CHANNEL_MANAGER_VSS_KEY)
+        .await
+        .map_err(download_err)?;
+    if !manifest_keys.is_empty() && cm.is_none() {
+        return Err(RestoreError::BackupInconsistent {
+            detail: "monitors present remotely but channel_manager missing".to_string(),
+        });
+    }
+    if let Some((bytes, _)) = &cm {
+        // PWA sanity floor for a serialized ChannelManager; the full
+        // deserialization happens when the node boots on the restored state.
+        if bytes.len() < 32 {
+            return Err(RestoreError::ValidationFailed {
+                detail: format!(
+                    "channel_manager from VSS is too small ({} bytes) — likely corrupt",
+                    bytes.len()
+                ),
+            });
+        }
+    }
+
+    let started = tokio::time::Instant::now();
+    let mut monitors: Vec<ValidatedMonitor> = Vec::with_capacity(manifest_keys.len());
+    for chunk in manifest_keys.chunks(RESTORE_CHUNK_SIZE) {
+        if started.elapsed() > budget {
+            return Err(RestoreError::DownloadFailed {
+                detail: format!(
+                    "VSS recovery timeout: downloaded {}/{} monitors in {}s. Retry on a faster \
+                     connection.",
+                    monitors.len(),
+                    manifest_keys.len(),
+                    started.elapsed().as_secs()
+                ),
+            });
+        }
+        // Parallel chunk download (PWA Promise.all over the chunk).
+        let mut join_set = tokio::task::JoinSet::new();
+        for (index, vss_key) in chunk.iter().enumerate() {
+            let transport = Arc::clone(transport);
+            let vss_key = vss_key.clone();
+            join_set.spawn(async move { (index, transport.get(&vss_key).await) });
+        }
+        let mut results: Vec<Option<Result<VersionedValue, VssError>>> =
+            (0..chunk.len()).map(|_| None).collect();
+        while let Some(joined) = join_set.join_next().await {
+            let (index, result) = joined.map_err(|e| RestoreError::Setup {
+                detail: format!("monitor download task failed: {e}"),
+            })?;
+            results[index] = Some(result);
+        }
+        for (index, result) in results.into_iter().enumerate() {
+            let vss_key = &chunk[index];
+            let value = result
+                .expect("every spawned download reports back")
+                .map_err(download_err)?;
+            let (bytes, version) = value.ok_or_else(|| RestoreError::BackupInconsistent {
+                detail: format!("monitor \"{vss_key}\" listed in manifest but missing from VSS"),
+            })?;
+            // Validate by deserialization with the RESTORED wallet's signer
+            // BEFORE anything is written (R4).
+            let parsed =
+                deserialize_monitor(&bytes, keys_manager, signer_provider).map_err(|detail| {
+                    RestoreError::ValidationFailed {
+                        detail: format!(
+                            "monitor \"{vss_key}\" from VSS failed deserialization: {detail}"
+                        ),
+                    }
+                })?;
+            monitors.push(ValidatedMonitor {
+                vss_key: vss_key.clone(),
+                local_key: parsed.local_key,
+                bytes,
+                version,
+                // Verified by construction: the key came FROM the manifest and
+                // the blob was just fetched under it, so re-publishing it can
+                // only ever name a key that exists remotely.
+                key_verified: true,
+            });
+        }
+    }
+
+    let peers = match transport
+        .get(KNOWN_PEERS_VSS_KEY)
+        .await
+        .map_err(download_err)?
+    {
+        Some((bytes, version)) => {
+            let map = parse_known_peers(&bytes)
+                .map_err(|detail| RestoreError::ValidationFailed { detail })?;
+            Some((map, version))
+        }
+        None => None,
+    };
+
+    Ok(RestorePlan {
+        manifest_version,
+        cm,
+        monitors,
+        peers,
+    })
+}
+
+/// One entry of the ordered local write log — returned so tests can assert
+/// the CM-before-monitors ordering and so callers can roll back exactly what
+/// was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalWrite {
+    /// The channel manager, under LDK's persist key constants.
+    Manager,
+    /// One monitor, under its `MonitorName` local key.
+    Monitor(String),
+    /// The known-peers local mirror.
+    Peers,
+}
+
+/// Ordered local writes of a validated plan: CM BEFORE monitors, then
+/// monitors, then peers (F3). Appends each completed write to `log` so a
+/// failure leaves the caller an exact rollback list. `stop_after_manager` is
+/// test-only crash injection.
+pub(crate) fn write_plan_local(
+    kv_store: &FilesystemStore,
+    plan: &RestorePlan,
+    log: &mut Vec<LocalWrite>,
+    stop_after_manager: bool,
+) -> Result<(), lightning::io::Error> {
+    if let Some((bytes, _)) = &plan.cm {
+        kv_store.write(
+            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_KEY,
+            bytes.clone(),
+        )?;
+        log.push(LocalWrite::Manager);
+    }
+    if stop_after_manager {
+        return Ok(());
+    }
+    for monitor in &plan.monitors {
+        kv_store.write(
+            CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+            &monitor.local_key,
+            monitor.bytes.clone(),
+        )?;
+        log.push(LocalWrite::Monitor(monitor.local_key.clone()));
+    }
+    if let Some((peers, _)) = &plan.peers {
+        write_local_known_peers(kv_store, peers)?;
+        log.push(LocalWrite::Peers);
+    }
+    Ok(())
+}
+
+/// Removes exactly the writes `log` records (silent recovery's
+/// never-fresh-over-backup rollback).
+pub(crate) fn rollback_local_writes(kv_store: &FilesystemStore, log: &[LocalWrite]) {
+    for entry in log {
+        let _ = match entry {
+            LocalWrite::Manager => kv_store.remove(
+                CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+                CHANNEL_MANAGER_PERSISTENCE_KEY,
+                false,
+            ),
+            LocalWrite::Monitor(local_key) => kv_store.remove(
+                CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                local_key,
+                false,
+            ),
+            LocalWrite::Peers => kv_store.remove(
+                KNOWN_PEERS_PRIMARY_NAMESPACE,
+                KNOWN_PEERS_SECONDARY_NAMESPACE,
+                KNOWN_PEERS_LOCAL_KEY,
+                false,
+            ),
+        };
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Clears the wallet's local state: the `store/` KV directory (LDK state,
+/// history, event queue, bdk changeset), the mnemonic file, and the fenced
+/// flag (restore IS the documented un-fence path — KTD-3). The restore
+/// marker and the data-dir lock survive.
+fn clear_local_wallet_state(storage_dir: &Path) -> std::io::Result<()> {
+    let store_dir = storage_dir.join(KV_STORE_SUBDIR);
+    if store_dir.exists() {
+        fs::remove_dir_all(&store_dir)?;
+    }
+    remove_file_if_exists(&storage_dir.join(MNEMONIC_FILE_NAME))?;
+    remove_file_if_exists(&storage_dir.join(FENCED_FLAG_FILE_NAME))?;
+    Ok(())
+}
+
+/// Startup half of crash-prefix safety, called by `builder::build` BEFORE the
+/// fence check and mnemonic load: when the marker holds a restore context and
+/// the on-disk mnemonic is not already the marker's target, the interrupted
+/// clear is redone (idempotent) and the TARGET mnemonic is written — so the
+/// normal marker branch (`vss::startup`) resumes silent recovery under the
+/// restored identity, whatever prefix the crash cut.
+pub(crate) fn prepare_marker_resume(
+    storage_dir: &Path,
+    logger: &Arc<Logger>,
+) -> Result<(), BuildError> {
+    let Some(marker) = read_marker(storage_dir) else {
+        return Ok(());
+    };
+    let Ok(target) = parse_mnemonic(&marker.mnemonic) else {
+        log_error!(
+            logger,
+            "Restore marker holds an invalid mnemonic; treating it as a void-only marker"
+        );
+        return Ok(());
+    };
+    let current_matches = fs::read_to_string(storage_dir.join(MNEMONIC_FILE_NAME))
+        .ok()
+        .and_then(|raw| parse_mnemonic(&raw).ok())
+        .is_some_and(|current| current == target);
+    if current_matches {
+        return Ok(());
+    }
+    log_info!(
+        logger,
+        "Resuming an interrupted restore: redoing the local clear and adopting the marker's \
+         mnemonic"
+    );
+    clear_local_wallet_state(storage_dir).map_err(|_| BuildError::WriteFailed)?;
+    write_mnemonic(storage_dir, &target)?;
+    Ok(())
+}
+
+/// RAII scratch directory for the validation-only signer stack (the real
+/// data dir must stay untouched until the two-phase write).
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create() -> Result<Self, RestoreError> {
+        let path = std::env::temp_dir().join(format!(
+            "zinqq-restore-scratch-{}-{}",
+            std::process::id(),
+            unix_now().as_nanos()
+        ));
+        fs::create_dir_all(&path).map_err(|e| RestoreError::Setup {
+            detail: format!("failed to create the validation scratch dir: {e}"),
+        })?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The explicit restore flow (F3), valid only with the node stopped —
+/// `Node::restore` enforces that and holds the node's state lock; this
+/// function additionally takes the data-dir lock so no other process can
+/// boot mid-restore.
+///
+/// `crash_after` is test-only crash injection for the crash-prefix matrix.
+pub(crate) fn run_restore(
+    config: &Config,
+    mnemonic_raw: &str,
+    event_sink: &dyn EventSink,
+    crash_after: Option<CrashPoint>,
+) -> Result<(), RestoreError> {
+    let logger = Arc::new(Logger);
+    let storage_dir = PathBuf::from(&config.storage_dir);
+    fs::create_dir_all(&storage_dir).map_err(|e| RestoreError::LocalWriteFailed {
+        detail: format!("failed to create the storage dir: {e}"),
+    })?;
+    let _dir_lock = DataDirLock::acquire(&storage_dir).map_err(|e| match e {
+        BuildError::InstanceAlreadyRunning => RestoreError::NodeRunning,
+        other => RestoreError::Setup {
+            detail: other.to_string(),
+        },
+    })?;
+
+    let progress = |step: &str| {
+        event_sink.emit(CoreEvent::RestoreProgress {
+            step: step.to_string(),
+        })
+    };
+
+    progress(STEP_DERIVING_KEYS);
+    let mnemonic = parse_mnemonic(mnemonic_raw).map_err(|_| RestoreError::InvalidMnemonic)?;
+    let keys = derive_wallet_keys(&mnemonic, config.network);
+    let transport = make_vss_transport(config, &keys)
+        .map_err(|e| RestoreError::Setup {
+            detail: e.to_string(),
+        })?
+        .ok_or(RestoreError::VssDisabled)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("wallet-core-restore")
+        .enable_all()
+        .build()
+        .map_err(|e| RestoreError::Setup {
+            detail: format!("failed to create the restore runtime: {e}"),
+        })?;
+
+    progress(STEP_CHECKING_SERVER);
+    let listing = runtime
+        .block_on(transport.list_key_versions())
+        .map_err(download_err)?;
+    if listing.is_empty() {
+        // The PWA's "No backup found" outcome: local state UNTOUCHED.
+        return Err(RestoreError::NoBackupFound);
+    }
+
+    progress(&step_downloading(listing.len()));
+    let manifest = runtime.block_on(fetch_manifest(&*transport))?;
+    let manifest_keys: Vec<String> = manifest
+        .as_ref()
+        .map(|(keys, _)| keys.clone())
+        .unwrap_or_default();
+
+    // Validation signer stack from the ENTERED mnemonic, over a throwaway
+    // scratch store: the real data dir stays untouched until the plan is
+    // fully validated.
+    let scratch = ScratchDir::create()?;
+    let now = unix_now();
+    let keys_manager = Arc::new(KeysManager::new(
+        &keys.ldk_seed,
+        now.as_secs(),
+        now.subsec_nanos(),
+        false,
+    ));
+    let scratch_store = Arc::new(FilesystemStore::new(scratch.path().join(KV_STORE_SUBDIR)));
+    let onchain_wallet = Arc::new(
+        OnchainWallet::new(
+            &keys.descriptor_external,
+            &keys.descriptor_internal,
+            config.network,
+            scratch_store,
+            Arc::clone(&logger),
+        )
+        .map_err(|e| RestoreError::Setup {
+            detail: format!("failed to set up the validation wallet: {e}"),
+        })?,
+    );
+    let signer_provider = WalletSignerProvider::new(
+        Arc::clone(&keys_manager),
+        onchain_wallet,
+        keys.channel_keys_id_hmac_key,
+        Arc::clone(&logger),
+    );
+
+    // Identify anything the manifest and the fixed key set do not explain
+    // BEFORE the bulk download: an unidentifiable key still aborts here, with
+    // nothing written and nothing downloaded in vain. Silent recovery runs this
+    // very function, in this very order.
+    let adopted = runtime.block_on(adopt_unexplained_monitors(
+        &*transport,
+        &listing,
+        &manifest_keys,
+        &keys_manager,
+        &signer_provider,
+        RESTORE_DOWNLOAD_BUDGET,
+        &logger,
+    ))?;
+
+    let mut plan = runtime.block_on(download_and_validate(
+        &transport,
+        manifest,
+        &keys_manager,
+        &signer_provider,
+        RESTORE_DOWNLOAD_BUDGET,
+    ))?;
+    // Adopted monitors join the restore set (and, through the plan, the local
+    // writes and the seeded `_monitor_keys` set).
+    let adopted_count = merge_adopted_monitors(&mut plan, adopted, &logger)?;
+    drop(signer_provider);
+    drop(scratch);
+    drop(keys); // WalletKeys::drop scrubs the derived key material.
+
+    // ---- Two-phase destructive write (everything above touched nothing) ----
+
+    // The node is stopped by contract (Node::restore holds the state lock and
+    // this function holds the data-dir lock); the step is emitted anyway for
+    // exact PWA copy parity.
+    progress(STEP_STOPPING_WALLET);
+    let marker = RestoreMarker {
+        mnemonic: mnemonic.to_string(),
+        started_at_ms: crate::util::now_ms(),
+    };
+    write_marker(&storage_dir, &marker).map_err(|e| RestoreError::LocalWriteFailed {
+        detail: format!("restore marker write failed: {e}"),
+    })?;
+    if crash_after == Some(CrashPoint::Marker) {
+        return Err(RestoreError::Interrupted);
+    }
+
+    progress(STEP_CLEARING_DATA);
+    clear_local_wallet_state(&storage_dir).map_err(|e| RestoreError::LocalWriteFailed {
+        detail: format!("clearing local state failed: {e}"),
+    })?;
+    if crash_after == Some(CrashPoint::Clear) {
+        return Err(RestoreError::Interrupted);
+    }
+
+    progress(STEP_WRITING_DATA);
+    write_mnemonic(&storage_dir, &mnemonic).map_err(|e| RestoreError::LocalWriteFailed {
+        detail: format!("mnemonic write failed: {e}"),
+    })?;
+    if crash_after == Some(CrashPoint::Mnemonic) {
+        return Err(RestoreError::Interrupted);
+    }
+
+    let kv_store = FilesystemStore::new(storage_dir.join(KV_STORE_SUBDIR));
+    let mut write_log = Vec::new();
+    write_plan_local(
+        &kv_store,
+        &plan,
+        &mut write_log,
+        crash_after == Some(CrashPoint::Manager),
+    )
+    .map_err(|e| RestoreError::LocalWriteFailed {
+        detail: format!("restored-data write failed: {e}"),
+    })?;
+    if crash_after == Some(CrashPoint::Manager) {
+        return Err(RestoreError::Interrupted);
+    }
+
+    remove_marker(&storage_dir).map_err(|e| RestoreError::LocalWriteFailed {
+        detail: format!("marker removal failed: {e}"),
+    })?;
+
+    // The restore is complete and durable from here on: the manifest backfill
+    // is a courtesy to the NEXT restore (so it needs no identification pass),
+    // and a failure must never turn a finished restore into a failed one.
+    //
+    // PUBLISHABLE, not the full set: a monitor whose stored key we could not
+    // confirm is recovered locally but must not be named in the manifest, or
+    // the courtesy would brick the next restore
+    // (`RestorePlan::publishable_monitor_keys`).
+    if adopted_count > 0 {
+        runtime.block_on(backfill_manifest(
+            &*transport,
+            &plan.publishable_monitor_keys(),
+            plan.manifest_version.unwrap_or(0),
+            &logger,
+        ));
+    }
+
+    log_info!(
+        logger,
+        "Restore complete: {} monitor(s) ({adopted_count} adopted from unlisted remote key(s)), \
+         channel_manager: {}, peers: {}",
+        plan.monitors.len(),
+        plan.cm.is_some(),
+        plan.peers.is_some()
+    );
+    progress(STEP_RESTARTING);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use crate::config::VssTransportOverride;
+    use crate::history::{PaymentDirection, PaymentStore};
+    use crate::node::{EventSink, LoggingEventSink, Node};
+    use crate::vss::known_peers::read_local_known_peers;
+    use crate::vss::test_support::MockTransport;
+
+    #[derive(Default)]
+    struct CapturingSink(Mutex<Vec<CoreEvent>>);
+
+    impl EventSink for CapturingSink {
+        fn emit(&self, event: CoreEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl CapturingSink {
+        fn steps(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    CoreEvent::RestoreProgress { step } => Some(step.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn offline_config(dir: &Path) -> Config {
+        let mut config = Config::new(dir.to_str().unwrap().to_string());
+        config.esplora_url = "http://127.0.0.1:1".to_string();
+        config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        config.vss_disabled = true;
+        config
+    }
+
+    fn vss_config(dir: &Path, transport: &Arc<MockTransport>) -> Config {
+        let mut config = offline_config(dir);
+        config.vss_disabled = false;
+        config.vss_transport_override = Some(VssTransportOverride(
+            Arc::clone(transport) as Arc<dyn VssTransport>
+        ));
+        config
+    }
+
+    /// A local-only wallet in `dir`; returns (node id, mnemonic words).
+    fn create_local_wallet(dir: &Path) -> (String, String) {
+        let node = Node::new(offline_config(dir));
+        node.start().expect("offline degraded start");
+        let node_id = node.node_id().unwrap().to_string();
+        node.stop().unwrap();
+        let mnemonic = fs::read_to_string(dir.join(MNEMONIC_FILE_NAME)).unwrap();
+        (node_id, mnemonic)
+    }
+
+    /// A wallet created WITH the mock transport, so its channel manager lands
+    /// on "VSS" (the migration/dual-write path). The wallet's own dir is
+    /// dropped: the backup lives in the returned transport.
+    fn seeded_backup() -> (Arc<MockTransport>, String, String) {
+        let transport = Arc::new(MockTransport::new());
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new(vss_config(dir.path(), &transport));
+        node.start().expect("fresh VSS-enabled start");
+        let node_id = node.node_id().unwrap().to_string();
+        node.stop().unwrap();
+        let mnemonic = fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap();
+        (transport, node_id, mnemonic)
+    }
+
+    fn kv_store(dir: &Path) -> FilesystemStore {
+        FilesystemStore::new(dir.join(KV_STORE_SUBDIR))
+    }
+
+    fn local_cm(dir: &Path) -> Result<Vec<u8>, lightning::io::Error> {
+        kv_store(dir).read(
+            CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+            CHANNEL_MANAGER_PERSISTENCE_KEY,
+        )
+    }
+
+    const PEER_PUBKEY: &str = "034066e29e402d9cf55af1ae1026cc5adf92eed1e0e421785442f53717ad1453b0";
+    const PEERS_JSON: &str = r#"{"034066e29e402d9cf55af1ae1026cc5adf92eed1e0e421785442f53717ad1453b0": {"host": "64.23.159.177", "port": 9735}}"#;
+
+    // ---------- real channel-monitor vectors ----------
+
+    /// Two REAL serialized monitors (see the fixture's own `_provenance`).
+    /// Nothing in this crate can mint a `ChannelMonitor` offline — a funded
+    /// channel is required — so without these the restore tests could only ever
+    /// assert that garbage is REJECTED, never that a genuine monitor is
+    /// accepted, adopted and written.
+    const MONITOR_VECTORS: &str = include_str!("../fixtures/channel_monitor_vectors.json");
+
+    /// One fixture monitor: its bytes and the two candidate key spellings of
+    /// its funding outpoint.
+    struct MonitorVector {
+        bytes: Vec<u8>,
+        /// `{raw-order txid hex}:{vout}` — the PWA wire format
+        /// (`outpointKey` = `bytesToHex(outpoint.get_txid())`,
+        /// `zinq/src/ldk/traits/persist.ts:17`).
+        raw_key: String,
+        /// `{display-order txid hex}:{vout}` — what an explorer shows, and the
+        /// spelling our key MUST NOT use.
+        display_key: String,
+    }
+
+    fn monitor_vectors() -> Vec<MonitorVector> {
+        let doc: serde_json::Value = serde_json::from_str(MONITOR_VECTORS).unwrap();
+        doc["monitors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let vout = entry["funding_vout"].as_u64().unwrap();
+                MonitorVector {
+                    bytes: hex_bytes(entry["monitor_hex"].as_str().unwrap()),
+                    raw_key: format!("{}:{vout}", entry["funding_txid_raw_hex"].as_str().unwrap()),
+                    display_key: format!(
+                        "{}:{vout}",
+                        entry["funding_txid_display_hex"].as_str().unwrap()
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The validation signer stack a restore builds from the ENTERED words,
+    /// over a throwaway store (the same construction as [`run_restore`]).
+    fn validation_stack(dir: &Path) -> (Arc<KeysManager>, Arc<WalletSignerProvider>) {
+        let keys = derive_wallet_keys(
+            &parse_mnemonic(crate::keys::tests::TEST_MNEMONIC).unwrap(),
+            bitcoin::Network::Bitcoin,
+        );
+        let logger = Arc::new(Logger);
+        let keys_manager = Arc::new(KeysManager::new(&keys.ldk_seed, 0, 0, false));
+        let wallet = Arc::new(
+            OnchainWallet::new(
+                &keys.descriptor_external,
+                &keys.descriptor_internal,
+                bitcoin::Network::Bitcoin,
+                Arc::new(FilesystemStore::new(dir.join(KV_STORE_SUBDIR))),
+                Arc::clone(&logger),
+            )
+            .unwrap(),
+        );
+        let provider = Arc::new(WalletSignerProvider::new(
+            Arc::clone(&keys_manager),
+            wallet,
+            keys.channel_keys_id_hmac_key,
+            logger,
+        ));
+        (keys_manager, provider)
+    }
+
+    /// Seeds `transport` with a PWA-SHAPED backup: the channel manager, a
+    /// `_monitor_keys` manifest declaring ONE monitor, that monitor, and a
+    /// SECOND real monitor blob no manifest mentions. Returns
+    /// `(listed, unlisted)` as `(vss key, bytes)` pairs.
+    ///
+    /// The PWA produces exactly this by design — `writeManifest(): void` is
+    /// never awaited (`zinq/src/ldk/traits/persist.ts:98`) and archiving a
+    /// channel deliberately orphans the monitor's VSS key (ibid. 370-376) — so
+    /// the same fixture drives BOTH entry points in the parity test below.
+    #[allow(clippy::type_complexity)]
+    fn seed_pwa_shaped_backup(transport: &MockTransport) -> ((String, Vec<u8>), (String, Vec<u8>)) {
+        let mut vectors = monitor_vectors();
+        let unlisted = vectors.pop().expect("fixture has two monitors");
+        let listed = vectors.pop().expect("fixture has two monitors");
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![listed.raw_key.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&listed.raw_key, &listed.bytes, 1);
+        transport.seed(&unlisted.raw_key, &unlisted.bytes, 1);
+        (
+            (listed.raw_key, listed.bytes),
+            (unlisted.raw_key, unlisted.bytes),
+        )
+    }
+
+    /// The same PWA-shaped backup as [`seed_pwa_shaped_backup`], except the
+    /// UNLISTED monitor blob is filed under a key its own funding outpoint does
+    /// NOT reproduce: the reversed (display-order) txid spelling — precisely the
+    /// cross-client key-derivation divergence
+    /// `derived_monitor_vss_keys_use_the_pwa_raw_txid_byte_order` guards our own
+    /// writes against, and the only shape in which adoption can learn a
+    /// plaintext key that names nothing remotely.
+    ///
+    /// The mock's `obfuscate` is the identity, so the plaintext seeded here IS
+    /// the stored key the listing reports, which is what lets the adoption path
+    /// observe the mismatch it would observe against a real server.
+    ///
+    /// Returns `(listed key, (derived key, stored key, unlisted bytes))`.
+    #[allow(clippy::type_complexity)]
+    fn seed_backup_with_a_divergently_stored_monitor(
+        transport: &MockTransport,
+    ) -> (String, (String, String, Vec<u8>)) {
+        let mut vectors = monitor_vectors();
+        let unlisted = vectors.pop().expect("fixture has two monitors");
+        let listed = vectors.pop().expect("fixture has two monitors");
+        assert_ne!(
+            unlisted.display_key, unlisted.raw_key,
+            "the fixture's two spellings must differ for this scenario to exist"
+        );
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![listed.raw_key.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&listed.raw_key, &listed.bytes, 1);
+        transport.seed(&unlisted.display_key, &unlisted.bytes, 1);
+        (
+            listed.raw_key,
+            (unlisted.raw_key, unlisted.display_key, unlisted.bytes),
+        )
+    }
+
+    /// Every `_monitor_keys` set the client actually ASKED the transport to
+    /// store, in attempt order. The manifest hazard is about what gets
+    /// PUBLISHED, so the assertions read the transport's received payloads
+    /// rather than an in-process accessor.
+    fn published_manifest_sets(transport: &MockTransport) -> Vec<BTreeSet<String>> {
+        transport
+            .put_payloads_for(MONITOR_MANIFEST_KEY)
+            .iter()
+            .map(|bytes| {
+                parse_monitor_manifest(bytes)
+                    .expect("every published manifest must be valid JSON")
+                    .into_iter()
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Runs U3's startup phases over `dir` exactly as `builder::build` does —
+    /// the SILENT-RECOVERY entry point, without booting a node afterwards (the
+    /// fixture monitors belong to channels no channel manager we can mint
+    /// offline knows about, so the boot itself is out of reach; the startup
+    /// state and the local writes are what these tests are about).
+    fn run_silent_recovery(
+        dir: &Path,
+        transport: &Arc<MockTransport>,
+    ) -> Result<crate::vss::startup::VssStartupState, BuildError> {
+        let (keys_manager, signer_provider) = validation_stack(dir);
+        let kv_store = Arc::new(FilesystemStore::new(dir.join(KV_STORE_SUBDIR)));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let event_sink: Arc<dyn EventSink> = Arc::new(LoggingEventSink::new());
+        crate::vss::startup::establish_vss_state(
+            Arc::clone(transport) as Arc<dyn VssTransport>,
+            &kv_store,
+            &keys_manager,
+            &signer_provider,
+            dir,
+            &event_sink,
+            &Arc::new(Logger),
+            &runtime,
+        )
+    }
+
+    /// Every local monitor blob in `dir`, keyed by its `MonitorName` local key.
+    fn local_monitor_blobs(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let store = kv_store(dir);
+        store
+            .list(
+                CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|key| {
+                let bytes = store
+                    .read(
+                        CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                        CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                        &key,
+                    )
+                    .unwrap();
+                (key, bytes)
+            })
+            .collect()
+    }
+
+    /// The `_monitor_keys` set a transport currently holds.
+    fn remote_manifest_keys(transport: &MockTransport) -> BTreeSet<String> {
+        let (bytes, _) = transport
+            .value(MONITOR_MANIFEST_KEY)
+            .expect("the manifest must exist");
+        parse_monitor_manifest(&bytes)
+            .expect("the manifest must be valid")
+            .into_iter()
+            .collect()
+    }
+
+    /// FIX B VECTOR (cross-client wire format, end to end): the VSS key we
+    /// derive for a REAL monitor must be `{funding txid RAW byte order}:{vout}`
+    /// — byte-identical to what the PWA writes
+    /// (`outpointKey` = `` `${bytesToHex(outpoint.get_txid())}:${index}` ``,
+    /// `zinq/src/ldk/traits/persist.ts:17-19`; LDK's `get_txid()` hands JS the
+    /// hash's raw internal bytes, and the PWA's separate `txidBytesToHex`
+    /// display-order helper is deliberately NOT used there).
+    ///
+    /// If this ever flips to the reversed display order, cross-client
+    /// dual-write silently breaks in a second way: after restoring a PWA
+    /// wallet our next monitor write would create a DUPLICATE remote blob
+    /// under a different key while the PWA's original went stale. The
+    /// companion unit vector lives in `vss::store`
+    /// (`monitor_vss_key_uses_raw_txid_byte_order`); this one pins the whole
+    /// path — deserialize a real monitor, ask it for its funding outpoint,
+    /// derive the key.
+    #[test]
+    fn derived_monitor_vss_keys_use_the_pwa_raw_txid_byte_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keys_manager, signer_provider) = validation_stack(dir.path());
+        for vector in monitor_vectors() {
+            let parsed = deserialize_monitor(&vector.bytes, &keys_manager, &signer_provider)
+                .expect("a real serialized monitor must deserialize under any seed's signer");
+            assert_eq!(
+                parsed.derived_vss_key, vector.raw_key,
+                "monitor VSS keys must use the funding txid's RAW byte order (PWA wire format)"
+            );
+            assert_ne!(
+                parsed.derived_vss_key, vector.display_key,
+                "the display (reversed) order would break cross-client dual-write"
+            );
+            assert!(crate::vss::store::is_valid_monitor_key(
+                &parsed.derived_vss_key
+            ));
+        }
+    }
+
+    /// The cross-client restore fix's recovery mechanism, over REAL serialized
+    /// monitors: `lightning` 0.2.4 has no accessor for a deserialized
+    /// `ChannelMonitor`'s `channel_keys_id`, so the signer provider records the
+    /// ids LDK asks it to derive. Deserializing genuine monitors must populate
+    /// that set, and the startup reveal must then leave the bdk wallet watching
+    /// each monitor's deterministic close destination — the reveal that was
+    /// missing, which is why a restored PWA wallet's on-chain balance came back
+    /// empty.
+    ///
+    /// (These fixtures' ids come from LDK's own functional-test harness and land
+    /// at destination indices 0 and 1; the HIGH-index case is pinned in
+    /// `signer::tests::startup_reveal_covers_a_high_destination_index`.)
+    #[test]
+    fn deserializing_real_monitors_records_their_destination_indexes_for_the_startup_reveal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (keys_manager, signer_provider) = validation_stack(dir.path());
+        assert_eq!(
+            signer_provider.derived_channel_count(),
+            0,
+            "nothing recorded before any monitor is read"
+        );
+
+        let vectors = monitor_vectors();
+        for vector in &vectors {
+            deserialize_monitor(&vector.bytes, &keys_manager, &signer_provider)
+                .expect("a real serialized monitor must deserialize");
+        }
+        assert_eq!(
+            signer_provider.derived_channel_count(),
+            vectors.len(),
+            "every deserialized monitor must have its channel_keys_id recorded"
+        );
+
+        let indexes = signer_provider.derived_destination_indexes();
+        assert_eq!(indexes.len(), vectors.len());
+        let max_index = signer_provider
+            .reveal_derived_destinations()
+            .expect("loaded monitors must produce a reveal");
+        assert_eq!(max_index, *indexes.iter().max().unwrap());
+        assert_eq!(
+            crate::wallet::test_support::derivation_index(
+                signer_provider.wallet(),
+                bdk_wallet::KeychainKind::External
+            ),
+            Some(max_index),
+            "the reveal must cover every loaded monitor's destination index"
+        );
+
+        // Each monitor's destination SPK is now one the next chain sync queries.
+        let watched = signer_provider.wallet().sync_request_spks();
+        for index in indexes {
+            assert!(
+                watched.contains(&signer_provider.wallet().peek_external_script(index)),
+                "destination index {index} must be watched after the startup reveal"
+            );
+        }
+    }
+
+    // ---------- scenario 1 (AE3 offline half) + progress copy ----------
+
+    /// Full explicit restore over an EXISTING different wallet: identity,
+    /// peers, and un-fencing all adopt the backup; the pre-restore payment
+    /// history is gone; progress steps match the PWA copy exactly, in order.
+    #[test]
+    fn restore_rebuilds_the_backed_up_wallet_and_emits_the_exact_pwa_steps() {
+        let (transport, backup_node_id, backup_mnemonic) = seeded_backup();
+        transport.seed(KNOWN_PEERS_VSS_KEY, PEERS_JSON.as_bytes(), 2);
+
+        // The victim dir holds a DIFFERENT wallet, a payment row, and a
+        // fenced flag (restore is the documented un-fence path).
+        let dir = tempfile::tempdir().unwrap();
+        let (old_node_id, old_mnemonic) = create_local_wallet(dir.path());
+        assert_ne!(old_mnemonic, backup_mnemonic);
+        let row_id = "aa".repeat(32);
+        PaymentStore::new(Arc::new(kv_store(dir.path())), Arc::new(Logger))
+            .record_pending(&row_id, PaymentDirection::Outbound, 1_000, 1)
+            .unwrap();
+        fs::write(dir.path().join(FENCED_FLAG_FILE_NAME), b"divergent").unwrap();
+
+        let sink = Arc::new(CapturingSink::default());
+        let node =
+            Node::with_event_sink(vss_config(dir.path(), &transport), Arc::clone(&sink) as _);
+        assert!(node.payment_detail(&row_id).is_some());
+
+        node.restore(&backup_mnemonic)
+            .expect("restore must succeed");
+
+        // The words were replaced, the marker cleared, the fence lifted.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            parse_mnemonic(&backup_mnemonic).unwrap().to_string()
+        );
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        assert!(!dir.path().join(FENCED_FLAG_FILE_NAME).exists());
+        // Pre-restore history is gone, in memory and on disk.
+        assert!(node.payment_detail(&row_id).is_none());
+        // Known peers were restored into the local mirror.
+        let peers = read_local_known_peers(&kv_store(dir.path()));
+        assert_eq!(peers.len(), 1);
+        assert!(peers.contains_key(PEER_PUBKEY));
+
+        // The node restarts with the RESTORED identity (AE3 offline half).
+        node.start().expect("post-restore start");
+        let restored_id = node.node_id().unwrap().to_string();
+        node.stop().unwrap();
+        assert_eq!(restored_id, backup_node_id);
+        assert_ne!(restored_id, old_node_id);
+
+        // Progress steps: the PWA's copy, exactly, in order. The listing held
+        // channel_manager + _known_peers → "2 item(s)".
+        assert_eq!(
+            sink.steps(),
+            vec![
+                "Deriving keys...",
+                "Checking backup server...",
+                "Downloading 2 item(s)...",
+                "Stopping wallet...",
+                "Clearing local data...",
+                "Writing restored data...",
+                "Restarting wallet...",
+            ]
+        );
+    }
+
+    // ---------- scenario 5: no backup ----------
+
+    /// Empty `listKeyVersions` → typed NoBackupFound; the current wallet is
+    /// completely untouched and no destructive step ever ran.
+    #[test]
+    fn restore_with_empty_namespace_is_no_backup_found_and_local_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node_id, mnemonic) = create_local_wallet(dir.path());
+        let cm_before = local_cm(dir.path()).unwrap();
+
+        let transport = Arc::new(MockTransport::new());
+        let sink = Arc::new(CapturingSink::default());
+        let node =
+            Node::with_event_sink(vss_config(dir.path(), &transport), Arc::clone(&sink) as _);
+        assert_eq!(
+            node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err(),
+            RestoreError::NoBackupFound
+        );
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            mnemonic,
+            "the original words must survive a no-backup restore attempt"
+        );
+        assert_eq!(local_cm(dir.path()).unwrap(), cm_before);
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        // The flow stopped at the probe: no destructive step was announced.
+        assert_eq!(
+            sink.steps(),
+            vec!["Deriving keys...", "Checking backup server..."]
+        );
+
+        // The original wallet still boots (offline, local-only).
+        let node = Node::new(offline_config(dir.path()));
+        node.start().unwrap();
+        assert_eq!(node.node_id().unwrap().to_string(), node_id);
+        node.stop().unwrap();
+    }
+
+    // ---------- scenario 4: manifest reconciliation ----------
+
+    /// The reported cross-client bug (R4/AE2): a PWA-shaped backup — the fixed
+    /// keys, a manifest listing ONE monitor, and a second monitor blob the
+    /// manifest never listed.
+    ///
+    /// The PWA produces exactly this by design: its manifest write is
+    /// fire-and-forget (`writeManifest(): void`, never awaited —
+    /// `zinq/src/ldk/traits/persist.ts:98`) and archiving a channel
+    /// deliberately orphans the monitor's VSS key ("orphaned VSS keys waste
+    /// storage but do not affect fund safety", ibid. 370-376). Aborting made
+    /// every PWA wallet that ever closed a channel permanently
+    /// un-restorable, so the unlisted monitor must be ADOPTED: BOTH monitors
+    /// land locally, and the manifest is backfilled so the next restore on
+    /// this seed reconciles with no identification pass at all.
+    #[test]
+    fn a_pwa_shaped_backup_adopts_the_unlisted_monitor_and_backfills_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        create_local_wallet(dir.path());
+        let vectors = monitor_vectors();
+        let (listed, unlisted) = (&vectors[0], &vectors[1]);
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![listed.raw_key.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&listed.raw_key, &listed.bytes, 1);
+        // The orphan: a real monitor blob no manifest mentions.
+        transport.seed(&unlisted.raw_key, &unlisted.bytes, 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        node.restore(crate::keys::tests::TEST_MNEMONIC)
+            .expect("a PWA backup with an unlisted monitor must restore");
+
+        // BOTH monitors are local, byte-for-byte — the adopted one included.
+        let store = kv_store(dir.path());
+        let local_keys = store
+            .list(
+                CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+            )
+            .unwrap();
+        assert_eq!(local_keys.len(), 2, "listed + adopted, got {local_keys:?}");
+        let written: BTreeSet<Vec<u8>> = local_keys
+            .iter()
+            .map(|key| {
+                store
+                    .read(
+                        CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                        CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                        key,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            written.contains(&unlisted.bytes),
+            "the ADOPTED monitor's bytes must be written locally"
+        );
+        assert!(written.contains(&listed.bytes));
+
+        // The manifest was backfilled to list both, at the next version.
+        let (manifest_bytes, manifest_version) = transport.value(MONITOR_MANIFEST_KEY).unwrap();
+        let backfilled: BTreeSet<String> = parse_monitor_manifest(&manifest_bytes)
+            .expect("the backfilled manifest must be valid")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            backfilled,
+            BTreeSet::from([listed.raw_key.clone(), unlisted.raw_key.clone()]),
+            "the backfilled manifest must explain every remote monitor key"
+        );
+        assert_eq!(manifest_version, 2, "backfilled at the known version + 1");
+
+        // Sanity: the same listing now reconciles STRICTLY, which is the whole
+        // point of the backfill.
+        let listing = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(transport.list_key_versions())
+            .unwrap();
+        let manifest_keys: Vec<String> = backfilled.into_iter().collect();
+        reconcile_backup_keys(&listing, &manifest_keys, &*transport)
+            .expect("after the backfill the backup is self-describing");
+
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            parse_mnemonic(crate::keys::tests::TEST_MNEMONIC)
+                .unwrap()
+                .to_string()
+        );
+    }
+
+    /// An unexplained key whose value does not DECRYPT with this seed's
+    /// encryption key is genuinely foreign (or corrupt) data — the store is not
+    /// ours to interpret, so the restore still aborts, and the diagnostic says
+    /// the key was rejected rather than verified.
+    #[test]
+    fn an_undecryptable_unexplained_key_still_aborts_and_reports_it_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mnemonic) = create_local_wallet(dir.path());
+        let cm_before = local_cm(dir.path()).unwrap();
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        let foreign = format!("{}:0", "ab".repeat(32));
+        transport.seed_undecryptable(&foreign, b"ciphertext from another key", 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        let err = node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err();
+        let detail = match &err {
+            RestoreError::BackupInconsistent { detail } => detail.clone(),
+            other => panic!("expected BackupInconsistent, got {other:?}"),
+        };
+        assert!(
+            detail.contains("0 decrypted and deserialized"),
+            "the diagnostic must report how many keys were verified: {detail}"
+        );
+        assert!(
+            detail.contains("1 could not be identified"),
+            "the diagnostic must report the rejected count: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("Unidentifiable obfuscated key(s): {foreign}")),
+            "the report must name the key it could not identify: {detail}"
+        );
+
+        // Nothing was touched.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            mnemonic
+        );
+        assert_eq!(local_cm(dir.path()).unwrap(), cm_before);
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+    }
+
+    /// One adoptable orphan does not buy amnesty for the other: a real
+    /// unlisted monitor ALONGSIDE an unexplained key that decrypts but is not a
+    /// monitor still aborts, and the diagnostic reports both counts.
+    #[test]
+    fn an_unexplained_non_monitor_aborts_even_next_to_an_adoptable_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mnemonic) = create_local_wallet(dir.path());
+        let vectors = monitor_vectors();
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(&vectors[0].raw_key, &vectors[0].bytes, 1);
+        let junk = format!("{}:7", "ab".repeat(32));
+        transport.seed(&junk, b"decrypts fine, not a channel monitor", 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        let err = node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err();
+        let detail = match &err {
+            RestoreError::BackupInconsistent { detail } => detail.clone(),
+            other => panic!("expected BackupInconsistent, got {other:?}"),
+        };
+        assert!(
+            detail.contains("1 decrypted and deserialized") && detail.contains("1 could not be"),
+            "the diagnostic must separate verified monitors from rejects: {detail}"
+        );
+        assert!(
+            detail.contains(&junk),
+            "the report names the offender, not the adoptable orphan: {detail}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            mnemonic
+        );
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+    }
+
+    /// A remote monitor-shaped key that no manifest explains AND that is not a
+    /// channel monitor (the identification pass rejects it) → typed
+    /// BackupInconsistent, aborted before ANY write (no marker, words
+    /// intact, store intact).
+    #[test]
+    fn unexplained_remote_key_aborts_with_backup_inconsistent_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mnemonic) = create_local_wallet(dir.path());
+        let cm_before = local_cm(dir.path()).unwrap();
+
+        // Backup with a CM and a rogue monitor key but NO manifest at all.
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        let rogue = format!("{}:0", "ab".repeat(32));
+        transport.seed(&rogue, b"orphan monitor bytes", 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        let err = node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err();
+        assert!(
+            matches!(err, RestoreError::BackupInconsistent { .. }),
+            "expected BackupInconsistent, got {err:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            mnemonic
+        );
+        assert_eq!(local_cm(dir.path()).unwrap(), cm_before);
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+    }
+
+    /// Same with a manifest present: a monitor key OUTSIDE the manifest is
+    /// unexplained even though other monitor keys are listed, and here neither
+    /// blob is a real monitor, so nothing can be adopted.
+    #[test]
+    fn monitor_key_absent_from_manifest_aborts_with_backup_inconsistent() {
+        let dir = tempfile::tempdir().unwrap();
+        create_local_wallet(dir.path());
+
+        let listed = format!("{}:0", "cd".repeat(32));
+        let unlisted = format!("{}:1", "ef".repeat(32));
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![listed.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&listed, b"listed monitor bytes", 1);
+        transport.seed(&unlisted, b"unlisted monitor bytes", 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        let err = node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err();
+        assert!(
+            matches!(err, RestoreError::BackupInconsistent { .. }),
+            "expected BackupInconsistent, got {err:?}"
+        );
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+    }
+
+    /// The fixed key set (CM, manifest, peers, close records, recovery
+    /// state) is always explained — a backup containing all of them plus
+    /// manifest-listed monitors reconciles cleanly.
+    #[test]
+    fn reconciliation_accepts_the_fixed_key_set_and_manifest_entries() {
+        let transport = MockTransport::new();
+        let monitor_key = format!("{}:0", "ab".repeat(32));
+        // Driven off the shared list, so a key added there without teaching
+        // reconcile about it can never pass unnoticed.
+        let listing: Vec<(String, i64)> = FIXED_REMOTE_KEYS
+            .iter()
+            .copied()
+            .chain(std::iter::once(monitor_key.as_str()))
+            .map(|key| (key.to_string(), 1))
+            .collect();
+        reconcile_backup_keys(&listing, std::slice::from_ref(&monitor_key), &transport)
+            .expect("every key is explained");
+
+        let mut with_rogue = listing.clone();
+        with_rogue.push(("something_else".to_string(), 1));
+        assert!(matches!(
+            reconcile_backup_keys(&with_rogue, std::slice::from_ref(&monitor_key), &transport),
+            Err(RestoreError::BackupInconsistent { .. })
+        ));
+    }
+
+    /// A bare hash is not a bug report: `BackupInconsistent` must name what
+    /// was actually COMPARED — the listing size, how much of it the manifest
+    /// and the expected keys each accounted for, and which expected plaintext
+    /// keys were present versus absent — so a user's screenshot is
+    /// triageable. It must stay leak-free: obfuscated keys, plaintext KEY
+    /// NAMES and counts only, never a value.
+    #[test]
+    fn backup_inconsistent_names_what_was_compared_without_leaking_values() {
+        let transport = MockTransport::new();
+        let monitor_key = format!("{}:0", "ab".repeat(32));
+        let orphan_a = format!("{}:0", "cd".repeat(32));
+        let orphan_b = format!("{}:1", "cd".repeat(32));
+        let orphan_c = format!("{}:2", "cd".repeat(32));
+        let orphan_d = format!("{}:3", "cd".repeat(32));
+        // A partially-populated backup: CM + manifest + one listed monitor,
+        // and four monitor blobs the manifest never declared.
+        let listing: Vec<(String, i64)> = [
+            CHANNEL_MANAGER_VSS_KEY,
+            MONITOR_MANIFEST_KEY,
+            monitor_key.as_str(),
+            orphan_a.as_str(),
+            orphan_b.as_str(),
+            orphan_c.as_str(),
+            orphan_d.as_str(),
+        ]
+        .iter()
+        .map(|key| (key.to_string(), 1))
+        .collect();
+
+        let detail =
+            match reconcile_backup_keys(&listing, std::slice::from_ref(&monitor_key), &transport) {
+                Err(RestoreError::BackupInconsistent { detail }) => detail,
+                other => panic!("expected BackupInconsistent, got {other:?}"),
+            };
+
+        // The comparison, in numbers.
+        assert!(detail.contains("4 of the 7 key(s)"), "{detail}");
+        assert!(detail.contains("declares 1 monitor key(s)"), "{detail}");
+        assert!(detail.contains("accounts for 1 of the listing"), "{detail}");
+        // Which expected keys the server actually had, by plaintext name.
+        assert!(
+            detail.contains("found: [channel_manager, _monitor_keys]"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("absent: [_known_peers, close_records, force_close_recovery]"),
+            "{detail}"
+        );
+        // The offenders, capped, with the remainder counted.
+        assert!(detail.contains(&orphan_a), "{detail}");
+        assert!(detail.contains("(+1 more)"), "{detail}");
+        assert!(
+            !detail.contains(&orphan_d),
+            "the listing is truncated, not dumped: {detail}"
+        );
+    }
+
+    // ---------- silent recovery: the SAME reconciliation, both doors ----------
+
+    /// The fund-safety asymmetry this suite closes: `vss::startup`'s silent
+    /// recovery used to go straight from the manifest to the downloads and
+    /// never reconcile the remote listing, so a PWA-shaped backup's unlisted
+    /// monitor was SILENTLY OMITTED on that path while the explicit Restore
+    /// screen adopted it. Because the PWA's manifest write is fire-and-forget
+    /// (`zinq/src/ldk/traits/persist.ts:98`), an unlisted monitor is NOT
+    /// necessarily an archived one — a manifest write that never landed leaves a
+    /// LIVE channel's monitor unlisted, and starting a node without it risks
+    /// that channel's funds.
+    ///
+    /// Both halves of the fix are asserted here: the orphan is verified,
+    /// adopted and WRITTEN LOCALLY, and it appears in the returned
+    /// `monitor_keys` — the manifest-gating input `VssBackedStore` is seeded
+    /// with, so an adopted monitor on disk can never be missing from the
+    /// manifest set the next new-channel completion gates on.
+    #[test]
+    fn silent_recovery_adopts_an_unlisted_monitor_into_the_writes_and_the_monitor_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let ((listed_key, listed_bytes), (unlisted_key, unlisted_bytes)) =
+            seed_pwa_shaped_backup(&transport);
+
+        let state = run_silent_recovery(dir.path(), &transport)
+            .expect("a PWA backup with an unlisted monitor must recover silently");
+
+        assert!(state.recovered, "the recovery branch ran");
+        assert_eq!(
+            state.monitor_keys,
+            BTreeSet::from([listed_key.clone(), unlisted_key.clone()]),
+            "the ADOPTED monitor must be in the manifest set the store is seeded with"
+        );
+        // ... and its version must be in the version cache seeds, so the next
+        // write of that monitor puts at the real server version.
+        let versions = state.versions;
+        assert_eq!(versions.get(&unlisted_key), Some(&1));
+        assert_eq!(versions.get(&listed_key), Some(&1));
+
+        // BOTH monitors are on disk, byte-for-byte.
+        let written: BTreeSet<Vec<u8>> = local_monitor_blobs(dir.path()).into_values().collect();
+        assert_eq!(written.len(), 2, "listed + adopted");
+        assert!(
+            written.contains(&unlisted_bytes),
+            "the ADOPTED monitor's bytes must be written locally"
+        );
+        assert!(written.contains(&listed_bytes));
+
+        // The manifest was backfilled, exactly as the explicit path does, so the
+        // NEXT start reconciles with no identification pass at all.
+        assert_eq!(
+            remote_manifest_keys(&transport),
+            BTreeSet::from([listed_key, unlisted_key])
+        );
+        // Reconciliation reused the probe result: no second listing.
+        assert_eq!(
+            transport.list_call_count(),
+            1,
+            "the startup probe is the ONLY listKeyVersions call"
+        );
+    }
+
+    /// The failure semantics: an unexplained remote key that decrypts but is
+    /// NOT a channel monitor makes silent recovery REFUSE TO START
+    /// ([`BuildError::VssRecoveryFailed`]) — the silent path's equivalent of the
+    /// explicit path's `BackupInconsistent`, and its existing documented stance.
+    /// Skipping the key and starting anyway is the outcome this branch exists to
+    /// forbid: with the reconciliation missing, this exact backup used to write
+    /// its garbage channel manager locally, discard it as a stale manager (zero
+    /// monitors), create a FRESH one, and dual-write that over the backup.
+    ///
+    /// Reconciliation runs before the bulk download, hence before any local
+    /// write, so the rollback has nothing to undo — the strongest form of the
+    /// property: nothing local, nothing remote, nothing fresh.
+    #[test]
+    fn silent_recovery_refuses_to_start_on_an_unidentifiable_unexplained_key() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(MNEMONIC_FILE_NAME),
+            parse_mnemonic(crate::keys::tests::TEST_MNEMONIC)
+                .unwrap()
+                .to_string(),
+        )
+        .unwrap();
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(
+            CHANNEL_MANAGER_VSS_KEY,
+            b"remote-cm-bytes-32-or-more.......",
+            1,
+        );
+        let junk = format!("{}:7", "ab".repeat(32));
+        transport.seed(&junk, b"decrypts fine, not a channel monitor", 1);
+        let before = transport.snapshot();
+
+        // Through the real builder: this is a plain start, not a restore.
+        let node = Node::new(vss_config(dir.path(), &transport));
+        assert_eq!(
+            node.start().unwrap_err(),
+            BuildError::VssRecoveryFailed,
+            "an unidentifiable remote key must refuse the start, never be skipped"
+        );
+
+        // Nothing fresh was written over the backup, locally or remotely.
+        assert_eq!(transport.put_attempt_count(), 0, "no VSS write issued");
+        assert!(
+            transport.put_many_calls().is_empty(),
+            "no batch write issued"
+        );
+        assert_eq!(transport.snapshot(), before, "remote state unchanged");
+        assert!(
+            local_cm(dir.path()).is_err(),
+            "no channel manager may survive the refused start"
+        );
+        assert!(local_monitor_blobs(dir.path()).is_empty());
+    }
+
+    /// The no-regression half: when the manifest explains every remote key the
+    /// reconciliation is PURE (the diff is computed client-side from obfuscated
+    /// key names), so silent recovery behaves byte-identically to before —
+    /// exactly the four fetches it always issued, one listing, and no manifest
+    /// backfill.
+    #[test]
+    fn silent_recovery_over_a_self_describing_backup_issues_no_extra_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let vectors = monitor_vectors();
+        let monitor = &vectors[0];
+
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![monitor.raw_key.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&monitor.raw_key, &monitor.bytes, 1);
+        transport.seed(KNOWN_PEERS_VSS_KEY, PEERS_JSON.as_bytes(), 1);
+
+        let state = run_silent_recovery(dir.path(), &transport).expect("silent recovery");
+
+        assert_eq!(
+            state.monitor_keys,
+            BTreeSet::from([monitor.raw_key.clone()])
+        );
+        assert_eq!(
+            transport.get_call_count(),
+            4,
+            "manifest + channel_manager + one monitor + known peers, and nothing else"
+        );
+        assert_eq!(transport.list_call_count(), 1, "only the startup probe");
+        assert_eq!(
+            transport.put_attempt_count(),
+            0,
+            "a self-describing backup needs no manifest backfill"
+        );
+    }
+
+    /// THE anti-divergence regression: given the SAME backup, the explicit
+    /// Restore screen and silent recovery must adopt the SAME monitor set.
+    /// Which door the user walks through cannot decide whether a monitor —
+    /// possibly a live channel's — is recovered, which is precisely how the two
+    /// paths came apart the first time.
+    #[test]
+    fn both_entry_points_adopt_the_same_monitor_set_from_the_same_backup() {
+        // Two identically-seeded backups (one per entry point, so neither
+        // path's manifest backfill can influence the other).
+        let explicit_transport = Arc::new(MockTransport::new());
+        let (explicit_listed, explicit_unlisted) = seed_pwa_shaped_backup(&explicit_transport);
+        let silent_transport = Arc::new(MockTransport::new());
+        let (silent_listed, silent_unlisted) = seed_pwa_shaped_backup(&silent_transport);
+        assert_eq!(explicit_transport.snapshot(), silent_transport.snapshot());
+        assert_eq!(explicit_listed.0, silent_listed.0);
+        assert_eq!(explicit_unlisted.0, silent_unlisted.0);
+
+        let explicit_dir = tempfile::tempdir().unwrap();
+        run_restore(
+            &vss_config(explicit_dir.path(), &explicit_transport),
+            crate::keys::tests::TEST_MNEMONIC,
+            &LoggingEventSink::new(),
+            None,
+        )
+        .expect("explicit restore");
+
+        let silent_dir = tempfile::tempdir().unwrap();
+        let state = run_silent_recovery(silent_dir.path(), &silent_transport)
+            .expect("silent recovery over the same backup");
+
+        // Same monitors on disk, byte-for-byte and under the same local keys.
+        let explicit_blobs = local_monitor_blobs(explicit_dir.path());
+        assert_eq!(explicit_blobs.len(), 2, "the fixture has two monitors");
+        assert_eq!(
+            explicit_blobs,
+            local_monitor_blobs(silent_dir.path()),
+            "the two entry points must write the same monitor set"
+        );
+        // Same adoption reflected remotely, and silent recovery's in-memory
+        // manifest set agrees with what both paths backfilled.
+        assert_eq!(
+            remote_manifest_keys(&explicit_transport),
+            remote_manifest_keys(&silent_transport),
+            "both paths backfill the same manifest"
+        );
+        assert_eq!(
+            state.monitor_keys,
+            remote_manifest_keys(&silent_transport),
+            "the seeded manifest set matches the backfilled manifest"
+        );
+    }
+
+    // ---------- adoption vs. PUBLICATION (R4 fund recovery) ----------
+
+    /// The fund-recovery hazard in adoption's own courtesy write: an adopted
+    /// monitor whose stored key its funding outpoint does NOT reproduce must be
+    /// recovered locally and tracked in the manifest GATE, yet must never be
+    /// PUBLISHED into the remote `_monitor_keys` manifest.
+    ///
+    /// Publishing it would name a key no blob exists under, and
+    /// `download_and_validate` treats manifest-listed-but-missing as a hard
+    /// `BackupInconsistent` (correctly — a missing monitor may belong to a live
+    /// channel). So the courtesy write would convert a RECOVERABLE backup into a
+    /// permanently failing restore, and on this startup door into a permanent
+    /// `BuildError::VssRecoveryFailed`, over a monitor that in fact recovered
+    /// fine. The manifest holds PLAINTEXT keys while the stored key is a one-way
+    /// HMAC, so publishing the key the blob really lives under is impossible;
+    /// publishing nothing for it is the only correct option, and the funds are
+    /// safe either way because the local write is what recovers them.
+    #[test]
+    fn an_adopted_monitor_stored_under_a_divergent_key_is_recovered_but_never_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let (listed_key, (derived_key, stored_key, unlisted_bytes)) =
+            seed_backup_with_a_divergently_stored_monitor(&transport);
+
+        let state = run_silent_recovery(dir.path(), &transport)
+            .expect("a divergently-stored orphan must still be adopted, never refuse the start");
+
+        // Recovered: the blob is on disk byte-for-byte — the write that saves
+        // the funds happens exactly as before.
+        let written: BTreeSet<Vec<u8>> = local_monitor_blobs(dir.path()).into_values().collect();
+        assert_eq!(written.len(), 2, "listed + adopted");
+        assert!(
+            written.contains(&unlisted_bytes),
+            "the divergently-stored monitor must still be written locally"
+        );
+
+        // GATE: total, adopted monitor included. Narrowing this would let the
+        // store's next manifest write drop a key another device tracks.
+        assert_eq!(
+            state.monitor_keys,
+            BTreeSet::from([listed_key.clone(), derived_key.clone()]),
+            "the adopted monitor must stay in the manifest set the store is seeded with"
+        );
+        assert_eq!(
+            state.versions.get(&derived_key),
+            Some(&1),
+            "its server version is still seeded"
+        );
+
+        // PUBLISHED: only the verified key — asserted against what the transport
+        // actually received, not against the accessor.
+        assert_eq!(
+            published_manifest_sets(&transport),
+            vec![BTreeSet::from([listed_key.clone()])],
+            "the unverified key must be absent from every manifest payload published"
+        );
+        assert_eq!(
+            remote_manifest_keys(&transport),
+            BTreeSet::from([listed_key])
+        );
+        // Nothing was moved or rewritten remotely: the blob still sits under
+        // the key the other client filed it under.
+        assert_eq!(transport.value(&stored_key).unwrap().0, unlisted_bytes);
+        assert!(
+            transport.value(&derived_key).is_none(),
+            "we cannot invent the blob under our own key either"
+        );
+    }
+
+    /// The no-regression half: an adopted key that DOES reproduce its stored key
+    /// is verified, so the backfill publishes it exactly as before. Asserted on
+    /// the transport's received manifest payload, so the publishable/gate split
+    /// cannot silently start withholding the ordinary case.
+    #[test]
+    fn a_verified_adopted_key_is_still_published_in_the_backfilled_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let ((listed_key, _), (unlisted_key, _)) = seed_pwa_shaped_backup(&transport);
+
+        let state = run_silent_recovery(dir.path(), &transport).expect("silent recovery");
+
+        let both = BTreeSet::from([listed_key, unlisted_key]);
+        assert_eq!(
+            published_manifest_sets(&transport),
+            vec![both.clone()],
+            "a verified adopted key MUST be published — that is what makes the next \
+             reconciliation need no identification pass"
+        );
+        assert_eq!(state.monitor_keys, both, "gate and publication agree here");
+    }
+
+    /// THE regression this split prevents, end to end: a divergent adoption must
+    /// leave the backup RESTORABLE.
+    ///
+    /// Before the fix the backfill published the re-derived key, so the remote
+    /// manifest named a monitor that did not exist: every later restore over
+    /// that state died in `download_and_validate` with `BackupInconsistent`
+    /// ("listed in manifest but missing from VSS"), and every later start on the
+    /// silent door died with `BuildError::VssRecoveryFailed` — a wallet whose
+    /// funds were fully recoverable, bricked by its own courtesy write. Both
+    /// doors are checked here, over the state the FIRST restore left behind.
+    #[test]
+    fn a_divergent_adoption_leaves_the_backup_restorable_on_both_doors() {
+        let transport = Arc::new(MockTransport::new());
+        let (listed_key, (derived_key, _stored_key, _)) =
+            seed_backup_with_a_divergently_stored_monitor(&transport);
+
+        let first = tempfile::tempdir().unwrap();
+        run_restore(
+            &vss_config(first.path(), &transport),
+            crate::keys::tests::TEST_MNEMONIC,
+            &LoggingEventSink::new(),
+            None,
+        )
+        .expect("the first restore adopts the divergently-stored monitor");
+        let recovered = local_monitor_blobs(first.path());
+        assert_eq!(recovered.len(), 2, "listed + adopted");
+        assert!(
+            !published_manifest_sets(&transport)
+                .iter()
+                .any(|set| set.contains(&derived_key)),
+            "no manifest payload may ever name the unverifiable key"
+        );
+
+        // Door 1 — explicit restore over the state the first restore left.
+        let second = tempfile::tempdir().unwrap();
+        run_restore(
+            &vss_config(second.path(), &transport),
+            crate::keys::tests::TEST_MNEMONIC,
+            &LoggingEventSink::new(),
+            None,
+        )
+        .expect("a restore after the divergent adoption must NOT be BackupInconsistent");
+        assert_eq!(
+            local_monitor_blobs(second.path()),
+            recovered,
+            "the second restore recovers the same monitor set, adopted one included"
+        );
+
+        // Door 2 — silent recovery over that same state must boot, not refuse.
+        let third = tempfile::tempdir().unwrap();
+        let state = run_silent_recovery(third.path(), &transport)
+            .expect("a start after the divergent adoption must NOT be VssRecoveryFailed");
+        assert!(state.recovered);
+        assert_eq!(local_monitor_blobs(third.path()), recovered);
+        assert_eq!(
+            state.monitor_keys,
+            BTreeSet::from([listed_key, derived_key]),
+            "and the gate still covers the adopted monitor on every later start"
+        );
+    }
+
+    // ---------- scenario 2: rollback / original intact ----------
+
+    /// A corrupt monitor blob in the set fails validation BEFORE any local
+    /// write: typed error, no partial writes, the ORIGINAL wallet (words +
+    /// manager) still loads.
+    #[test]
+    fn corrupt_monitor_blob_leaves_the_original_wallet_fully_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node_id, mnemonic) = create_local_wallet(dir.path());
+        let cm_before = local_cm(dir.path()).unwrap();
+
+        let monitor_key = format!("{}:0", "cd".repeat(32));
+        let transport = Arc::new(MockTransport::new());
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![monitor_key.clone()]).unwrap(),
+            1,
+        );
+        transport.seed(&monitor_key, b"not a channel monitor", 1);
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        let err = node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err();
+        assert!(
+            matches!(err, RestoreError::ValidationFailed { .. }),
+            "expected ValidationFailed, got {err:?}"
+        );
+
+        // Nothing was cleared or written: words, manager, and marker state
+        // are exactly as before.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            mnemonic
+        );
+        assert_eq!(local_cm(dir.path()).unwrap(), cm_before);
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        assert!(kv_store(dir.path())
+            .list(
+                CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+            )
+            .unwrap_or_default()
+            .is_empty());
+
+        // The pre-restore wallet still boots with its identity.
+        let node = Node::new(offline_config(dir.path()));
+        node.start().unwrap();
+        assert_eq!(node.node_id().unwrap().to_string(), node_id);
+        node.stop().unwrap();
+    }
+
+    // ---------- scenario 6: ordering + refused while running ----------
+
+    /// CM is written strictly BEFORE any monitor, monitors before peers
+    /// (write-log assertion), and a mid-write failure rolls back exactly
+    /// what was written.
+    #[test]
+    fn write_plan_local_orders_manager_before_monitors_before_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = kv_store(dir.path());
+        let plan = RestorePlan {
+            manifest_version: Some(1),
+            cm: Some((vec![1u8; 40], 3)),
+            monitors: vec![
+                ValidatedMonitor {
+                    vss_key: format!("{}:0", "aa".repeat(32)),
+                    local_key: format!("{}_0", "aa".repeat(32)),
+                    bytes: vec![2u8; 16],
+                    version: 4,
+                    key_verified: true,
+                },
+                ValidatedMonitor {
+                    vss_key: format!("{}:1", "bb".repeat(32)),
+                    local_key: format!("{}_1", "bb".repeat(32)),
+                    bytes: vec![3u8; 16],
+                    version: 5,
+                    key_verified: true,
+                },
+            ],
+            peers: Some((parse_known_peers(PEERS_JSON.as_bytes()).unwrap(), 2)),
+        };
+
+        let mut log = Vec::new();
+        write_plan_local(&store, &plan, &mut log, false).unwrap();
+        assert_eq!(
+            log,
+            vec![
+                LocalWrite::Manager,
+                LocalWrite::Monitor(format!("{}_0", "aa".repeat(32))),
+                LocalWrite::Monitor(format!("{}_1", "bb".repeat(32))),
+                LocalWrite::Peers,
+            ],
+            "F3 ordering: CM before monitors, monitors before peers"
+        );
+
+        // Rollback removes exactly the logged writes.
+        rollback_local_writes(&store, &log);
+        assert!(local_cm(dir.path()).is_err());
+        assert!(store
+            .list(
+                CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+            )
+            .unwrap_or_default()
+            .is_empty());
+        assert!(read_local_known_peers(&store).is_empty());
+
+        // The versions/monitor-keys the plan seeds match its contents.
+        let versions = plan.versions();
+        assert_eq!(versions.get(CHANNEL_MANAGER_VSS_KEY), Some(&3));
+        assert_eq!(versions.get(MONITOR_MANIFEST_KEY), Some(&1));
+        assert_eq!(versions.get(KNOWN_PEERS_VSS_KEY), Some(&2));
+        assert_eq!(versions.len(), 5);
+        assert_eq!(plan.monitor_keys().len(), 2);
+    }
+
+    /// Restore is refused while the node runs — typed error, nothing touched.
+    #[test]
+    fn restore_is_refused_while_the_node_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(MockTransport::new());
+        let node = Node::new(vss_config(dir.path(), &transport));
+        node.start().expect("fresh VSS-enabled start");
+        assert_eq!(
+            node.restore(crate::keys::tests::TEST_MNEMONIC).unwrap_err(),
+            RestoreError::NodeRunning
+        );
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        node.stop().unwrap();
+    }
+
+    // ---------- scenario 3: crash-prefix matrix ----------
+
+    /// Runs a restore of the seeded backup over an existing different wallet
+    /// and kills it at `crash`. Then asserts the invariant matrix: the marker
+    /// survives the crash, the next start RESUMES recovery (never boots a
+    /// partial set, never generates fresh words), and the node comes back
+    /// with the backup's identity and words.
+    fn crash_prefix_case(crash: CrashPoint) {
+        let (transport, backup_node_id, backup_mnemonic) = seeded_backup();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, old_mnemonic) = create_local_wallet(dir.path());
+
+        let config = vss_config(dir.path(), &transport);
+        let sink = LoggingEventSink::new();
+        assert_eq!(
+            run_restore(&config, &backup_mnemonic, &sink, Some(crash)).unwrap_err(),
+            RestoreError::Interrupted
+        );
+        assert!(
+            dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists(),
+            "the marker must be durable before the crash point {crash:?}"
+        );
+        if crash == CrashPoint::Marker {
+            // The clear never ran: the OLD words are still on disk; the
+            // marker's context must still win on resume.
+            assert_eq!(
+                fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+                old_mnemonic
+            );
+        }
+
+        // Resume: a plain start completes the restore from the marker.
+        let node = Node::new(config);
+        node.start()
+            .unwrap_or_else(|e| panic!("start must resume the restore after {crash:?}: {e}"));
+        let node_id = node.node_id().unwrap().to_string();
+        node.stop().unwrap();
+
+        assert_eq!(
+            node_id, backup_node_id,
+            "resume after {crash:?} must yield the backup's identity"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(MNEMONIC_FILE_NAME)).unwrap(),
+            parse_mnemonic(&backup_mnemonic).unwrap().to_string(),
+            "resume after {crash:?} must adopt the marker's words, never fresh ones"
+        );
+        assert!(
+            !dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists(),
+            "the marker clears once the resumed recovery is durable"
+        );
+    }
+
+    #[test]
+    fn crash_after_marker_write_resumes_the_restore() {
+        crash_prefix_case(CrashPoint::Marker);
+    }
+
+    #[test]
+    fn crash_after_clear_resumes_the_restore() {
+        crash_prefix_case(CrashPoint::Clear);
+    }
+
+    #[test]
+    fn crash_after_mnemonic_write_resumes_the_restore() {
+        crash_prefix_case(CrashPoint::Mnemonic);
+    }
+
+    #[test]
+    fn crash_after_manager_write_resumes_the_restore() {
+        crash_prefix_case(CrashPoint::Manager);
+    }
+
+    /// The mid-monitors crash prefix, state-constructed: marker + target
+    /// mnemonic + a PARTIAL local set (CM plus a half-written garbage
+    /// monitor). The node must never boot against the partial set — startup
+    /// voids it and re-runs recovery.
+    #[test]
+    fn crash_mid_monitors_never_boots_the_partial_set_and_resumes() {
+        let (transport, backup_node_id, backup_mnemonic) = seeded_backup();
+        let dir = tempfile::tempdir().unwrap();
+        let normalized = parse_mnemonic(&backup_mnemonic).unwrap().to_string();
+        write_marker(
+            dir.path(),
+            &RestoreMarker {
+                mnemonic: normalized.clone(),
+                started_at_ms: 1,
+            },
+        )
+        .unwrap();
+        fs::write(dir.path().join(MNEMONIC_FILE_NAME), &normalized).unwrap();
+        let store = kv_store(dir.path());
+        let (cm_bytes, _) = transport.value(CHANNEL_MANAGER_VSS_KEY).unwrap();
+        store
+            .write(
+                CHANNEL_MANAGER_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
+                CHANNEL_MANAGER_PERSISTENCE_KEY,
+                cm_bytes,
+            )
+            .unwrap();
+        store
+            .write(
+                CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                &format!("{}_0", "ab".repeat(32)),
+                b"half-written garbage monitor".to_vec(),
+            )
+            .unwrap();
+
+        let node = Node::new(vss_config(dir.path(), &transport));
+        node.start()
+            .expect("startup must void the partial set and resume recovery");
+        assert_eq!(node.node_id().unwrap().to_string(), backup_node_id);
+        node.stop().unwrap();
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        assert!(
+            store
+                .list(
+                    CHANNEL_MONITOR_PERSISTENCE_PRIMARY_NAMESPACE,
+                    CHANNEL_MONITOR_PERSISTENCE_SECONDARY_NAMESPACE,
+                )
+                .unwrap_or_default()
+                .is_empty(),
+            "the garbage partial monitor must not survive the resumed recovery"
+        );
+    }
+
+    // ---------- marker + misc units ----------
+
+    #[test]
+    fn marker_round_trips_and_tolerates_legacy_void_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_marker(dir.path()).is_none(), "absent marker");
+
+        // Legacy/void marker (U3 wrote empty markers in tests): no context.
+        fs::write(dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME), b"").unwrap();
+        assert!(read_marker(dir.path()).is_none());
+
+        let marker = RestoreMarker {
+            mnemonic: crate::keys::tests::TEST_MNEMONIC.to_string(),
+            started_at_ms: 42,
+        };
+        write_marker(dir.path(), &marker).unwrap();
+        let read = read_marker(dir.path()).expect("marker context round-trips");
+        assert_eq!(read.mnemonic, marker.mnemonic);
+        assert_eq!(read.started_at_ms, 42);
+
+        remove_marker(dir.path()).unwrap();
+        assert!(!dir.path().join(RESTORE_IN_PROGRESS_FILE_NAME).exists());
+        remove_marker(dir.path()).expect("idempotent removal");
+    }
+
+    #[test]
+    fn invalid_words_and_disabled_vss_fail_with_distinct_typed_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = LoggingEventSink::new();
+
+        let transport = Arc::new(MockTransport::new());
+        let config = vss_config(dir.path(), &transport);
+        assert_eq!(
+            run_restore(&config, "not a mnemonic", &sink, None).unwrap_err(),
+            RestoreError::InvalidMnemonic
+        );
+
+        let disabled = offline_config(dir.path());
+        assert_eq!(
+            run_restore(&disabled, crate::keys::tests::TEST_MNEMONIC, &sink, None).unwrap_err(),
+            RestoreError::VssDisabled
+        );
+        assert!(!dir.path().join(MNEMONIC_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn restore_error_variants_have_distinct_display() {
+        let variants = [
+            RestoreError::NodeRunning,
+            RestoreError::InvalidMnemonic,
+            RestoreError::VssDisabled,
+            RestoreError::Setup { detail: "d".into() },
+            RestoreError::NoBackupFound,
+            RestoreError::BackupInconsistent { detail: "d".into() },
+            RestoreError::DownloadFailed { detail: "d".into() },
+            RestoreError::ValidationFailed { detail: "d".into() },
+            RestoreError::LocalWriteFailed { detail: "d".into() },
+            RestoreError::Interrupted,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for b in variants.iter().skip(i + 1) {
+                assert_ne!(a.to_string(), b.to_string());
+            }
+        }
+    }
+}

@@ -1,45 +1,68 @@
 # zinqq-kmp
 
-Native Kotlin Multiplatform spike for the Zinqq Lightning wallet: a Rust core built directly on the LDK crates (`lightning 0.2.4`, `lightning-liquidity`, `lightning-transaction-sync`, `bdk_wallet`), exposed via UniFFI/Gobley into shared `commonMain` Kotlin, with thin native Compose (Android) and SwiftUI (iOS) shells.
+The native Kotlin Multiplatform client for the Zinqq Lightning wallet: a Rust core built directly on the LDK crates (`lightning 0.2.4`, `lightning-liquidity`, `lightning-transaction-sync`, `bdk_wallet`, `vss-client-ng`), exposed via UniFFI/Gobley into shared `commonMain` Kotlin, with native Compose (Android) and SwiftUI (iOS) shells.
 
-Success criterion: one real mainnet payment received through a Megalith LSPS2 JIT channel and one sent, driven by the same shared core on both platforms.
+This repo has grown from the original payment spike into **full feature parity with the Zinqq web PWA** (the sibling `zinq` repo): the same 16 screens, every shipped capability, and the same architecture — including VSS encrypted cloud backup that is wire-compatible with the PWA, so one seed restores on either client.
 
-- Plan: `docs/plans/2026-07-25-001-feat-kmp-native-payment-spike-plan.md`
-- Zinqq web extraction this spike references: `docs/research/zinq-grounding-dossier.md`
+- Plan: `docs/plans/2026-07-26-001-feat-pwa-feature-parity-plan.md` (spike: `docs/plans/2026-07-25-001-feat-kmp-native-payment-spike-plan.md`)
+- The Zinqq web PWA remains a maintained client; the two clients share protocols, formats, and infrastructure — never code.
 
-The Zinqq web PWA remains the production client; this repo is an exploration, not a migration.
+## What it does
+
+- **Unified send** — one input classifies BIP321 URIs, BOLT11 (including amountless with amount entry), BOLT12 offers, BIP353 names (DNSSEC-verified over DoH), LNURL-pay, and on-chain addresses.
+- **Unified receive** — one QR combining an on-chain address and BOLT11 invoice (BIP321), a reusable BOLT12 offer page, and LSPS2 just-in-time inbound channels from Megalith with a live fee floor and quote review.
+- **VSS encrypted cloud backup** — channel monitors, channel manager, known peers, close records, and recovery state dual-written VSS-first with client-side ChaCha20-Poly1305 encryption and HMAC key obfuscation, byte-compatible with the PWA's scheme. Restore from the 12-word seed alone, on either client.
+- **On-chain wallet** — send with a 10,000-sat anchor reserve while channels exist, send-max, fee guards, and a review-to-broadcast drift guard.
+- **Force-close pipeline** — close records with chain-truth reconciliation, a recovery flow with deposit calculation, anchor CPFP fee-bumping, and a sweep engine with a subsidized near-dust rescue.
+- **Channel management** — connect/forget peers, open (20k–16.77M sats) and close (cooperative or force) channels with informational estimates.
+- **Payment history** — persisted rows merged with on-chain transactions and channel closes into one activity feed.
+- **QR scanning** — CameraX/MLKit on Android, VisionKit (with AVCapture fallback) on iOS.
+
+Single-active-client rule: **never run two clients on one seed at the same time.** The VSS layer detects a concurrent writer via versioned-write conflicts and fences the losing client (it halts and offers wipe-and-restore). This is collision detection, not prevention — stop the other client before restoring a shared seed.
 
 ## Layout
 
 ```text
-rust/        wallet-core crate: LDK node, LSPS2 client, event queue, UniFFI exports
-shared/      KMP module (Gobley generates uniffi.wallet_core bindings into commonMain)
-androidApp/  Compose shell (single screen: balance, receive QR, send)
-iosApp/      SwiftUI shell (same shape; XcodeGen project.yml)
+rust/        wallet-core crate: LDK node, VSS store, engines (send/receive/
+             onchain/channels/close-records/recovery/sweep), UniFFI exports
+shared/      KMP module (Gobley generates uniffi.wallet_core bindings) +
+             pure helpers (BIP177 formatting, numpad reducer)
+androidApp/  Compose shell: 16 screens, three appearance modes
+iosApp/      SwiftUI shell: the same 16 screens (XcodeGen project.yml)
 ```
 
 ## Prerequisites
 
 - Rust (stable) with mobile targets: `rustup target add aarch64-linux-android x86_64-linux-android aarch64-apple-ios aarch64-apple-ios-sim`
-- JDK **21** (JDK 26 is too new for the Android Gradle Plugin in use)
-- Android SDK 35 with **NDK r28+** (16 KB page alignment) and an emulator system image; point `local.properties` at it via `sdk.dir=`
-- Xcode 16+ (full install, not CommandLineTools) and [XcodeGen](https://github.com/yonaskolb/XcodeGen) for `iosApp`
+- JDK **21** (newer JDKs break the Android Gradle Plugin)
+- Android SDK 35 with **NDK r28+** (16 KB page alignment) and an emulator image; point `local.properties` at it via `sdk.dir=`
+- Xcode 16+ (full install) and [XcodeGen](https://github.com/yonaskolb/XcodeGen) for `iosApp`
 - The Gradle wrapper is committed, so `./gradlew` needs no separate Gradle install
 
-## Build and run
+## Build and test
 
 Rust core (host, no mobile toolchain needed):
 
 ```bash
 cd rust
-cargo test                                  # 68 offline tests
-cargo test --lib -- --ignored live_megalith_receive_jit  # live LSPS2 flow (network)
+cargo test                    # full offline suite
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
+```
+
+Live-network tests (`#[ignore]`d; talk to mainnet services):
+
+```bash
+cargo test --lib -- --ignored live_vss_roundtrip           # VSS wire compat
+cargo test --lib -- --ignored live_megalith_get_info       # LSPS2 fee menu
+cargo test --lib -- --ignored live_megalith_receive_jit    # full JIT quote+buy
+cargo test --lib -- --ignored live_lightning_address_resolution
 ```
 
 Android:
 
 ```bash
 ./gradlew :shared:jvmTest                   # bindings smoke test across the FFI
+./gradlew :androidApp:testDebugUnitTest     # screen logic/presentation tests
 ./gradlew :androidApp:assembleDebug
 ./gradlew :androidApp:installDebug          # device or emulator
 ```
@@ -48,55 +71,35 @@ iOS:
 
 ```bash
 cd iosApp && xcodegen generate
-open iosApp.xcodeproj                       # build/run the iosApp scheme on simulator or device
+xcodebuild -project iosApp.xcodeproj -scheme iosApp \
+  -destination 'platform=iOS Simulator,name=iPhone 17' \
+  ARCHS=arm64 CODE_SIGNING_ALLOWED=NO test   # build + XCTest suites
 ```
 
-Configuration (Esplora URL, Megalith pubkey/address, RGS URL) lives in `rust/src/config.rs`. Esplora defaults to the Zinqq PWA's own proxy (`https://zinqq.app/api/esplora`), which fronts Blockstream Enterprise staging and keeps credentials server-side; `blockstream.info` and `mempool.space` remain configurable fallbacks. Public mempool.space throttled a single request to 75s under this repo's test volume, which stalls every sync pass — prefer the proxy.
+## Configuration
 
-## Mainnet acceptance protocol (manual — U8 in the plan)
+Defaults live in `rust/src/config.rs` and are overridable through the FFI `WalletConfig`:
 
-Amounts stay under $10 equivalent. The payer must be a **separate device** — the node is foreground-only and stops when the app backgrounds. Keep the app foregrounded from invoice display until `PaymentReceived`.
+- **Esplora**: `https://zinqq.app/api/esplora` (the PWA's proxy fronting Blockstream Enterprise; keeps credentials server-side). Fallbacks: `blockstream.info`, `mempool.space`.
+- **VSS**: `https://zinqq.app/api/vss-proxy` (pass-through to the VSS origin; the proxy adds no trust). `vss_disabled` runs fully local.
+- **LSP**: Megalith (`034066e2…1453b0@64.23.159.177:9735`), sourced from the PWA's working configuration — public explorer listings name the wrong node.
+- **RGS**: `https://rapidsync.lightningdevkit.org/snapshot`. Explorer links: `https://mempool.space`.
+- Mainnet only, enforced by a genesis-hash check at startup.
 
-1. Fresh install on Android. First launch generates a new seed (there is no import path).
-2. Request an invoice for at least **6,000 sats**. Megalith's observed floor is a flat 2,500 sat opening fee with a 2,501 sat minimum payment (1.4% proportional only matters above ~180k sats), so 6,000 sats received leaves ~3,500. The app reads the live menu and rejects amounts at or below the fee.
-3. Pay from an external wallet on another device. Expect: JIT channel opens (0-conf), balance shows amount minus the skimmed opening fee. Megalith advertises `client_trusts_lsp: true`, so the preimage is released before the funding transaction is visible — the received amount is the trust ceiling.
-4. Send a small payment out to an external invoice from the JIT channel balance.
-5. Repeat 1–4 on iOS with zero platform Lightning-code changes.
-6. Record results below (payment hashes only — never preimages or the seed; no secrets in screenshots).
+## Cross-client acceptance protocol (manual — U23 in the plan)
+
+Amounts stay small (< $20 total). Record payment hashes only — never seeds or preimages. The PWA side runs the **pinned 2026-07-26 commit built locally**.
+
+1. **AE1 — node identity**: initialize the same test mnemonic in the PWA (dev) and this app; the node IDs must be identical.
+2. **AE2 — cross-client restore**: create + fund a small wallet on the PWA, let it back up to VSS, **stop the PWA**, restore on native from the seed; balances and channel state must match, then send a payment.
+3. **AE3 — native restore**: wipe and reinstall the native app, restore from seed; monitors, manager, and peers rebuild from VSS.
+4. **JIT receive + send** on both platforms through the full UI (payer on a separate device; the node is foreground-only).
+5. **Force-close drill**: force-close a small channel, verify CPFP/recovery/sweep behavior and fee sanity.
+6. **Collision drill** (throwaway wallet): run both clients on one seed deliberately; the losing writer must fence (durable flag, halt, zero further puts) and recover via restore-take-over.
 
 ### Results
 
 _Not yet run._
 
-| Date | Platform | Received (msat) | Skimmed fee (msat) | Sent (msat) | Payment hashes | Notes |
-|---|---|---|---|---|---|---|
-
-### Verified live (2026-07-26)
-
-The client half of the JIT receive flow is proven against mainnet Megalith on the
-Android emulator through the real UI — typing an amount and tapping **Invoice**
-produced a payable `lnbc60u...` invoice with a QR and expiry countdown. Only the
-external payment itself remains manual. Headless equivalents:
-
-```bash
-cd rust
-cargo test --lib -- --ignored live_megalith_get_info      # real fee menu
-cargo test --lib -- --ignored live_megalith_receive_jit   # get_info + buy + invoice
-```
-
-The LSP identity in `rust/src/config.rs` comes from the Zinqq PWA's own working
-configuration, not from public explorer listings — the explorer-listed node
-completes a handshake but never answers `lsps2.get_info`.
-
-Also verified on the emulator run: every packaged `.so` (including
-`libwallet_core.so`) has 16 KB-aligned `LOAD` segments, satisfying the Android 15+
-page-size requirement that NDK r28 provides by default:
-
-```bash
-unzip -o androidApp/build/outputs/apk/debug/androidApp-debug.apk 'lib/*' -d /tmp/apk
-"$ANDROID_HOME"/ndk/*/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-readelf \
-  -l /tmp/apk/lib/arm64-v8a/libwallet_core.so | grep LOAD   # expect 0x4000
-```
-
-The debug APK is large (~650 MB) because the Rust staticlib carries full debug
-symbols; a release build strips them.
+| Date | Step | Platform | Outcome | Payment hashes | Notes |
+|---|---|---|---|---|---|

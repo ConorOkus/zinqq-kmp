@@ -7,10 +7,12 @@ plugins {
 }
 
 android {
-    namespace = "zinqq.spike.android"
+    // U13: the spike package graduated to the product id. Safe because spike
+    // installs are disposable (plan Key Decisions: no migration is built).
+    namespace = "zinqq.app"
     compileSdk = 35
     defaultConfig {
-        applicationId = "zinqq.spike.android"
+        applicationId = "zinqq.app"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
@@ -38,9 +40,19 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.lifecycle.process)
+    // U13: 16-destination NavHost with declarative destination-based back (KTD-11).
+    implementation(libs.androidx.navigation.compose)
+    // U13: appearance mode + balance visibility persisted with the PWA's keys (R12).
+    implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
     // QR rendering only: the BOLT11 string goes in, pixels come out (R4).
     implementation(libs.zxing.core)
+    // U15 Scan: CameraX preview + MLKit QR-only analyzer (R13).
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+    implementation(libs.androidx.camera.mlkit.vision)
+    implementation(libs.mlkit.barcode.scanning)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.test)

@@ -1,0 +1,439 @@
+{
+  "tx_union_fill_in": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "commitment",
+          "feeSats": "2000"
+        }
+      ],
+      "createdAt": 1000
+    },
+    "incoming": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "commitment",
+          "confirmedAtHeight": 100
+        },
+        {
+          "txid": "t2",
+          "role": "sweep"
+        }
+      ],
+      "createdAt": 1000
+    },
+    "merged": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "commitment",
+          "feeSats": "2000",
+          "confirmedAtHeight": 100
+        },
+        {
+          "txid": "t2",
+          "role": "sweep"
+        }
+      ],
+      "createdAt": 1000
+    }
+  },
+  "known_beats_unknown": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "force",
+      "initiator": "local",
+      "txs": [],
+      "createdAt": 1000
+    },
+    "incoming": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000
+    },
+    "merged": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "force",
+      "initiator": "local",
+      "txs": [],
+      "createdAt": 1000
+    }
+  },
+  "created_at_min_a": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 500
+    },
+    "incoming": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 900
+    },
+    "merged": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 500
+    }
+  },
+  "created_at_min_b": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 900
+    },
+    "incoming": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 500
+    },
+    "merged": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 500
+    }
+  },
+  "completed_at_set_once_verified_absorbs": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "completedAt": 2000,
+      "resolution": "unverified"
+    },
+    "incoming": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "completedAt": 3000,
+      "resolution": "verified"
+    },
+    "merged": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "completedAt": 2000,
+      "resolution": "verified"
+    }
+  },
+  "idempotency": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "coop",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "closing"
+        }
+      ],
+      "createdAt": 1000,
+      "fundingTxo": {
+        "txid": "f",
+        "vout": 0
+      },
+      "expectedAmountSats": "5000"
+    },
+    "once": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "fundingTxo": {
+        "txid": "f",
+        "vout": 0
+      },
+      "closeType": "coop",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "closing"
+        }
+      ],
+      "expectedAmountSats": "5000",
+      "createdAt": 1000
+    },
+    "twice": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "fundingTxo": {
+        "txid": "f",
+        "vout": 0
+      },
+      "closeType": "coop",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "closing"
+        }
+      ],
+      "expectedAmountSats": "5000",
+      "createdAt": 1000
+    }
+  },
+  "measurements_incoming_identity_base": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "closureReason": "Cooperative close",
+      "expectedAmountSats": "5000",
+      "claimableAtHeight": 100
+    },
+    "incoming": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "closureReason": "something else",
+      "expectedAmountSats": "4800",
+      "claimableAtHeight": 105
+    },
+    "merged": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "closureReason": "Cooperative close",
+      "txs": [],
+      "expectedAmountSats": "4800",
+      "claimableAtHeight": 105,
+      "createdAt": 1000
+    }
+  },
+  "non_commutativity_witness": {
+    "a": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "commitment",
+          "feeSats": "1"
+        }
+      ],
+      "createdAt": 1000,
+      "closureReason": "A-side reason",
+      "fundingTxo": {
+        "txid": "fa",
+        "vout": 0
+      },
+      "expectedAmountSats": "100"
+    },
+    "b": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "sweep",
+          "feeSats": "2"
+        }
+      ],
+      "createdAt": 1000,
+      "closureReason": "B-side reason",
+      "fundingTxo": {
+        "txid": "fb",
+        "vout": 1
+      },
+      "expectedAmountSats": "200"
+    },
+    "a_then_b": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "fundingTxo": {
+        "txid": "fa",
+        "vout": 0
+      },
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "closureReason": "A-side reason",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "commitment",
+          "feeSats": "1"
+        }
+      ],
+      "expectedAmountSats": "200",
+      "createdAt": 1000
+    },
+    "b_then_a": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "fundingTxo": {
+        "txid": "fb",
+        "vout": 1
+      },
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "closureReason": "B-side reason",
+      "txs": [
+        {
+          "txid": "t1",
+          "role": "sweep",
+          "feeSats": "2"
+        }
+      ],
+      "expectedAmountSats": "100",
+      "createdAt": 1000
+    }
+  },
+  "base_wins_nullish_and_schema_max": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "timelockBlocks": 144
+    },
+    "incoming": {
+      "schemaVersion": 3,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "fundingTxo": {
+        "txid": "ff",
+        "vout": 2
+      },
+      "timelockBlocks": 720,
+      "claimableAtHeight": 890000
+    },
+    "merged": {
+      "schemaVersion": 3,
+      "channelId": "ab",
+      "fundingTxo": {
+        "txid": "ff",
+        "vout": 2
+      },
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "timelockBlocks": 144,
+      "claimableAtHeight": 890000,
+      "createdAt": 1000
+    }
+  },
+  "extras_base_over_incoming": {
+    "base": {
+      "shared": "base",
+      "baseOnly": 1,
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000
+    },
+    "incoming": {
+      "shared": "incoming",
+      "incomingOnly": 2,
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000
+    },
+    "merged": {
+      "shared": "base",
+      "incomingOnly": 2,
+      "baseOnly": 1,
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000
+    }
+  },
+  "resolution_verified_precedence_no_completed": {
+    "base": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "resolution": "unverified"
+    },
+    "incoming": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "resolution": "verified"
+    },
+    "merged": {
+      "schemaVersion": 1,
+      "channelId": "ab",
+      "closeType": "unknown",
+      "initiator": "unknown",
+      "txs": [],
+      "createdAt": 1000,
+      "resolution": "verified"
+    }
+  }
+}

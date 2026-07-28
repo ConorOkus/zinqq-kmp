@@ -13,8 +13,10 @@ rust/target/
 # macOS
 .DS_Store
 
-# Xcode (iosApp.xcodeproj is generated from iosApp/project.yml via xcodegen)
+# Xcode (iosApp.xcodeproj and iosApp/Info.plist are generated from
+# iosApp/project.yml via xcodegen)
 iosApp/iosApp.xcodeproj/
+iosApp/iosApp/Info.plist
 xcuserdata/
 DerivedData/
 *.xcworkspace

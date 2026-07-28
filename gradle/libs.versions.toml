@@ -8,6 +8,11 @@ coroutines = "1.10.2"
 androidx-activity-compose = "1.10.1"
 androidx-compose-bom = "2025.05.01"
 androidx-lifecycle = "2.9.0"
+androidx-navigation = "2.9.0"
+androidx-datastore = "1.1.7"
+# U15: CameraX 1.4.x is the first stable line with camera-mlkit-vision.
+androidx-camera = "1.4.2"
+mlkit-barcode = "17.3.0"
 junit = "4.13.2"
 zxing = "3.5.3"
 
@@ -20,6 +25,13 @@ androidx-activity-compose = { module = "androidx.activity:activity-compose", ver
 androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "androidx-compose-bom" }
 androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
 androidx-lifecycle-process = { module = "androidx.lifecycle:lifecycle-process", version.ref = "androidx-lifecycle" }
+androidx-navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "androidx-navigation" }
+androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "androidx-datastore" }
+androidx-camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "androidx-camera" }
+androidx-camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "androidx-camera" }
+androidx-camera-view = { module = "androidx.camera:camera-view", version.ref = "androidx-camera" }
+androidx-camera-mlkit-vision = { module = "androidx.camera:camera-mlkit-vision", version.ref = "androidx-camera" }
+mlkit-barcode-scanning = { module = "com.google.mlkit:barcode-scanning", version.ref = "mlkit-barcode" }
 junit = { module = "junit:junit", version.ref = "junit" }
 zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
 
