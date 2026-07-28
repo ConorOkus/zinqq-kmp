@@ -14,7 +14,7 @@
 # plist, so both mechanisms compose.
 name: iosApp
 options:
-  bundleIdPrefix: zinqq.spike
+  bundleIdPrefix: zinqq
   deploymentTarget:
     iOS: "16.0"
 targets:
@@ -25,7 +25,7 @@ targets:
       - iosApp
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: zinqq.spike.ios
+        PRODUCT_BUNDLE_IDENTIFIER: zinqq.ios
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_CFBundleDisplayName: Zinqq Spike
@@ -71,7 +71,7 @@ targets:
       - target: iosApp
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: zinqq.spike.ios.tests
+        PRODUCT_BUNDLE_IDENTIFIER: zinqq.ios.tests
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/iosApp.app/iosApp
         BUNDLE_LOADER: $(TEST_HOST)
