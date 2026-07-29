@@ -63,7 +63,7 @@ kotlin {
 }
 
 android {
-    namespace = "zinqq.spike.shared"
+    namespace = "zinqq.main.shared"
     compileSdk = 35
     // NDK r28+: 16 KB page-size alignment is the default for packaged .so files.
     ndkVersion = "28.1.13356709"

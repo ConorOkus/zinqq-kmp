@@ -46,8 +46,8 @@ import zinqq.app.components.ResultTemplate
 import zinqq.app.explorerTxUrl
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.formatBtc
-import zinqq.spike.msatToSatCeil
+import zinqq.main.formatBtc
+import zinqq.main.msatToSatCeil
 
 /**
  * The Send screen (U15, F1, R5/R7 UI): the PWA's six-step machine rendered
@@ -286,7 +286,7 @@ private fun AmountStepScreen(
     step: SendStep.Amount,
     onchainBalanceSats: ULong,
     unifiedTotalSats: ULong,
-    onKey: (zinqq.spike.NumpadKey) -> Unit,
+    onKey: (zinqq.main.NumpadKey) -> Unit,
     onNext: () -> Unit,
     onSendMax: () -> Unit,
     onLnAvailable: () -> Unit,

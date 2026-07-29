@@ -30,8 +30,8 @@ import zinqq.app.components.Numpad
 import zinqq.app.components.ResultTemplate
 import zinqq.app.nav.ScreenHeader
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.formatBtc
-import zinqq.spike.numpadDigitReducer
+import zinqq.main.formatBtc
+import zinqq.main.numpadDigitReducer
 
 /** The PWA OpenChannel's step machine (`OpenChannel.tsx:22-27`). */
 private sealed interface OpenStep {

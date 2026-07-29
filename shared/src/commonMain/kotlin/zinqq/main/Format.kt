@@ -1,4 +1,4 @@
-package zinqq.spike
+package zinqq.main
 
 /**
  * BIP177 / msat formatting helpers, shared by both platform shells (U13,

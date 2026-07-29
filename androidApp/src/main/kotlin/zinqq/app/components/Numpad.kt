@@ -26,7 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import zinqq.app.R
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.NumpadKey
+import zinqq.main.NumpadKey
 
 /**
  * The PWA's sats-only `Numpad` (U13, KTD-11, R12): a Next CTA above a 3×4

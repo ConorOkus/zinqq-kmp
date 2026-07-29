@@ -21,7 +21,7 @@ import uniffi.wallet_core.JitInvoice
 import uniffi.wallet_core.JitQuote
 import uniffi.wallet_core.ReceiveBundle
 import uniffi.wallet_core.WalletException
-import zinqq.spike.NumpadKey
+import zinqq.main.NumpadKey
 
 /**
  * The controller's async transitions over a fake port (U16): mandatory

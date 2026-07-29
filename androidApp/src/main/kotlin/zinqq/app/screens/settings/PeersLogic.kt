@@ -4,8 +4,8 @@ import uniffi.wallet_core.ChannelStateLabel
 import uniffi.wallet_core.ChannelView
 import uniffi.wallet_core.PeerView
 import uniffi.wallet_core.WalletException
-import zinqq.spike.formatBtc
-import zinqq.spike.msatToSatFloor
+import zinqq.main.formatBtc
+import zinqq.main.msatToSatFloor
 
 /**
  * The Peers screen's pure derivations (U17, R10 UI, R14): the PWA's

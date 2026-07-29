@@ -18,8 +18,8 @@ import uniffi.wallet_core.CloseTypeView
 import uniffi.wallet_core.PendingSweepView
 import uniffi.wallet_core.RecoveryStateView
 import uniffi.wallet_core.RecoveryStatusView
-import zinqq.spike.formatBtc
-import zinqq.spike.msatToSatFloor
+import zinqq.main.formatBtc
+import zinqq.main.msatToSatFloor
 
 /**
  * Pure display derivations for the wallet/activity screens (U14, R14):

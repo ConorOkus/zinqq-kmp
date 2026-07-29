@@ -134,6 +134,67 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Compile-only guard for the TestFlight archive chain (R8/KTD5 in
+  # docs/plans/2026-07-28-001-feat-testflight-distribution-plan.md): the manual
+  # upload path archives a Release device build, a toolchain path nothing else
+  # exercises. This job keeps the Rust aarch64-apple-ios staticlib, the Release
+  # Kotlin/Native framework, and the unsigned app compile from silently rotting
+  # between uploads. `build` (not `archive`) on purpose: archive triggers
+  # provisioning validation an unsigned CI job cannot satisfy. No secrets, no
+  # upload — signing stays manual per the runbook.
+  ios-release-device:
+    name: iOS Release device (unsigned guard)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - name: Install Rust iOS device target
+        run: rustup target add aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          # Distinct from the simulator job's `ios` key: the Release/device
+          # cargo target dir would otherwise evict or be evicted by it.
+          key: ios-release
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # First half of the archive chain: Rust aarch64-apple-ios staticlib
+      # (release profile) statically linked into the Release Kotlin/Native
+      # framework.
+      - name: Build Release device framework
+        run: ./gradlew :shared:linkReleaseFrameworkIosArm64 --stacktrace
+
+      - name: Generate Xcode project
+        working-directory: iosApp
+        run: xcodegen generate
+
+      # Second half: the unsigned Release app compile against a generic device
+      # destination — the same compile an Xcode archive performs, minus signing.
+      - name: Build unsigned Release device app
+        working-directory: iosApp
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project iosApp.xcodeproj \
+            -scheme iosApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd-release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
   ios:
     name: iOS
     runs-on: macos-15

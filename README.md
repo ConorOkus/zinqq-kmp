@@ -2,9 +2,9 @@
 
 The native Kotlin Multiplatform client for the Zinqq Lightning wallet: a Rust core built directly on the LDK crates (`lightning 0.2.4`, `lightning-liquidity`, `lightning-transaction-sync`, `bdk_wallet`, `vss-client-ng`), exposed via UniFFI/Gobley into shared `commonMain` Kotlin, with native Compose (Android) and SwiftUI (iOS) shells.
 
-This repo has grown from the original payment spike into **full feature parity with the Zinqq web PWA** (the sibling `zinq` repo): the same 16 screens, every shipped capability, and the same architecture — including VSS encrypted cloud backup that is wire-compatible with the PWA, so one seed restores on either client.
+This is the **production native client** for Zinqq — a mainnet Lightning wallet handling real funds, on a path to real distribution (internal TestFlight today; App Store pending organization enrollment). It has **full feature parity with the Zinqq web PWA** (the sibling `zinq` repo): the same 16 screens, every shipped capability, and the same architecture — including VSS encrypted cloud backup that is wire-compatible with the PWA, so one seed restores on either client. The iOS bundle ID is `zinqq.ios` and shared Kotlin code lives under `zinqq.main.*`; the original payment spike this grew from survives only in the plan history.
 
-- Plan: `docs/plans/2026-07-26-001-feat-pwa-feature-parity-plan.md` (spike: `docs/plans/2026-07-25-001-feat-kmp-native-payment-spike-plan.md`)
+- Plans: `docs/plans/2026-07-26-001-feat-pwa-feature-parity-plan.md` (parity), `docs/plans/2026-07-28-001-feat-testflight-distribution-plan.md` (distribution), `docs/plans/2026-07-25-001-feat-kmp-native-payment-spike-plan.md` (original spike)
 - The Zinqq web PWA remains a maintained client; the two clients share protocols, formats, and infrastructure — never code.
 
 ## What it does
@@ -75,6 +75,10 @@ xcodebuild -project iosApp.xcodeproj -scheme iosApp \
   -destination 'platform=iOS Simulator,name=iPhone 17' \
   ARCHS=arm64 CODE_SIGNING_ALLOWED=NO test   # build + XCTest suites
 ```
+
+## Distribution
+
+iOS ships to **internal TestFlight testers** via manual Xcode Organizer uploads — the full procedure (first-time setup, routine uploads, pre-upload sanity check, and the real-funds constraints like the 90-day build expiry) lives in `docs/runbooks/testflight-upload.md`. The `ios-release-device` CI job compiles the same Rust-release + Kotlin/Native-release device chain an archive uses, so archive-toolchain breakage surfaces in CI, not mid-upload. External beta and App Store release wait on organization enrollment (Apple requires it for wallet apps). Android distribution is not set up yet.
 
 ## Configuration
 

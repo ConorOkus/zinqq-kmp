@@ -28,7 +28,7 @@ import zinqq.app.R
 import zinqq.app.WalletHolder
 import zinqq.app.components.CenteredNote
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.formatBtc
+import zinqq.main.formatBtc
 
 /**
  * The PWA's Balance (U17, R12; `Balance.tsx`): the Total card with the

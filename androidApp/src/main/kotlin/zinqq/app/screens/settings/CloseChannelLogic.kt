@@ -4,7 +4,7 @@ import uniffi.wallet_core.CloseEstimate
 import uniffi.wallet_core.CloseFeePayer
 import uniffi.wallet_core.WalletException
 import zinqq.app.humanizeBlocks
-import zinqq.spike.formatBtc
+import zinqq.main.formatBtc
 
 /**
  * CloseChannel's pure derivations (U17, R10 UI, R14): the coop/force

@@ -14,7 +14,7 @@
 # plist, so both mechanisms compose.
 name: iosApp
 options:
-  bundleIdPrefix: zinqq.spike
+  bundleIdPrefix: zinqq
   deploymentTarget:
     iOS: "16.0"
 targets:
@@ -25,10 +25,20 @@ targets:
       - iosApp
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: zinqq.spike.ios
+        PRODUCT_BUNDLE_IDENTIFIER: zinqq.ios
+        # Signing (R2/KTD2): automatic signing with the Team ID committed here,
+        # because the .xcodeproj is regenerated and Xcode-clicked settings are
+        # wiped. CI is unaffected: it builds with CODE_SIGNING_ALLOWED=NO.
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: 2LD486V4AU
+        # Version source of truth (R4/KTD3). The generated Info.plist derives
+        # CFBundleShortVersionString/CFBundleVersion from these; bump
+        # CURRENT_PROJECT_VERSION before every TestFlight upload.
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: 1
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Zinqq Spike
+        INFOPLIST_KEY_CFBundleDisplayName: Zinqq
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)
         OTHER_LDFLAGS: $(inherited) -framework Shared
@@ -36,6 +46,12 @@ targets:
     info:
       path: iosApp/Info.plist
       properties:
+        # Export compliance (R5/KTD4): the wallet uses standard-algorithm
+        # encryption not provided by the OS (ChaCha20-Poly1305 for VSS blobs,
+        # LDK protocol crypto) — Apple's non-exempt-but-standard category.
+        # Declaring it here answers the question once instead of per upload;
+        # the App Store Connect questionnaire at first upload must match.
+        ITSAppUsesNonExemptEncryption: true
         # Scan screen (U20, R13): the camera exists solely to read payment
         # QR codes; iOS shows this string on the permission prompt.
         NSCameraUsageDescription: >-
@@ -71,7 +87,7 @@ targets:
       - target: iosApp
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: zinqq.spike.ios.tests
+        PRODUCT_BUNDLE_IDENTIFIER: zinqq.ios.tests
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/iosApp.app/iosApp
         BUNDLE_LOADER: $(TEST_HOST)

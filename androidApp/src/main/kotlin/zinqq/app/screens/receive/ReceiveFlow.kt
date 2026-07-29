@@ -5,9 +5,9 @@ import uniffi.wallet_core.Event
 import uniffi.wallet_core.JitQuote
 import uniffi.wallet_core.ReceiveBundle
 import uniffi.wallet_core.WalletException
-import zinqq.spike.formatBtc
-import zinqq.spike.msatToSatCeil
-import zinqq.spike.msatToSatFloor
+import zinqq.main.formatBtc
+import zinqq.main.msatToSatCeil
+import zinqq.main.msatToSatFloor
 
 /**
  * The pure half of the receive flow (U16, F2, R6 UI, R12): the PWA's

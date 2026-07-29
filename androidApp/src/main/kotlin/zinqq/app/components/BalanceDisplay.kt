@@ -22,7 +22,7 @@ import androidx.compose.ui.unit.sp
 import zinqq.app.R
 import zinqq.app.theme.ZinqqDimens
 import zinqq.app.theme.ZinqqTheme
-import zinqq.spike.formatBtc
+import zinqq.main.formatBtc
 
 /**
  * The PWA's `BalanceDisplay` (U13, KTD-11, R12): unified total as a BIP177

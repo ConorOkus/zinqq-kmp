@@ -1,4 +1,4 @@
-package zinqq.spike
+package zinqq.main
 
 import kotlin.test.Test
 import kotlin.test.assertEquals

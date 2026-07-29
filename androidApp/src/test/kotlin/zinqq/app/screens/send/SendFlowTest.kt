@@ -8,7 +8,7 @@ import kotlin.test.assertTrue
 import uniffi.wallet_core.ClassifiedKind
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.WalletException
-import zinqq.spike.NumpadKey
+import zinqq.main.NumpadKey
 
 /**
  * The send machine's step-transition matrix (U15): every classification kind

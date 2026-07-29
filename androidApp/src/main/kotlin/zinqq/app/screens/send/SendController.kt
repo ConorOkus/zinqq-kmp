@@ -20,7 +20,7 @@ import uniffi.wallet_core.LnurlPayView
 import uniffi.wallet_core.MaxSendEstimate
 import uniffi.wallet_core.ResolvedView
 import uniffi.wallet_core.WalletException
-import zinqq.spike.NumpadKey
+import zinqq.main.NumpadKey
 
 /**
  * The send flow's window onto the wallet (U15, R14): every call is a thin

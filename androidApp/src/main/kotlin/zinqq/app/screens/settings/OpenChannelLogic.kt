@@ -2,7 +2,7 @@ package zinqq.app.screens.settings
 
 import uniffi.wallet_core.OpenFeeEstimate
 import uniffi.wallet_core.WalletException
-import zinqq.spike.formatBtc
+import zinqq.main.formatBtc
 
 /**
  * OpenChannel's pure derivations (U17, R10 UI, R14): the PWA's bounds and

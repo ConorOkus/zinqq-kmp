@@ -1,4 +1,4 @@
-package zinqq.spike
+package zinqq.main
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
