@@ -2,16 +2,13 @@
 
 The native Kotlin Multiplatform client for the Zinqq Lightning wallet: a Rust core built directly on the LDK crates (`lightning 0.2.4`, `lightning-liquidity`, `lightning-transaction-sync`, `bdk_wallet`, `vss-client-ng`), exposed via UniFFI/Gobley into shared `commonMain` Kotlin, with native Compose (Android) and SwiftUI (iOS) shells.
 
-This is the **production native client** for Zinqq — a mainnet Lightning wallet handling real funds, on a path to real distribution (internal TestFlight today; App Store pending organization enrollment). It has **full feature parity with the Zinqq web PWA** (the sibling `zinq` repo): the same 16 screens, every shipped capability, and the same architecture — including VSS encrypted cloud backup that is wire-compatible with the PWA, so one seed restores on either client. The iOS bundle ID is `zinqq.ios` and shared Kotlin code lives under `zinqq.main.*`; the original payment spike this grew from survives only in the plan history.
-
-- Plans: `docs/plans/2026-07-26-001-feat-pwa-feature-parity-plan.md` (parity), `docs/plans/2026-07-28-001-feat-testflight-distribution-plan.md` (distribution), `docs/plans/2026-07-25-001-feat-kmp-native-payment-spike-plan.md` (original spike)
-- The Zinqq web PWA remains a maintained client; the two clients share protocols, formats, and infrastructure — never code.
+This is the **production native client** for Zinqq — a mainnet Lightning wallet handling real funds, with 16 screens and VSS encrypted cloud backup so one seed restores the whole wallet. The iOS bundle ID is `zinqq.ios` and shared Kotlin code lives under `zinqq.main.*`.
 
 ## What it does
 
 - **Unified send** — one input classifies BIP321 URIs, BOLT11 (including amountless with amount entry), BOLT12 offers, BIP353 names (DNSSEC-verified over DoH), LNURL-pay, and on-chain addresses.
 - **Unified receive** — one QR combining an on-chain address and BOLT11 invoice (BIP321), a reusable BOLT12 offer page, and LSPS2 just-in-time inbound channels from Megalith with a live fee floor and quote review.
-- **VSS encrypted cloud backup** — channel monitors, channel manager, known peers, close records, and recovery state dual-written VSS-first with client-side ChaCha20-Poly1305 encryption and HMAC key obfuscation, byte-compatible with the PWA's scheme. Restore from the 12-word seed alone, on either client.
+- **VSS encrypted cloud backup** — channel monitors, channel manager, known peers, close records, and recovery state dual-written VSS-first with client-side ChaCha20-Poly1305 encryption and HMAC key obfuscation. Restore from the 12-word seed alone.
 - **On-chain wallet** — send with a 10,000-sat anchor reserve while channels exist, send-max, fee guards, and a review-to-broadcast drift guard.
 - **Force-close pipeline** — close records with chain-truth reconciliation, a recovery flow with deposit calculation, anchor CPFP fee-bumping, and a sweep engine with a subsidized near-dust rescue.
 - **Channel management** — connect/forget peers, open (20k–16.77M sats) and close (cooperative or force) channels with informational estimates.
@@ -76,34 +73,12 @@ xcodebuild -project iosApp.xcodeproj -scheme iosApp \
   ARCHS=arm64 CODE_SIGNING_ALLOWED=NO test   # build + XCTest suites
 ```
 
-## Distribution
-
-iOS ships to **internal TestFlight testers** via manual Xcode Organizer uploads — the full procedure (first-time setup, routine uploads, pre-upload sanity check, and the real-funds constraints like the 90-day build expiry) lives in `docs/runbooks/testflight-upload.md`. The `ios-release-device` CI job compiles the same Rust-release + Kotlin/Native-release device chain an archive uses, so archive-toolchain breakage surfaces in CI, not mid-upload. External beta and App Store release wait on organization enrollment (Apple requires it for wallet apps). Android distribution is not set up yet.
-
 ## Configuration
 
 Defaults live in `rust/src/config.rs` and are overridable through the FFI `WalletConfig`:
 
-- **Esplora**: `https://zinqq.app/api/esplora` (the PWA's proxy fronting Blockstream Enterprise; keeps credentials server-side). Fallbacks: `blockstream.info`, `mempool.space`.
+- **Esplora**: `https://zinqq.app/api/esplora` (proxy fronting Blockstream Enterprise; keeps credentials server-side). Fallbacks: `blockstream.info`, `mempool.space`.
 - **VSS**: `https://zinqq.app/api/vss-proxy` (pass-through to the VSS origin; the proxy adds no trust). `vss_disabled` runs fully local.
-- **LSP**: Megalith (`034066e2…1453b0@64.23.159.177:9735`), sourced from the PWA's working configuration — public explorer listings name the wrong node.
+- **LSP**: Megalith (`034066e2…1453b0@64.23.159.177:9735`) — use this address, not the public explorer listings, which name the wrong node.
 - **RGS**: `https://rapidsync.lightningdevkit.org/snapshot`. Explorer links: `https://mempool.space`.
 - Mainnet only, enforced by a genesis-hash check at startup.
-
-## Cross-client acceptance protocol (manual — U23 in the plan)
-
-Amounts stay small (< $20 total). Record payment hashes only — never seeds or preimages. The PWA side runs the **pinned 2026-07-26 commit built locally**.
-
-1. **AE1 — node identity**: initialize the same test mnemonic in the PWA (dev) and this app; the node IDs must be identical.
-2. **AE2 — cross-client restore**: create + fund a small wallet on the PWA, let it back up to VSS, **stop the PWA**, restore on native from the seed; balances and channel state must match, then send a payment.
-3. **AE3 — native restore**: wipe and reinstall the native app, restore from seed; monitors, manager, and peers rebuild from VSS.
-4. **JIT receive + send** on both platforms through the full UI (payer on a separate device; the node is foreground-only).
-5. **Force-close drill**: force-close a small channel, verify CPFP/recovery/sweep behavior and fee sanity.
-6. **Collision drill** (throwaway wallet): run both clients on one seed deliberately; the losing writer must fence (durable flag, halt, zero further puts) and recover via restore-take-over.
-
-### Results
-
-_Not yet run._
-
-| Date | Step | Platform | Outcome | Payment hashes | Notes |
-|---|---|---|---|---|---|
