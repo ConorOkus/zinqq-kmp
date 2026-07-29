@@ -22,7 +22,7 @@ After that, `/usr/libexec/java_home -v 21` resolves and GUI-launched Xcode finds
 
 ## First-time setup
 
-1. **Fill in the Team ID.** In `iosApp/project.yml`, replace the `DEVELOPMENT_TEAM: ZZZZZZZZZZ` placeholder with your Team ID (App Store Connect → Membership details). Then regenerate:
+1. **Verify the Team ID.** `DEVELOPMENT_TEAM: 2LD486V4AU` is committed in `iosApp/project.yml`; confirm it matches App Store Connect → Membership details (replace it if the app ever moves to a different team). Then regenerate:
 
    ```bash
    (cd iosApp && xcodegen generate)

@@ -28,11 +28,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: zinqq.ios
         # Signing (R2/KTD2): automatic signing with the Team ID committed here,
         # because the .xcodeproj is regenerated and Xcode-clicked settings are
-        # wiped. ZZZZZZZZZZ is a placeholder — replace it with the enrolled
-        # Team ID per docs/runbooks/testflight-upload.md (first-time setup).
-        # CI is unaffected: it builds with CODE_SIGNING_ALLOWED=NO.
+        # wiped. CI is unaffected: it builds with CODE_SIGNING_ALLOWED=NO.
         CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: ZZZZZZZZZZ
+        DEVELOPMENT_TEAM: 2LD486V4AU
         # Version source of truth (R4/KTD3). The generated Info.plist derives
         # CFBundleShortVersionString/CFBundleVersion from these; bump
         # CURRENT_PROJECT_VERSION before every TestFlight upload.
