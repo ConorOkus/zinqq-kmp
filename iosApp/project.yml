@@ -26,6 +26,11 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: zinqq.ios
+        # iPhone-only. The 16 screens are phone-designed (PWA parity), and
+        # declaring iPad support drags in App Store requirements the app
+        # doesn't meet (152x152 iPad icon, all-four multitasking orientations
+        # — upload validation errors 90023/90474).
+        TARGETED_DEVICE_FAMILY: 1
         # Signing (R2/KTD2): automatic signing with the Team ID committed here,
         # because the .xcodeproj is regenerated and Xcode-clicked settings are
         # wiped. CI is unaffected: it builds with CODE_SIGNING_ALLOWED=NO.
@@ -35,7 +40,8 @@ targets:
         # CFBundleShortVersionString/CFBundleVersion from these; bump
         # CURRENT_PROJECT_VERSION before every TestFlight upload.
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: 1
+        CURRENT_PROJECT_VERSION: 2
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_CFBundleDisplayName: Zinqq
@@ -46,12 +52,14 @@ targets:
     info:
       path: iosApp/Info.plist
       properties:
-        # Export compliance (R5/KTD4): the wallet uses standard-algorithm
-        # encryption not provided by the OS (ChaCha20-Poly1305 for VSS blobs,
-        # LDK protocol crypto) — Apple's non-exempt-but-standard category.
-        # Declaring it here answers the question once instead of per upload;
-        # the App Store Connect questionnaire at first upload must match.
-        ITSAppUsesNonExemptEncryption: true
+        # Export compliance (R5/KTD4): the wallet's encryption is standard,
+        # published algorithms only (ChaCha20-Poly1305 for VSS blobs, LDK
+        # protocol crypto, TLS) — the exempt self-classification under the
+        # EAR mass-market provisions, which this key encodes as `false`
+        # ("uses no NON-exempt encryption"). `true` requires filed export
+        # compliance documentation and a compliance code in the plist; the
+        # first upload was rejected without them (validation error 90592).
+        ITSAppUsesNonExemptEncryption: false
         # Scan screen (U20, R13): the camera exists solely to read payment
         # QR codes; iOS shows this string on the permission prompt.
         NSCameraUsageDescription: >-
