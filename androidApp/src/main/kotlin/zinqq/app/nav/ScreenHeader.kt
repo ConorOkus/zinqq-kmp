@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -38,6 +39,11 @@ fun ScreenHeader(
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            // targetSdk 35 draws edge-to-edge, so without this the 56dp bar
+            // starts at y=0 and the back chevron lands under the clock while
+            // the right action lands under the battery icons. The inset moves
+            // the bar down; the screen's own background still paints behind it.
+            .statusBarsPadding()
             .height(ZinqqDimens.HeaderHeight)
             .padding(horizontal = 16.dp),
     ) {
