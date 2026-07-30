@@ -39,6 +39,17 @@ interface ReceivePort {
     /** The core's `build_bip321_uri` (copy form) — re-composes around a JIT invoice. */
     suspend fun buildUnifiedUri(address: String, amountSats: ULong?, invoice: String?): String
 
+    /**
+     * Mints the persistent BOLT12 offer, or serves the persisted one (R6).
+     * `null` when the node is stopped or every attempt failed. Blinded paths
+     * need the synced graph, so the core retries on its 3/6/12/24/48 s
+     * schedule — this can block for ~93 s and never belongs on the entry path.
+     */
+    suspend fun getOrCreateOffer(): String?
+
+    /** The core's `build_bolt12_page_uri` — the offer page's copy form. */
+    suspend fun bolt12Uri(offer: String): String
+
     /** The core's live event stream ([Event.PaymentReceived] settles the visit). */
     val walletEvents: Flow<Event>
 }
@@ -145,6 +156,10 @@ class ReceiveController(
                         ),
                     )
                 }
+                // An amountless `needs_jit` IS the core's `has_usable_channel`
+                // (rust/src/receive.rs `needs_jit`), so this is exactly the
+                // offer gate: mint only when the offer page could render.
+                if (!bundle.needsJit && bundle.offer == null) mintOffer()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -358,6 +373,29 @@ class ReceiveController(
                         it.copy(step = ReceiveStep.Display(InvoicePath.NONE))
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * The PWA's `loadOrCreateOffer` (`context.tsx:1655-1663`): the offer page
+     * needs an offer only [ReceivePort.getOrCreateOffer] can mint, and minting
+     * blocks through the core's retry schedule — so it runs BESIDE the screen
+     * on its own coroutine, never on the entry path. Only the offer fields are
+     * folded in: by the time it lands the visit may be mid-JIT-flow, and the
+     * rest of the state belongs to that flow. A failure is silent — the pager
+     * simply stays at one page (the PWA swallows it the same way).
+     */
+    private fun mintOffer() {
+        scope.launch {
+            try {
+                val offer = port.getOrCreateOffer() ?: return@launch
+                val qrValue = port.bolt12Uri(offer).uppercase()
+                _state.update { it.copy(offer = offer, offerQrValue = qrValue) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Offer creation NEVER degrades receive (core contract, R6).
             }
         }
     }

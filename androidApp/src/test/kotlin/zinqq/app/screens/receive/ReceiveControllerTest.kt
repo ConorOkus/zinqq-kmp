@@ -6,6 +6,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
@@ -38,6 +39,14 @@ class ReceiveControllerTest {
         var inboundMsat: ULong = 0uL
         var floorFetches = 0
 
+        /** The offer the core mints; `null` stands in for "every attempt failed". */
+        var mintedOffer: String? = TEST_RECEIVE_OFFER
+        var mintFails = false
+        var mintCalls = 0
+
+        /** Held open, this stands in for the core's retry schedule still running. */
+        var mintGate: CompletableDeferred<Unit>? = null
+
         val events = MutableSharedFlow<Event>(extraBufferCapacity = 8)
 
         override suspend fun receiveBundle(amountMsat: ULong?): ReceiveBundle =
@@ -63,6 +72,15 @@ class ReceiveControllerTest {
             append("bitcoin:").append(address.uppercase())
             if (invoice != null) append("?lightning=").append(invoice)
         }
+
+        override suspend fun getOrCreateOffer(): String? {
+            mintCalls++
+            mintGate?.await()
+            if (mintFails) throw WalletException.NotRunning()
+            return mintedOffer
+        }
+
+        override suspend fun bolt12Uri(offer: String): String = "bitcoin:?lno=$offer"
 
         override val walletEvents: Flow<Event> = events
     }
@@ -138,6 +156,94 @@ class ReceiveControllerTest {
             assertEquals(ReceiveStep.Display(InvoicePath.STANDARD), state.step)
             assertEquals(0, port.floorFetches)
             assertTrue(showBolt12Page(state.offerQrValue != null, state.needsAmount))
+        }
+    }
+
+    @Test
+    fun capacityCoveredEntryMintsTheMissingOfferAndRendersItsPage() {
+        val port = FakePort().apply {
+            inboundMsat = 100_000_000uL
+            // A usable channel (amountless needsJit = false) but nothing
+            // persisted yet — the core mints on demand.
+            bundleFor = { makeBundle(offer = null) }
+        }
+        controllerTest(port) { c ->
+            advanceUntilIdle()
+            val state = c.state.value
+            assertEquals(1, port.mintCalls)
+            assertEquals(TEST_RECEIVE_OFFER, state.offer)
+            assertEquals("bitcoin:?lno=$TEST_RECEIVE_OFFER".uppercase(), state.offerQrValue)
+            assertTrue(showBolt12Page(state.offerQrValue != null, state.needsAmount))
+        }
+    }
+
+    @Test
+    fun entryWithAPersistedOfferNeverMintsAgain() {
+        val port = FakePort().apply {
+            inboundMsat = 100_000_000uL
+            bundleFor = { makeBundle(offer = TEST_RECEIVE_OFFER) }
+        }
+        controllerTest(port) {
+            advanceUntilIdle()
+            assertEquals(0, port.mintCalls)
+        }
+    }
+
+    @Test
+    fun freshWalletEntryNeverMintsAnOffer() {
+        // No usable channel: the page could not render, so the ~93 s
+        // creation retry schedule must not run at all.
+        val port = freshWalletPort()
+        controllerTest(port) {
+            advanceUntilIdle()
+            assertEquals(0, port.mintCalls)
+        }
+    }
+
+    @Test
+    fun failedOfferCreationLeavesReceiveIntact() {
+        val port = FakePort().apply {
+            inboundMsat = 100_000_000uL
+            bundleFor = { makeBundle(offer = null) }
+            mintFails = true
+        }
+        controllerTest(port) { c ->
+            advanceUntilIdle()
+            val state = c.state.value
+            assertNull(state.offer)
+            assertNull(state.offerQrValue)
+            assertNull(state.loadError)
+            assertEquals(ReceiveStep.Display(InvoicePath.STANDARD), state.step)
+            assertFalse(showBolt12Page(state.offerQrValue != null, state.needsAmount))
+        }
+    }
+
+    @Test
+    fun aLateOfferLandsBesideTheJitFlowWithoutClobberingIt() {
+        val gate = CompletableDeferred<Unit>()
+        val port = FakePort().apply {
+            inboundMsat = 100_000_000uL
+            mintGate = gate
+            bundleFor = { amountMsat ->
+                // Amountless: capacity covered, so the mint gate opens.
+                // Amounted: over capacity, so the visit runs the JIT flow
+                // while creation is still retrying.
+                makeBundle(offer = null, needsJit = amountMsat != null)
+            }
+        }
+        controllerTest(port) { c ->
+            c.enterAmount("200000")
+            advanceUntilIdle()
+            assertIs<ReceiveStep.JitReview>(c.state.value.step)
+
+            // Creation finally succeeds mid-review.
+            gate.complete(Unit)
+            advanceUntilIdle()
+
+            val state = c.state.value
+            assertEquals(TEST_RECEIVE_OFFER, state.offer)
+            assertEquals("bitcoin:?lno=$TEST_RECEIVE_OFFER".uppercase(), state.offerQrValue)
+            assertIs<ReceiveStep.JitReview>(state.step)
         }
     }
 

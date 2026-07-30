@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Icon
@@ -59,6 +60,9 @@ fun ActivityScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(colors.field)
+            // No ScreenHeader on this tab, so the title needs the status-bar
+            // inset itself (targetSdk 35 is edge-to-edge).
+            .statusBarsPadding()
             .padding(top = 24.dp),
     ) {
         Text(

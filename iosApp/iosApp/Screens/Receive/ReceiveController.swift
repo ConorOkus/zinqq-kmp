@@ -23,6 +23,15 @@ protocol ReceivePort: AnyObject {
     /// The core's `build_bip321_uri` (copy form) — re-composes around a JIT invoice.
     func buildUnifiedUri(address: String, amountSats: UInt64?, invoice: String?) async throws -> String
 
+    /// Mints the persistent BOLT12 offer, or serves the persisted one (R6).
+    /// `nil` when the node is stopped or every attempt failed. Blinded paths
+    /// need the synced graph, so the core retries on its 3/6/12/24/48 s
+    /// schedule — this can block for ~93 s and never belongs on the entry path.
+    func getOrCreateOffer() async throws -> String?
+
+    /// The core's `build_bolt12_page_uri` — the offer page's copy form.
+    func bolt12Uri(offer: String) async throws -> String
+
     /// The core's live event rebroadcast (`paymentReceived` settles the
     /// visit). Each access is a fresh subscription registered synchronously
     /// at creation (Android's `walletEvents` shared-flow twin).
@@ -87,6 +96,7 @@ final class ReceiveController: ObservableObject {
     private var watcherTask: Task<Void, Never>?
     private var requestTask: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
+    private var offerTask: Task<Void, Never>?
     private var started = false
 
     init(
@@ -105,6 +115,7 @@ final class ReceiveController: ObservableObject {
         watcherTask?.cancel()
         requestTask?.cancel()
         expiryTask?.cancel()
+        offerTask?.cancel()
     }
 
     /// Screen entry: floor fetch + the amountless default bundle + settlement watch.
@@ -152,6 +163,10 @@ final class ReceiveController: ObservableObject {
                     invoicePath: bundle.bolt11 != nil ? .standard : InvoicePath.none
                 )
                 self.state = next
+                // An amountless `needsJit` IS the core's `has_usable_channel`
+                // (rust/src/receive.rs `needs_jit`), so this is exactly the
+                // offer gate: mint only when the offer page could render.
+                if !bundle.needsJit, bundle.offer == nil { self.mintOffer() }
             } catch {
                 guard !Task.isCancelled else { return }
                 self.state.loading = false
@@ -349,6 +364,27 @@ final class ReceiveController: ObservableObject {
                     state.step = .display(invoicePath: .none)
                 }
             }
+        }
+    }
+
+    /// The PWA's `loadOrCreateOffer` (`context.tsx:1655-1663`): the offer page
+    /// needs an offer only `ReceivePort.getOrCreateOffer` can mint, and minting
+    /// blocks through the core's retry schedule — so it runs BESIDE the screen
+    /// on its own task, never on the entry path. Only the offer fields are
+    /// folded in: by the time it lands the visit may be mid-JIT-flow, and the
+    /// rest of the state belongs to that flow. A failure is silent — the pager
+    /// simply stays at one page (the PWA swallows it the same way).
+    private func mintOffer() {
+        offerTask?.cancel()
+        offerTask = Task { [weak self] in
+            guard let self else { return }
+            // Offer creation NEVER degrades receive (core contract, R6).
+            guard let offer = try? await self.port.getOrCreateOffer(),
+                  let uri = try? await self.port.bolt12Uri(offer: offer),
+                  !Task.isCancelled
+            else { return }
+            self.state.offer = offer
+            self.state.offerQrValue = uri.uppercased()
         }
     }
 

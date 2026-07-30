@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -41,8 +42,12 @@ fun TabBar(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(ZinqqDimens.TabBarHeight)
+            // Background before the inset so the field color still paints
+            // behind the gesture bar (targetSdk 35 is edge-to-edge) while the
+            // pills and icons sit clear of it.
             .background(colors.field)
+            .navigationBarsPadding()
+            .height(ZinqqDimens.TabBarHeight)
             .padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
