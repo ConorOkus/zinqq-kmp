@@ -978,6 +978,17 @@ pub fn build_bip321_uri(
     crate::receive::build_bip321_uri(&address, amount_sats, invoice.as_deref())
 }
 
+/// The BOLT12 offer page's URI (U7, R6): `bitcoin:?lno={offer}`, the PWA's
+/// `buildBip321Uri({ lno })` form. This is the copy/share form; uppercase the
+/// WHOLE string for QR alphanumeric mode (as `ReceiveBundle::offer_qr_value`
+/// already does). Pure — usable while the node is stopped, e.g. folding a
+/// freshly minted [`Wallet::get_or_create_offer`] offer into a receive screen
+/// that is already rendered.
+#[uniffi::export]
+pub fn build_bolt12_uri(offer: String) -> String {
+    crate::receive::build_bolt12_page_uri(&offer)
+}
+
 /// The one FFI object: a node handle plus the persisted event queue.
 ///
 /// The queue owns its own `FilesystemStore` handle over the same store

@@ -371,6 +371,14 @@ class WalletHolder internal constructor(
         uniffi.wallet_core.buildBip321Uri(address, amountSats, invoice)
     }
 
+    // Blocking through the core's 3/6/12/24/48 s offer-creation retries, so
+    // the caller keeps it off the receive entry path (ReceiveController).
+    override suspend fun getOrCreateOffer(): String? =
+        withContext(Dispatchers.IO) { wallet.getOrCreateOffer() }
+
+    override suspend fun bolt12Uri(offer: String): String =
+        withContext(Dispatchers.IO) { uniffi.wallet_core.buildBolt12Uri(offer) }
+
     // ------------------------------------------------------------------
     // SettingsPort (U17, R14): thin passthroughs to the core's mnemonic and
     // channels/peers FFI. Bounds, guards, close estimates, and the connect

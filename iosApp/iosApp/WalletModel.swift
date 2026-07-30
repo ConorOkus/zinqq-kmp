@@ -979,6 +979,17 @@ extension WalletModel: ReceivePort {
             )
         }
     }
+
+    // Blocking through the core's 3/6/12/24/48 s offer-creation retries, so
+    // the caller keeps it off the receive entry path (ReceiveController).
+    func getOrCreateOffer() async throws -> String? {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { wallet.getOrCreateOffer() }
+    }
+
+    func bolt12Uri(offer: String) async throws -> String {
+        try await Self.runBlockingFFI { Wallet_core_nativeKt.buildBolt12Uri(offer: offer) }
+    }
 }
 
 // MARK: - SettingsPort (U22, R14)

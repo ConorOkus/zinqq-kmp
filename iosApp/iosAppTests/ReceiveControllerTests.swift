@@ -20,6 +20,13 @@ final class ReceiveControllerTests: XCTestCase {
         var inboundMsat: UInt64 = 0
         var floorFetches = 0
 
+        /// The offer the core mints; `nil` stands in for "every attempt failed".
+        var mintedOffer: String? = testReceiveOffer
+        var mintFails = false
+        var mintCalls = 0
+        /// Held open, this stands in for the core's retry schedule still running.
+        var mintGate: GatedMint?
+
         private var continuations: [AsyncStream<WalletEvent>.Continuation] = []
 
         func receiveBundle(amountMsat: UInt64?) async throws -> ReceiveBundle {
@@ -51,6 +58,15 @@ final class ReceiveControllerTests: XCTestCase {
             return uri
         }
 
+        func getOrCreateOffer() async throws -> String? {
+            mintCalls += 1
+            await mintGate?.wait()
+            if mintFails { throw kotlinError(WalletException.NotRunning()) }
+            return mintedOffer
+        }
+
+        func bolt12Uri(offer: String) async throws -> String { "bitcoin:?lno=\(offer)" }
+
         /// Fresh subscription per access, registered synchronously — the same
         /// contract as `WalletModel.walletEvents`.
         var walletEvents: AsyncStream<WalletEvent> {
@@ -79,6 +95,24 @@ final class ReceiveControllerTests: XCTestCase {
             )
         }
         return port
+    }
+
+    /// A hand-cranked offer mint: the fake port's `getOrCreateOffer` suspends
+    /// here until the test calls `fire()` — Android's `mintGate`
+    /// `CompletableDeferred` twin.
+    @MainActor
+    private final class GatedMint {
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func wait() async {
+            await withCheckedContinuation { waiters.append($0) }
+        }
+
+        func fire() {
+            let pending = waiters
+            waiters = []
+            for waiter in pending { waiter.resume() }
+        }
     }
 
     /// A hand-cranked expiry timer: the controller's injected `sleepMs`
@@ -179,6 +213,106 @@ final class ReceiveControllerTests: XCTestCase {
                 offerExists: state.offerQrValue != nil, needsAmount: state.needsAmount
             )
         )
+    }
+
+    @MainActor
+    func testCapacityCoveredEntryMintsTheMissingOfferAndRendersItsPage() async {
+        let port = FakeReceivePort()
+        port.inboundMsat = 100_000_000
+        // A usable channel (amountless needsJit = false) but nothing persisted
+        // yet — the core mints on demand.
+        port.bundleFor = { _ in makeBundle(offer: nil) }
+        let c = await startController(port)
+        await waitUntil { c.state.offer != nil }
+
+        let state = c.state
+        XCTAssertEqual(1, port.mintCalls)
+        XCTAssertEqual(testReceiveOffer, state.offer)
+        XCTAssertEqual("bitcoin:?lno=\(testReceiveOffer)".uppercased(), state.offerQrValue)
+        XCTAssertTrue(
+            showBolt12Page(
+                offerExists: state.offerQrValue != nil, needsAmount: state.needsAmount
+            )
+        )
+    }
+
+    @MainActor
+    func testEntryWithAPersistedOfferNeverMintsAgain() async {
+        let port = FakeReceivePort()
+        port.inboundMsat = 100_000_000
+        port.bundleFor = { _ in makeBundle(offer: testReceiveOffer) }
+        _ = await startController(port)
+        await waitUntil(timeout: 0.2) { false }
+
+        XCTAssertEqual(0, port.mintCalls)
+    }
+
+    @MainActor
+    func testFreshWalletEntryNeverMintsAnOffer() async {
+        // No usable channel: the page could not render, so the ~93 s creation
+        // retry schedule must not run at all.
+        let port = freshWalletPort()
+        _ = await startController(port)
+        await waitUntil(timeout: 0.2) { false }
+
+        XCTAssertEqual(0, port.mintCalls)
+    }
+
+    @MainActor
+    func testFailedOfferCreationLeavesReceiveIntact() async {
+        let port = FakeReceivePort()
+        port.inboundMsat = 100_000_000
+        port.bundleFor = { _ in makeBundle(offer: nil) }
+        port.mintFails = true
+        let c = await startController(port)
+        await waitUntil { port.mintCalls == 1 }
+        await waitUntil(timeout: 0.2) { false }
+
+        let state = c.state
+        XCTAssertNil(state.offer)
+        XCTAssertNil(state.offerQrValue)
+        XCTAssertNil(state.loadError)
+        XCTAssertEqual(.display(invoicePath: .standard), state.step)
+        XCTAssertFalse(
+            showBolt12Page(
+                offerExists: state.offerQrValue != nil, needsAmount: state.needsAmount
+            )
+        )
+    }
+
+    @MainActor
+    func testALateOfferLandsBesideTheJitFlowWithoutClobberingIt() async {
+        let gate = GatedMint()
+        let port = FakeReceivePort()
+        port.inboundMsat = 100_000_000
+        port.mintGate = gate
+        port.bundleFor = { amountMsat in
+            // Amountless: capacity covered, so the mint gate opens. Amounted:
+            // over capacity, so the visit runs the JIT flow while creation is
+            // still retrying.
+            makeBundle(offer: nil, needsJit: amountMsat != nil)
+        }
+        let c = await startController(port)
+
+        enterAmount(c, "200000")
+        await waitUntil {
+            if case .jitReview = c.state.step { return true }
+            return false
+        }
+        guard case .jitReview = c.state.step else {
+            return XCTFail("expected the JIT review step, got \(c.state.step)")
+        }
+
+        // Creation finally succeeds mid-review.
+        gate.fire()
+        await waitUntil { c.state.offer != nil }
+
+        let state = c.state
+        XCTAssertEqual(testReceiveOffer, state.offer)
+        XCTAssertEqual("bitcoin:?lno=\(testReceiveOffer)".uppercased(), state.offerQrValue)
+        if case .jitReview = state.step {} else {
+            XCTFail("the late offer clobbered the flow: \(state.step)")
+        }
     }
 
     @MainActor
