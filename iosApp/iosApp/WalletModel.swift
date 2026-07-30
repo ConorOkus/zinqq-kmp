@@ -992,15 +992,11 @@ extension WalletModel: ReceivePort {
     }
 
     // Non-blocking in the core (LDK owns the retry schedule and persistence),
-    // but kept off the main actor for consistency with its neighbours.
-    func asyncReceiveOffer() async throws -> String? {
+    // but kept off the main actor for consistency with its neighbours. One
+    // call per visit: the core's read consumes an offer from LDK's cache.
+    func asyncReceive() async throws -> AsyncReceiveView {
         let wallet = try requireWallet()
-        return try await Self.runBlockingFFI { wallet.asyncReceiveOffer() }
-    }
-
-    func asyncReceiveStatus() async throws -> AsyncReceiveStatus {
-        let wallet = try requireWallet()
-        return try await Self.runBlockingFFI { wallet.asyncReceiveStatus() }
+        return try await Self.runBlockingFFI { wallet.asyncReceive() }
     }
 }
 

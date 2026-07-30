@@ -113,13 +113,22 @@ entry — it is never silently dropped.
 
 ### 4. Watch it converge
 
-`Wallet.asyncReceiveStatus()` reports progress:
+`Wallet.asyncReceive()` returns the status and the offer together:
 
-| Status | Meaning |
-|--------|---------|
-| `DISABLED` | No paths configured. Every shipped build sits here. |
-| `AWAITING_SERVER` | Paths configured; LDK has not finished the offer/invoice handshake. |
-| `READY` | An offer exists — `asyncReceiveOffer()` returns it. |
+| Status | `offer` | Meaning |
+|--------|---------|---------|
+| `DISABLED` | `null` | No paths configured. Every shipped build sits here, and the core returns without touching LDK. |
+| `AWAITING_SERVER` | `null` | Paths configured; LDK has not finished the offer/invoice handshake (or the node is stopped). |
+| `READY` | the offer | An offer exists and is payable while the wallet is offline. |
+
+> **Call it once per visit.** `ChannelManager::get_async_receive_offer` is a
+> *mutating* read: it marks the freshest unused offer `Used` and requests a
+> `ChannelManager` persist. LDK keeps ten cached offers and hands out an unused
+> one each time specifically to limit reuse, so an extra call per screen visit
+> halves that rotation pool and doubles the `ServeStaticInvoice` churn against
+> your server. That is why status and offer come back from one call rather than
+> two getters — if you see offers rotating about twice as fast as expected,
+> something is reading twice.
 
 `AWAITING_SERVER` is the normal state for a while after start, and the normal
 *terminal* state when the server is unreachable. LDK drives the handshake

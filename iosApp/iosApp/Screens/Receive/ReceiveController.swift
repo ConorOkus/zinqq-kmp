@@ -32,14 +32,13 @@ protocol ReceivePort: AnyObject {
     /// The core's `build_bolt12_page_uri` — the offer page's copy form.
     func bolt12Uri(offer: String) async throws -> String
 
-    /// The async payments offer — payable while this wallet is offline. `nil`
-    /// unless `asyncReceiveStatus()` is `.ready`. Cheap and non-blocking,
-    /// unlike `getOrCreateOffer`: the core does no retrying or persisting of
-    /// its own here.
-    func asyncReceiveOffer() async throws -> String?
-
-    /// How far along async receive setup is — `.disabled` in shipped builds.
-    func asyncReceiveStatus() async throws -> AsyncReceiveStatus
+    /// Async receive state and offer together — payable while this wallet is
+    /// offline. `.disabled` with a nil offer in shipped builds.
+    ///
+    /// Call this at most **once** per receive visit: the core reads LDK's
+    /// offer cache exactly once per call, and that read consumes the freshest
+    /// unused offer. Cheap and non-blocking, unlike `getOrCreateOffer`.
+    func asyncReceive() async throws -> AsyncReceiveView
 
     /// The core's live event rebroadcast (`paymentReceived` settles the
     /// visit). Each access is a fresh subscription registered synchronously
@@ -408,17 +407,20 @@ final class ReceiveController: ObservableObject {
     /// every shipped build (no static invoice server is configured), so it
     /// must never be able to delay, gate, or fail the receive screen.
     ///
-    /// Both the status AND the offer are required: they are two calls, so a
-    /// `.ready` status can race ahead of an offer that has since gone away.
+    /// Exactly one `asyncReceive()` call: the core's read consumes an offer
+    /// from LDK's cache, so asking twice would burn two per visit and could
+    /// report a status about a different offer than the one rendered. Status
+    /// and offer arrive together, so they cannot disagree.
     private func loadAsyncOffer() {
         asyncOfferTask?.cancel()
         asyncOfferTask = Task { [weak self] in
             guard let self else { return }
             // Async receive NEVER degrades receive — same contract as the
-            // standard offer above.
-            guard let status = try? await self.port.asyncReceiveStatus(),
-                  status == .ready,
-                  let offer = try? await self.port.asyncReceiveOffer(),
+            // standard offer above. Both halves required: the core pairs
+            // them, but a page with no payload must never render.
+            guard let view = try? await self.port.asyncReceive(),
+                  view.status == .ready,
+                  let offer = view.offer,
                   let uri = try? await self.port.bolt12Uri(offer: offer),
                   !Task.isCancelled
             else { return }

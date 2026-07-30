@@ -31,6 +31,9 @@ final class ReceiveControllerTests: XCTestCase {
         var asyncStatus: AsyncReceiveStatus = .disabled
         var asyncOffer: String? = testAsyncReceiveOffer
         var asyncFails = false
+        /// Counts core reads. Each one consumes an offer from LDK's cache, so
+        /// the controller must make exactly one per visit.
+        var asyncReceiveCalls = 0
 
         private var continuations: [AsyncStream<WalletEvent>.Continuation] = []
 
@@ -72,14 +75,14 @@ final class ReceiveControllerTests: XCTestCase {
 
         func bolt12Uri(offer: String) async throws -> String { "bitcoin:?lno=\(offer)" }
 
-        func asyncReceiveOffer() async throws -> String? {
+        func asyncReceive() async throws -> AsyncReceiveView {
+            asyncReceiveCalls += 1
             if asyncFails { throw kotlinError(WalletException.NotRunning()) }
-            return asyncOffer
-        }
-
-        func asyncReceiveStatus() async throws -> AsyncReceiveStatus {
-            if asyncFails { throw kotlinError(WalletException.NotRunning()) }
-            return asyncStatus
+            // Mirrors the core's pairing: an offer only ever accompanies .ready.
+            return AsyncReceiveView(
+                status: asyncStatus,
+                offer: asyncStatus == .ready ? asyncOffer : nil
+            )
         }
 
         /// Fresh subscription per access, registered synchronously — the same
@@ -643,8 +646,8 @@ final class ReceiveControllerTests: XCTestCase {
         XCTAssertEqual([.unified, .bolt12], pagesFor(c.state))
     }
 
-    /// Status and offer are two calls, so `.ready` can race ahead of an offer
-    /// that has gone away. No page, no crash.
+    /// A `.ready` view with no offer is inconsistent — the core never
+    /// produces it — but the page must not render off a status alone.
     @MainActor
     func testReadyWithoutAnOfferAddsNoPage() async {
         let port = asyncPort()
@@ -684,6 +687,33 @@ final class ReceiveControllerTests: XCTestCase {
 
         XCTAssertNil(c.state.asyncOffer)
         XCTAssertEqual([.unified], pagesFor(c.state))
+    }
+
+    /// Each core read consumes an offer from LDK's ten-slot cache and asks
+    /// for a ChannelManager persist, so a visit must read exactly once —
+    /// never once for the status and again for the offer.
+    @MainActor
+    func testAVisitReadsAsyncReceiveExactlyOnce() async {
+        let port = asyncPort()
+        port.asyncStatus = .ready
+        let c = await startController(port)
+        await waitUntil { c.state.asyncOffer != nil }
+
+        XCTAssertEqual(testAsyncReceiveOffer, c.state.asyncOffer)
+        XCTAssertEqual(1, port.asyncReceiveCalls)
+    }
+
+    /// The `.disabled` path reads once too — the core short-circuits before
+    /// touching LDK's cache (asserted in the Rust suite), so the shell need
+    /// not special-case it.
+    @MainActor
+    func testADisabledVisitStillReadsOnlyOnce() async {
+        let port = asyncPort()
+        let c = await startController(port)
+        await settleAsyncOfferLoad()
+
+        XCTAssertNil(c.state.asyncOffer)
+        XCTAssertEqual(1, port.asyncReceiveCalls)
     }
 
     /// The async load runs on its own task, so a negative assertion has to

@@ -18,6 +18,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import uniffi.wallet_core.AsyncReceiveStatus
+import uniffi.wallet_core.AsyncReceiveView
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.JitInvoice
 import uniffi.wallet_core.JitQuote
@@ -52,6 +53,12 @@ class ReceiveControllerTest {
         var asyncStatus: AsyncReceiveStatus = AsyncReceiveStatus.DISABLED
         var asyncOffer: String? = TEST_ASYNC_RECEIVE_OFFER
         var asyncFails = false
+
+        /**
+         * Counts core reads. Each one consumes an offer from LDK's cache, so
+         * the controller must make exactly one per visit.
+         */
+        var asyncReceiveCalls = 0
 
         val events = MutableSharedFlow<Event>(extraBufferCapacity = 8)
 
@@ -88,14 +95,12 @@ class ReceiveControllerTest {
 
         override suspend fun bolt12Uri(offer: String): String = "bitcoin:?lno=$offer"
 
-        override suspend fun asyncReceiveOffer(): String? {
+        override suspend fun asyncReceive(): AsyncReceiveView {
+            asyncReceiveCalls++
             if (asyncFails) throw WalletException.NotRunning()
-            return asyncOffer
-        }
-
-        override suspend fun asyncReceiveStatus(): AsyncReceiveStatus {
-            if (asyncFails) throw WalletException.NotRunning()
-            return asyncStatus
+            // Mirrors the core's pairing: an offer only ever accompanies READY.
+            val offer = if (asyncStatus == AsyncReceiveStatus.READY) asyncOffer else null
+            return AsyncReceiveView(status = asyncStatus, offer = offer)
         }
 
         override val walletEvents: Flow<Event> = events
@@ -536,8 +541,8 @@ class ReceiveControllerTest {
     }
 
     /**
-     * Status and offer are two calls, so READY can race ahead of an offer
-     * that has gone away. No page, no crash.
+     * A READY view with no offer is inconsistent — the core never produces
+     * it — but the page must not render off a status alone. No page, no crash.
      */
     @Test
     fun readyWithoutAnOfferAddsNoPage() {
@@ -549,6 +554,34 @@ class ReceiveControllerTest {
             val state = c.state.value
             assertNull(state.asyncOffer)
             assertEquals(listOf(QrPage.UNIFIED, QrPage.BOLT12), pagesFor(state))
+        }
+    }
+
+    /**
+     * Each core read consumes an offer from LDK's ten-slot cache and asks for
+     * a ChannelManager persist, so a visit must read exactly once — never
+     * once for the status and again for the offer.
+     */
+    @Test
+    fun aVisitReadsAsyncReceiveExactlyOnce() {
+        val port = asyncPort().apply { asyncStatus = AsyncReceiveStatus.READY }
+        controllerTest(port) { c ->
+            assertEquals(TEST_ASYNC_RECEIVE_OFFER, c.state.value.asyncOffer)
+            assertEquals(1, port.asyncReceiveCalls)
+        }
+    }
+
+    /**
+     * The DISABLED path reads once too — the core short-circuits before
+     * touching LDK's cache (asserted in the Rust suite), so the shell need
+     * not special-case it.
+     */
+    @Test
+    fun aDisabledVisitStillReadsOnlyOnce() {
+        val port = asyncPort()
+        controllerTest(port) { c ->
+            assertNull(c.state.value.asyncOffer)
+            assertEquals(1, port.asyncReceiveCalls)
         }
     }
 

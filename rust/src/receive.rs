@@ -115,6 +115,50 @@ pub enum AsyncReceiveStatus {
     Ready,
 }
 
+/// Everything the receive screen needs about async payments, from **one**
+/// core call (U4).
+///
+/// Deliberately one call rather than a status getter plus an offer getter:
+/// LDK's `ChannelManager::get_async_receive_offer` is a *mutating* read. It
+/// marks the freshest unused offer `Used` and asks for a `ChannelManager`
+/// persist, so asking twice per screen visit would burn two of LDK's ten
+/// cached offers, double the VSS writes, and let the status and the rendered
+/// QR disagree about which offer was consumed.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AsyncReceiveView {
+    /// How far along async receive setup is.
+    pub status: AsyncReceiveStatus,
+    /// The offer payable while offline. `Some` exactly when `status` is
+    /// [`AsyncReceiveStatus::Ready`].
+    pub offer: Option<String>,
+}
+
+impl AsyncReceiveView {
+    /// No static invoice server configured — the shipped default.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            status: AsyncReceiveStatus::Disabled,
+            offer: None,
+        }
+    }
+
+    /// Configured, but no offer yet: either the node is stopped or LDK has
+    /// not finished the handshake with the server.
+    pub(crate) fn awaiting_server() -> Self {
+        Self {
+            status: AsyncReceiveStatus::AwaitingServer,
+            offer: None,
+        }
+    }
+
+    pub(crate) fn ready(offer: String) -> Self {
+        Self {
+            status: AsyncReceiveStatus::Ready,
+            offer: Some(offer),
+        }
+    }
+}
+
 /// A two-phase JIT quote (U7, F2 "fee review" step): everything the review
 /// screen renders, plus the single-use token `jit_accept` consumes. No
 /// LSP-side commitment exists yet — refusing/abandoning a quote costs

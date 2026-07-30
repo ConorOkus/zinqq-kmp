@@ -51,7 +51,7 @@ use crate::payment::{
     describe_failure_reason, parse_and_validate, payment_id_for, resolve_amount, send_bolt11,
     send_bolt12, validate_offer, SendError,
 };
-use crate::receive::AsyncReceiveStatus;
+use crate::receive::AsyncReceiveView;
 use crate::recovery::{
     self, RecoveryState, RecoveryStore, RecoverySweeper, AUTO_RECOVER_EVERY_TICKS,
     RECOVERY_TICK_INTERVAL,
@@ -951,39 +951,41 @@ impl Node {
             && crate::receive::read_persisted_offer(&kv_store).is_some()
     }
 
-    /// The BOLT12 offer that can be paid while this wallet is offline (U4) —
-    /// the async payments protocol's receive half. `None` while stopped, when
-    /// no static invoice server is configured, or while the handshake with
-    /// that server has not yet produced an offer.
+    /// Async receive state and offer together (U4) — the receive screen's one
+    /// async payments call.
+    ///
+    /// **Reads LDK's offer cache exactly once**, which is the whole reason
+    /// this is a single method: `ChannelManager::get_async_receive_offer` is a
+    /// mutating read that marks the freshest unused offer `Used` and requests
+    /// a `ChannelManager` persist. A separate status getter would consume a
+    /// second offer per screen visit — halving the rotation pool LDK keeps to
+    /// limit offer reuse — and could report `Ready` about a different offer
+    /// than the one rendered.
+    ///
+    /// Short-circuits to [`AsyncReceiveView::disabled`] before touching LDK
+    /// when no server is configured, which is every shipped build.
     ///
     /// Unlike [`Node::get_or_create_offer`] this neither retries nor persists
     /// anything locally, because LDK owns both: it refreshes the offer on its
     /// own timer and serializes the cache inside the `ChannelManager`, so the
     /// offer already rides the existing VSS backup. Non-blocking.
-    pub fn async_receive_offer(&self) -> Option<String> {
+    pub fn async_receive(&self) -> AsyncReceiveView {
+        if self.config.static_invoice_server_paths.is_empty() {
+            return AsyncReceiveView::disabled();
+        }
         let channel_manager = {
             let state_lock = self.state.lock().unwrap();
-            Arc::clone(&state_lock.as_ref()?.components.channel_manager)
+            match state_lock.as_ref() {
+                // Stopped-but-configured is AwaitingServer, not Disabled:
+                // paths ARE set, there is just no running node to serve the
+                // handshake yet.
+                None => return AsyncReceiveView::awaiting_server(),
+                Some(state) => Arc::clone(&state.components.channel_manager),
+            }
         };
-        channel_manager
-            .get_async_receive_offer()
-            .ok()
-            .map(|offer| offer.to_string())
-    }
-
-    /// How far along async receive is (U4). Distinguishes "never configured"
-    /// — the shipped default — from "configured, still handshaking with the
-    /// server", which [`Node::async_receive_offer`] alone cannot express.
-    pub fn async_receive_status(&self) -> AsyncReceiveStatus {
-        if self.config.static_invoice_server_paths.is_empty() {
-            return AsyncReceiveStatus::Disabled;
-        }
-        match self.async_receive_offer() {
-            Some(_) => AsyncReceiveStatus::Ready,
-            // A stopped node reads as AwaitingServer rather than Disabled:
-            // paths ARE configured, there is just no running node to serve
-            // the handshake yet.
-            None => AsyncReceiveStatus::AwaitingServer,
+        match channel_manager.get_async_receive_offer() {
+            Ok(offer) => AsyncReceiveView::ready(offer.to_string()),
+            Err(()) => AsyncReceiveView::awaiting_server(),
         }
     }
 
@@ -2715,12 +2717,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::new(offline_config(dir.path()));
 
-        assert_eq!(node.async_receive_offer(), None);
-        assert_eq!(node.async_receive_status(), AsyncReceiveStatus::Disabled);
+        assert_eq!(node.async_receive(), AsyncReceiveView::disabled());
 
         node.start().expect("offline degraded start");
-        assert_eq!(node.async_receive_offer(), None);
-        assert_eq!(node.async_receive_status(), AsyncReceiveStatus::Disabled);
+        assert_eq!(
+            node.async_receive(),
+            AsyncReceiveView::disabled(),
+            "the shipped default never touches LDK's offer cache"
+        );
         node.stop().unwrap();
     }
 
@@ -2738,16 +2742,16 @@ mod tests {
         let node = Node::new(config);
 
         assert_eq!(
-            node.async_receive_status(),
-            AsyncReceiveStatus::AwaitingServer,
+            node.async_receive(),
+            AsyncReceiveView::awaiting_server(),
             "stopped-but-configured is not Disabled"
         );
 
         node.start().expect("offline degraded start with paths");
-        assert_eq!(node.async_receive_offer(), None, "no server is reachable");
         assert_eq!(
-            node.async_receive_status(),
-            AsyncReceiveStatus::AwaitingServer
+            node.async_receive(),
+            AsyncReceiveView::awaiting_server(),
+            "no server is reachable, so no offer was ever built"
         );
         // Prove LDK actually took the paths, which the status alone cannot
         // show — it only reflects that the config is non-empty. Re-applying
@@ -2769,10 +2773,7 @@ mod tests {
         node.stop().unwrap();
 
         node.start().expect("re-applying the paths is safe");
-        assert_eq!(
-            node.async_receive_status(),
-            AsyncReceiveStatus::AwaitingServer
-        );
+        assert_eq!(node.async_receive(), AsyncReceiveView::awaiting_server());
         node.stop().unwrap();
     }
 

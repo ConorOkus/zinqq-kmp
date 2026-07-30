@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import uniffi.wallet_core.AsyncReceiveStatus
+import uniffi.wallet_core.AsyncReceiveView
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.JitInvoice
 import uniffi.wallet_core.JitQuote
@@ -52,15 +53,14 @@ interface ReceivePort {
     suspend fun bolt12Uri(offer: String): String
 
     /**
-     * The async payments offer — payable while this wallet is offline.
-     * `null` unless [asyncReceiveStatus] is [AsyncReceiveStatus.READY]. Cheap
-     * and non-blocking, unlike [getOrCreateOffer]: the core does no retrying
-     * or persisting of its own here.
+     * Async receive state and offer together — payable while this wallet is
+     * offline. `DISABLED` with a null offer in shipped builds.
+     *
+     * Call this at most **once** per receive visit: the core reads LDK's
+     * offer cache exactly once per call, and that read consumes the freshest
+     * unused offer. Cheap and non-blocking, unlike [getOrCreateOffer].
      */
-    suspend fun asyncReceiveOffer(): String?
-
-    /** How far along async receive setup is — `DISABLED` in shipped builds. */
-    suspend fun asyncReceiveStatus(): AsyncReceiveStatus
+    suspend fun asyncReceive(): AsyncReceiveView
 
     /** The core's live event stream ([Event.PaymentReceived] settles the visit). */
     val walletEvents: Flow<Event>
@@ -123,6 +123,7 @@ class ReceiveController(
 
     private var requestJob: Job? = null
     private var expiryJob: Job? = null
+    private var asyncOfferJob: Job? = null
     private var started = false
 
     /** Screen entry: floor fetch + the amountless default bundle + settlement watch. */
@@ -422,14 +423,20 @@ class ReceiveController(
      * every shipped build (no static invoice server is configured), so it
      * must never be able to delay, gate, or fail the receive screen.
      *
-     * Both the status AND the offer are required: they are two calls, so a
-     * `READY` status can race ahead of an offer that has since gone away.
+     * Exactly one [ReceivePort.asyncReceive] call: the core's read consumes an
+     * offer from LDK's cache, so asking twice would burn two per visit and
+     * could report a status about a different offer than the one rendered.
+     * Status and offer arrive together, so they cannot disagree.
      */
     private fun loadAsyncOffer() {
-        scope.launch {
+        asyncOfferJob?.cancel()
+        asyncOfferJob = scope.launch {
             try {
-                if (port.asyncReceiveStatus() != AsyncReceiveStatus.READY) return@launch
-                val offer = port.asyncReceiveOffer() ?: return@launch
+                val view = port.asyncReceive()
+                // Both halves required: the core pairs them, but a page with
+                // no payload must never render.
+                if (view.status != AsyncReceiveStatus.READY) return@launch
+                val offer = view.offer ?: return@launch
                 val qrValue = port.bolt12Uri(offer).uppercase()
                 _state.update { it.copy(asyncOffer = offer, asyncOfferQrValue = qrValue) }
             } catch (e: CancellationException) {
