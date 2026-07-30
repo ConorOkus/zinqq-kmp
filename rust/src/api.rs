@@ -24,7 +24,7 @@ use crate::liquidity::Lsps2Error;
 use crate::node::Node;
 use crate::onchain_send::{FeeEstimate, MaxSendEstimate, OnchainSendError};
 use crate::payment::SendError;
-use crate::receive::{JitInvoice, JitQuote, ReceiveBundle, ReceiveError};
+use crate::receive::{AsyncReceiveStatus, JitInvoice, JitQuote, ReceiveBundle, ReceiveError};
 use crate::restore::RestoreError;
 use crate::send::{self, Classified, HttpNameResolver, LnurlPayMetadata, ResolveError};
 use crate::types::Logger;
@@ -1168,6 +1168,23 @@ impl Wallet {
     /// while stopped.
     pub fn offer_available(&self) -> bool {
         self.node.offer_available()
+    }
+
+    /// The BOLT12 offer that can be paid while this wallet is offline (U4) —
+    /// the async payments protocol's receive half. `None` unless
+    /// [`Wallet::async_receive_status`] is `Ready`. Non-blocking, unlike
+    /// [`Wallet::get_or_create_offer`]: LDK owns the retry schedule and the
+    /// persistence, so there is nothing to wait on here.
+    pub fn async_receive_offer(&self) -> Option<String> {
+        self.node.async_receive_offer()
+    }
+
+    /// How far along async receive is (U4). `Disabled` in every shipped build
+    /// — the feature needs a static invoice server configured at construction
+    /// via [`WalletConfig::static_invoice_server_paths`], and none is
+    /// reachable for zinqq users yet. Non-blocking.
+    pub fn async_receive_status(&self) -> AsyncReceiveStatus {
+        self.node.async_receive_status()
     }
 
     /// Pays a fixed-amount mainnet BOLT11 invoice (compat shim for the

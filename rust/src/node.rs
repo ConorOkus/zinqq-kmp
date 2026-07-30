@@ -51,6 +51,7 @@ use crate::payment::{
     describe_failure_reason, parse_and_validate, payment_id_for, resolve_amount, send_bolt11,
     send_bolt12, validate_offer, SendError,
 };
+use crate::receive::AsyncReceiveStatus;
 use crate::recovery::{
     self, RecoveryState, RecoveryStore, RecoverySweeper, AUTO_RECOVER_EVERY_TICKS,
     RECOVERY_TICK_INTERVAL,
@@ -481,6 +482,25 @@ impl Node {
             Arc::clone(&liquidity_source),
             stop_sender.subscribe(),
         );
+
+        // Async payments, recipient half (U3). A no-op for the default empty
+        // configuration, which is every shipped build. Never fails start:
+        // async receive is an opt-in extra, and the standard receive paths
+        // must not depend on it.
+        match crate::receive::apply_static_invoice_server_paths(
+            &components.channel_manager,
+            &self.config.static_invoice_server_paths,
+        ) {
+            Ok(0) => {}
+            Ok(count) => log_info!(
+                components.logger,
+                "Async receive: configured {count} path(s) to the static invoice server"
+            ),
+            Err(()) => log_error!(
+                components.logger,
+                "Async receive: LDK rejected the configured static invoice server paths"
+            ),
+        }
 
         // U11 (KTD-8): the core-owned sweep engine over the shared
         // descriptor store. The reserve closure reads the channel count at
@@ -929,6 +949,42 @@ impl Node {
             .iter()
             .any(|details| details.is_usable)
             && crate::receive::read_persisted_offer(&kv_store).is_some()
+    }
+
+    /// The BOLT12 offer that can be paid while this wallet is offline (U4) —
+    /// the async payments protocol's receive half. `None` while stopped, when
+    /// no static invoice server is configured, or while the handshake with
+    /// that server has not yet produced an offer.
+    ///
+    /// Unlike [`Node::get_or_create_offer`] this neither retries nor persists
+    /// anything locally, because LDK owns both: it refreshes the offer on its
+    /// own timer and serializes the cache inside the `ChannelManager`, so the
+    /// offer already rides the existing VSS backup. Non-blocking.
+    pub fn async_receive_offer(&self) -> Option<String> {
+        let channel_manager = {
+            let state_lock = self.state.lock().unwrap();
+            Arc::clone(&state_lock.as_ref()?.components.channel_manager)
+        };
+        channel_manager
+            .get_async_receive_offer()
+            .ok()
+            .map(|offer| offer.to_string())
+    }
+
+    /// How far along async receive is (U4). Distinguishes "never configured"
+    /// — the shipped default — from "configured, still handshaking with the
+    /// server", which [`Node::async_receive_offer`] alone cannot express.
+    pub fn async_receive_status(&self) -> AsyncReceiveStatus {
+        if self.config.static_invoice_server_paths.is_empty() {
+            return AsyncReceiveStatus::Disabled;
+        }
+        match self.async_receive_offer() {
+            Some(_) => AsyncReceiveStatus::Ready,
+            // A stopped node reads as AwaitingServer rather than Disabled:
+            // paths ARE configured, there is just no running node to serve
+            // the handshake yet.
+            None => AsyncReceiveStatus::AwaitingServer,
+        }
     }
 
     /// Pays a mainnet BOLT11 invoice (U5). Blocking (route computation): call
@@ -2632,6 +2688,110 @@ mod tests {
 
     fn payment_hash(byte: u8) -> PaymentHash {
         PaymentHash([byte; 32])
+    }
+
+    /// A real `BlindedMessagePath` to stand in for one a static invoice
+    /// server operator would hand over (U3).
+    fn static_invoice_server_path() -> lightning::blinded_path::message::BlindedMessagePath {
+        use lightning::blinded_path::message::{BlindedMessagePath, MessageContext};
+        use lightning::sign::{KeysManager, NodeSigner as _, Recipient};
+
+        let keys = KeysManager::new(&[9u8; 32], 0, 0, false);
+        BlindedMessagePath::one_hop(
+            keys.get_node_id(Recipient::Node).unwrap(),
+            keys.get_receive_auth_key(),
+            MessageContext::Custom(b"static-invoice-server".to_vec()),
+            &keys,
+            &bitcoin::secp256k1::Secp256k1::new(),
+        )
+    }
+
+    /// U3/U4, AE3 and R6: with no static invoice server configured — the
+    /// shipped default — async receive is inert. Both endpoints degrade
+    /// safely while stopped AND while running, exactly like the standard
+    /// offer endpoints above them.
+    #[test]
+    fn async_receive_is_inert_without_a_configured_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new(offline_config(dir.path()));
+
+        assert_eq!(node.async_receive_offer(), None);
+        assert_eq!(node.async_receive_status(), AsyncReceiveStatus::Disabled);
+
+        node.start().expect("offline degraded start");
+        assert_eq!(node.async_receive_offer(), None);
+        assert_eq!(node.async_receive_status(), AsyncReceiveStatus::Disabled);
+        node.stop().unwrap();
+    }
+
+    /// U3/U4, AE4: configured paths are applied at start without blocking or
+    /// failing it, even with no peers connected — LDK's timer-driven refresh
+    /// owns convergence. The status reports `AwaitingServer` rather than
+    /// `Disabled`, because no server is reachable from an offline test and
+    /// the handshake never completes. Re-running start proves KTD-3's claim
+    /// that re-application is safe.
+    #[test]
+    fn configured_static_invoice_server_paths_apply_at_every_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = offline_config(dir.path());
+        config.static_invoice_server_paths = vec![static_invoice_server_path()];
+        let node = Node::new(config);
+
+        assert_eq!(
+            node.async_receive_status(),
+            AsyncReceiveStatus::AwaitingServer,
+            "stopped-but-configured is not Disabled"
+        );
+
+        node.start().expect("offline degraded start with paths");
+        assert_eq!(node.async_receive_offer(), None, "no server is reachable");
+        assert_eq!(
+            node.async_receive_status(),
+            AsyncReceiveStatus::AwaitingServer
+        );
+        // Prove LDK actually took the paths, which the status alone cannot
+        // show — it only reflects that the config is non-empty. Re-applying
+        // against the live channel manager is the same call `start` makes, so
+        // an Ok here is also KTD-3's re-application claim under test.
+        {
+            let state_lock = node.state.lock().unwrap();
+            let channel_manager =
+                Arc::clone(&state_lock.as_ref().unwrap().components.channel_manager);
+            drop(state_lock);
+            assert_eq!(
+                crate::receive::apply_static_invoice_server_paths(
+                    &channel_manager,
+                    &[static_invoice_server_path()]
+                ),
+                Ok(1)
+            );
+        }
+        node.stop().unwrap();
+
+        node.start().expect("re-applying the paths is safe");
+        assert_eq!(
+            node.async_receive_status(),
+            AsyncReceiveStatus::AwaitingServer
+        );
+        node.stop().unwrap();
+    }
+
+    /// U3: the empty case is a genuine no-op, not a rejected call — this is
+    /// the path every shipped build takes on every start.
+    #[test]
+    fn applying_no_static_invoice_server_paths_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new(offline_config(dir.path()));
+        node.start().expect("offline degraded start");
+
+        let state_lock = node.state.lock().unwrap();
+        let channel_manager = Arc::clone(&state_lock.as_ref().unwrap().components.channel_manager);
+        drop(state_lock);
+        assert_eq!(
+            crate::receive::apply_static_invoice_server_paths(&channel_manager, &[]),
+            Ok(0)
+        );
+        node.stop().unwrap();
     }
 
     /// U5 persist-then-ack, failure half: when the settle CANNOT be made

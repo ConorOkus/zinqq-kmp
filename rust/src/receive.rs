@@ -72,6 +72,47 @@ pub(crate) const OFFER_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
 pub(crate) const OFFER_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const OFFER_PERSISTENCE_KEY: &str = "bolt12_offer";
 
+/// Tells LDK which static invoice server to build async receive offers with
+/// (U3), returning how many paths were accepted.
+///
+/// Safe to call on every start: LDK overwrites the stored path list while
+/// preserving its offer slots, and errors only on an empty input (which the
+/// caller excludes). The offer handshake itself is driven by the background
+/// processor's timer ticks, so a call made before any peer is connected still
+/// converges — there is nothing here to sequence or retry.
+pub(crate) fn apply_static_invoice_server_paths(
+    channel_manager: &crate::types::ChannelManager,
+    paths: &[lightning::blinded_path::message::BlindedMessagePath],
+) -> Result<usize, ()> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    channel_manager
+        .set_paths_to_static_invoice_server(paths.to_vec())
+        .map(|()| paths.len())
+}
+
+/// How far along the async payments receive setup is (U4) — the protocol that
+/// lets a payer pay this wallet while it is offline, via a static invoice
+/// server that serves BOLT12 static invoices on our behalf.
+///
+/// Three states rather than a nullable offer, because "you never configured
+/// this" and "configured, still handshaking with the server" want different
+/// treatment and a `None` offer cannot tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AsyncReceiveStatus {
+    /// No static invoice server configured — the shipped default. Async
+    /// receive does nothing and the receive screen is unchanged.
+    Disabled,
+    /// Paths are configured, but LDK has not yet completed the offer/invoice
+    /// handshake with the server, so there is no offer to show. LDK retries on
+    /// its own background timer; nothing here needs to poll.
+    AwaitingServer,
+    /// An async receive offer exists and can be paid while this wallet is
+    /// offline.
+    Ready,
+}
+
 /// A two-phase JIT quote (U7, F2 "fee review" step): everything the review
 /// screen renders, plus the single-use token `jit_accept` consumes. No
 /// LSP-side commitment exists yet — refusing/abandoning a quote costs
