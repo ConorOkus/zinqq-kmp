@@ -291,7 +291,7 @@ private fun QrDisplay(
     val pagerState = rememberPagerState(pageCount = { pages.size })
 
     // Reset to the unified page when the current page is removed (PWA:373-375).
-    LaunchedEffect(pages.size) {
+    LaunchedEffect(pages) {
         if (pagerState.currentPage >= pages.size) pagerState.scrollToPage(0)
     }
     LaunchedEffect(pagerState.currentPage, pages) {

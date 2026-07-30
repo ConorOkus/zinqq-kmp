@@ -22,6 +22,7 @@
 
 use std::time::Duration;
 
+use lightning::blinded_path::message::BlindedMessagePath;
 use lightning::ln::channelmanager::Bolt11InvoiceParameters;
 use lightning::util::persist::KVStoreSync as _;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
@@ -31,6 +32,7 @@ use lightning_persister::fs_store::FilesystemStore;
 use crate::channels::ChannelView;
 use crate::config::RECEIVE_INVOICE_DESCRIPTION;
 use crate::liquidity::{datetime_unix_secs, Lsps2Error};
+use crate::types::ChannelManager;
 
 /// Static fallback floor (sats) for a JIT receive, used whenever the live
 /// menu fetch failed, returned an empty/degenerate menu, or has not resolved
@@ -81,8 +83,8 @@ pub(crate) const OFFER_PERSISTENCE_KEY: &str = "bolt12_offer";
 /// processor's timer ticks, so a call made before any peer is connected still
 /// converges — there is nothing here to sequence or retry.
 pub(crate) fn apply_static_invoice_server_paths(
-    channel_manager: &crate::types::ChannelManager,
-    paths: &[lightning::blinded_path::message::BlindedMessagePath],
+    channel_manager: &ChannelManager,
+    paths: &[BlindedMessagePath],
 ) -> Result<usize, ()> {
     if paths.is_empty() {
         return Ok(0);

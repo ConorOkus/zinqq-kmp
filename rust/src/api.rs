@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use lightning::blinded_path::message::BlindedMessagePath;
 use lightning_persister::fs_store::FilesystemStore;
 
 use crate::builder::{BuildError, KV_STORE_SUBDIR};
@@ -971,13 +972,28 @@ fn apply_config_overrides(config: WalletConfig) -> Result<Config, WalletError> {
         // LDK's own `Readable`, so an operator's `Writeable` output and our
         // input cannot drift (the paths are produced by
         // `ChannelManager::blinded_paths_for_async_recipient`).
-        let path = lightning::util::ser::Readable::read(&mut &bytes[..]).map_err(|e| {
-            WalletError::InvalidConfig {
-                detail: format!(
+        let mut cursor = &bytes[..];
+        let path: BlindedMessagePath =
+            lightning::util::ser::Readable::read(&mut cursor).map_err(|e| {
+                WalletError::InvalidConfig {
+                    detail: format!(
                     "static invoice server path {index} is not a readable blinded message path: {e:?}"
                 ),
-            }
-        })?;
+                }
+            })?;
+        // `Readable` stops at the end of the TLV stream and ignores whatever
+        // follows, so a truncated-and-padded or concatenated blob would decode
+        // to a valid-looking prefix. Rejecting leftovers is what makes the
+        // "operator's output IS our input" claim above actually hold.
+        if !cursor.is_empty() {
+            return Err(WalletError::InvalidConfig {
+                detail: format!(
+                    "static invoice server path {index} has {} trailing byte(s) after \
+                     a complete blinded message path",
+                    cursor.len()
+                ),
+            });
+        }
         core_config.static_invoice_server_paths.push(path);
     }
 
@@ -1679,6 +1695,26 @@ mod tests {
                     detail.contains("blinded message path"),
                     "names the failure: {detail}"
                 );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// U2: a valid path with junk appended is rejected, not silently accepted
+    /// as its prefix — `Readable` alone stops at the end of the TLV stream and
+    /// ignores the rest, which would let a corrupted blob decode to a
+    /// valid-looking path.
+    #[test]
+    fn static_invoice_server_path_rejects_trailing_bytes() {
+        let mut ffi_config = base_config();
+        ffi_config.static_invoice_server_paths =
+            vec![format!("{}deadbeef", encoded_blinded_message_path())];
+
+        let err = apply_config_overrides(ffi_config).unwrap_err();
+        match err {
+            WalletError::InvalidConfig { detail } => {
+                assert!(detail.contains("path 0"), "names the entry: {detail}");
+                assert!(detail.contains("trailing"), "names the failure: {detail}");
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }

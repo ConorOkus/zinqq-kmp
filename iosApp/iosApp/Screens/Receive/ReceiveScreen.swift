@@ -174,10 +174,6 @@ private struct QrDisplay: View {
 
     @Environment(\.zinqqColors) private var colors
 
-    private var showBolt12: Bool {
-        showBolt12Page(offerExists: state.offerQrValue != nil, needsAmount: state.needsAmount)
-    }
-
     private var pages: [QrPage] {
         receivePages(
             offerExists: state.offerQrValue != nil,
@@ -223,7 +219,7 @@ private struct QrDisplay: View {
                         )
                         .padding(.horizontal, 16)
                         .tag(QrPage.unified)
-                        if showBolt12 {
+                        if pages.contains(.bolt12) {
                             QrView(
                                 payload: state.offerQrValue ?? "",
                                 accessibilityLabel: "QR code for BOLT 12 offer"
