@@ -71,6 +71,16 @@ pub struct WalletConfig {
     /// Megalith seed and the configured LSP (KTD-10: a set + predicate).
     #[uniffi(default = [])]
     pub trusted_lsp_node_ids: Vec<String>,
+    /// Blinded message paths to a BOLT12 static invoice server, each the hex
+    /// of LDK's own `BlindedMessagePath` serialization — the async payments
+    /// protocol's receive half (see [`Wallet::async_receive_status`]).
+    ///
+    /// Empty in every shipped build. The paths must be obtained out-of-band
+    /// from the server operator (LDK has no in-band fetch), so this exists for
+    /// dev builds and integration testing against a self-hosted server:
+    /// `docs/runbooks/async-payments-static-invoice-server.md`.
+    #[uniffi(default = [])]
+    pub static_invoice_server_paths: Vec<String>,
 }
 
 /// Wallet balances, from U2's bdk wallet and channel monitors, split per U5:
@@ -952,6 +962,25 @@ fn apply_config_overrides(config: WalletConfig) -> Result<Config, WalletError> {
         }
     }
 
+    for (index, encoded) in config.static_invoice_server_paths.iter().enumerate() {
+        let bytes = <Vec<u8> as bitcoin::hex::FromHex>::from_hex(encoded.trim()).map_err(|e| {
+            WalletError::InvalidConfig {
+                detail: format!("static invoice server path {index} is not valid hex: {e}"),
+            }
+        })?;
+        // LDK's own `Readable`, so an operator's `Writeable` output and our
+        // input cannot drift (the paths are produced by
+        // `ChannelManager::blinded_paths_for_async_recipient`).
+        let path = lightning::util::ser::Readable::read(&mut &bytes[..]).map_err(|e| {
+            WalletError::InvalidConfig {
+                detail: format!(
+                    "static invoice server path {index} is not a readable blinded message path: {e:?}"
+                ),
+            }
+        })?;
+        core_config.static_invoice_server_paths.push(path);
+    }
+
     Ok(core_config)
 }
 
@@ -1538,7 +1567,112 @@ mod tests {
             lsp_host: None,
             lsp_port: None,
             trusted_lsp_node_ids: Vec::new(),
+            static_invoice_server_paths: Vec::new(),
         }
+    }
+
+    /// A real `BlindedMessagePath`, hex-encoded the way a static invoice
+    /// server operator would hand it over. Built through LDK's own
+    /// constructor and serializer rather than a pasted literal, so the
+    /// fixture cannot rot against an LDK encoding change (U2).
+    fn encoded_blinded_message_path() -> String {
+        use bitcoin::hex::DisplayHex as _;
+        use lightning::blinded_path::message::{BlindedMessagePath, MessageContext};
+        use lightning::sign::{KeysManager, NodeSigner as _, Recipient};
+        use lightning::util::ser::Writeable as _;
+
+        let keys = KeysManager::new(&[42u8; 32], 0, 0, false);
+        let node_id = keys.get_node_id(Recipient::Node).unwrap();
+        let path = BlindedMessagePath::one_hop(
+            node_id,
+            keys.get_receive_auth_key(),
+            MessageContext::Custom(b"static-invoice-server".to_vec()),
+            &keys,
+            &bitcoin::secp256k1::Secp256k1::new(),
+        );
+        path.encode().to_lower_hex_string()
+    }
+
+    /// U2/AE2: a well-formed path decodes into the core config and round-trips
+    /// back to the same bytes.
+    #[test]
+    fn static_invoice_server_paths_decode_and_round_trip() {
+        use bitcoin::hex::DisplayHex as _;
+        use lightning::util::ser::Writeable as _;
+
+        let encoded = encoded_blinded_message_path();
+        let mut ffi_config = base_config();
+        ffi_config.static_invoice_server_paths = vec![encoded.clone()];
+
+        let config = apply_config_overrides(ffi_config).unwrap();
+        assert_eq!(config.static_invoice_server_paths.len(), 1);
+        assert_eq!(
+            config.static_invoice_server_paths[0]
+                .encode()
+                .to_lower_hex_string(),
+            encoded
+        );
+    }
+
+    /// U2: multiple paths are kept, in input order.
+    #[test]
+    fn static_invoice_server_paths_preserve_input_order() {
+        let encoded = encoded_blinded_message_path();
+        let mut ffi_config = base_config();
+        ffi_config.static_invoice_server_paths = vec![encoded.clone(), encoded.clone()];
+
+        let config = apply_config_overrides(ffi_config).unwrap();
+        assert_eq!(config.static_invoice_server_paths.len(), 2);
+        assert_eq!(
+            config.static_invoice_server_paths[0],
+            config.static_invoice_server_paths[1]
+        );
+    }
+
+    /// U2/AE2: invalid hex is an `InvalidConfig` naming the offending entry,
+    /// never a panic.
+    #[test]
+    fn static_invoice_server_path_rejects_invalid_hex() {
+        let mut ffi_config = base_config();
+        ffi_config.static_invoice_server_paths =
+            vec![encoded_blinded_message_path(), "zz".to_string()];
+
+        let err = apply_config_overrides(ffi_config).unwrap_err();
+        match err {
+            WalletError::InvalidConfig { detail } => {
+                assert!(detail.contains("path 1"), "names the entry: {detail}");
+                assert!(detail.contains("hex"), "names the failure: {detail}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// U2/AE2: valid hex that is not a readable blinded message path is also
+    /// an `InvalidConfig`, not a panic.
+    #[test]
+    fn static_invoice_server_path_rejects_undecodable_bytes() {
+        let mut ffi_config = base_config();
+        ffi_config.static_invoice_server_paths = vec!["00".to_string()];
+
+        let err = apply_config_overrides(ffi_config).unwrap_err();
+        match err {
+            WalletError::InvalidConfig { detail } => {
+                assert!(detail.contains("path 0"), "names the entry: {detail}");
+                assert!(
+                    detail.contains("blinded message path"),
+                    "names the failure: {detail}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// U2/R6: the default is empty — async receive stays inert unless a
+    /// server is explicitly configured.
+    #[test]
+    fn static_invoice_server_paths_default_to_empty() {
+        let config = apply_config_overrides(base_config()).unwrap();
+        assert!(config.static_invoice_server_paths.is_empty());
     }
 
     /// U12/KTD-12: no overrides yields the PWA's infrastructure defaults.

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::Network;
+use lightning::blinded_path::message::BlindedMessagePath;
 use lightning::util::config::UserConfig;
 
 /// Every network-dependent constant, keyed by the one network this wallet
@@ -300,6 +301,24 @@ pub struct Config {
     /// pubkey). Seeded with Megalith; the configured [`Config::lsp`] is
     /// always trusted too (mirroring the PWA's `trustedLspIds`).
     pub trusted_lsps: Vec<PublicKey>,
+    /// Blinded message paths to a BOLT12 **static invoice server** — the
+    /// always-online node that serves static invoices on our behalf so payers
+    /// can pay us while this wallet is offline (the async payments protocol).
+    ///
+    /// Empty by default, and empty in every shipped build: LDK's async
+    /// payments flow is pre-production and works LDK-to-LDK only, and no
+    /// static invoice server is reachable for zinqq users yet (Megalith is an
+    /// LSPS2 provider; `lightning-liquidity` has no path-fetch message). The
+    /// field exists so the receive half can be exercised end-to-end against a
+    /// self-hosted server — see `docs/runbooks/async-payments-static-invoice-server.md`.
+    ///
+    /// Non-empty means the node calls
+    /// `ChannelManager::set_paths_to_static_invoice_server` once per start.
+    ///
+    /// **Trust boundary:** these paths name who serves invoices on the user's
+    /// behalf. They are settable only at wallet construction from the app's
+    /// own build config — deliberately not from user input or a remote fetch.
+    pub static_invoice_server_paths: Vec<BlindedMessagePath>,
     /// Test-only in-process VSS transport (see [`VssTransportOverride`]).
     #[cfg(test)]
     pub(crate) vss_transport_override: Option<VssTransportOverride>,
@@ -320,6 +339,7 @@ impl Config {
             lsp: LspConfig::megalith(),
             trusted_lsps: vec![PublicKey::from_str(MEGALITH_LSP_NODE_ID)
                 .expect("Megalith node id constant is a valid public key")],
+            static_invoice_server_paths: Vec::new(),
             #[cfg(test)]
             vss_transport_override: None,
         }
@@ -367,6 +387,26 @@ pub(crate) fn default_user_config() -> UserConfig {
     // The LSP deducts its opening fee before forwarding; allow claiming the
     // underpaying HTLC (the fee is validated at invoice creation).
     config.channel_config.accept_underpaying_htlcs = JIT_ACCEPT_UNDERPAYING_HTLCS;
+    // Async payments, payer half: when an offer resolves to a BOLT12
+    // `StaticInvoice`, hold the outbound HTLCs at our next hop so the phone
+    // can go offline before the often-offline recipient wakes up to claim.
+    //
+    // Two facts make this safe to turn on for a mainnet wallet:
+    //   1. Blast radius is one branch. LDK reads this flag only in
+    //      `ChannelManager::hold_htlc_channels`, called only from
+    //      `initiate_async_payment` — the `StaticInvoice` arm. BOLT11, JIT,
+    //      and ordinary BOLT12 payments never reach it.
+    //   2. It degrades gracefully. `hold_htlc_channels` filters for a live
+    //      counterparty advertising `htlc_hold`; with none, it returns
+    //      `Err(())` and LDK falls back to `enqueue_held_htlc_available`,
+    //      i.e. today's behavior of staying online for `ReleaseHeldHtlc`.
+    //      So this needs no feature probe against Megalith.
+    config.hold_outbound_htlcs_at_next_hop = true;
+    // Deliberately left at LDK's `false`: `enable_htlc_hold` makes US hold
+    // HTLCs for other people's often-offline peers, and LDK documents it as
+    // for nodes "which expect to be online reliably". A mobile wallet is the
+    // opposite of that.
+    debug_assert!(!config.enable_htlc_hold);
     config
 }
 
@@ -398,6 +438,27 @@ mod tests {
             vec![PublicKey::from_str(MEGALITH_LSP_NODE_ID).unwrap()],
             "the trusted-LSP set is seeded with Megalith"
         );
+        assert!(
+            config.static_invoice_server_paths.is_empty(),
+            "async receive stays inert unless a static invoice server is configured"
+        );
+    }
+
+    /// U1: the payer half of async payments is ON — a zinqq user paying an
+    /// offer that resolves to a `StaticInvoice` locks the HTLCs in at the
+    /// next hop and can then go offline.
+    #[test]
+    fn user_config_holds_outbound_htlcs_at_the_next_hop() {
+        assert!(default_user_config().hold_outbound_htlcs_at_next_hop);
+    }
+
+    /// U1: the *always-online* half stays OFF. Asserted separately from the
+    /// flag above so a future "turn on async payments" edit cannot flip this
+    /// one by association — a mobile wallet must never take on holding HTLCs
+    /// for somebody else's often-offline peer.
+    #[test]
+    fn user_config_never_holds_htlcs_for_other_peers() {
+        assert!(!default_user_config().enable_htlc_hold);
     }
 
     /// U12/KTD-10: the 0-conf gate is a set + predicate, never a single
