@@ -23,10 +23,16 @@ enum InvoicePath {
     case jit
 }
 
-/// The snap pager's two pages (PWA `QrPage`).
+/// The snap pager's pages (PWA `QrPage`, plus `async` which the PWA has no
+/// equivalent for). Membership is `receivePages`, not this enum's raw value —
+/// `async` can be present with `bolt12` absent.
 enum QrPage: Int, CaseIterable {
     case unified = 0
     case bolt12 = 1
+    /// The async payments offer: payable while this wallet is offline.
+    /// Experimental, and present only when the core reports it Ready — which
+    /// requires a static invoice server no shipped build configures.
+    case async = 2
 }
 
 /// `jit-review` (kind `commit`): fee disclosure before committing LSP-side
@@ -134,8 +140,27 @@ func showBolt12Page(offerExists: Bool, needsAmount: Bool) -> Bool {
     offerExists && !needsAmount
 }
 
+/// The pager's pages, in order. The unified QR is always present; the others
+/// are strictly additive, so async receive can never displace or gate the
+/// shipped BOLT12 offer page — the worst case for an async bug is a page that
+/// should not have rendered.
+///
+/// The async page rides the same `!needsAmount` gate as bolt12: the
+/// no-channel mandatory-amount visit has nothing reusable to show.
+func receivePages(
+    offerExists: Bool,
+    asyncOfferExists: Bool,
+    needsAmount: Bool
+) -> [QrPage] {
+    var pages: [QrPage] = [.unified]
+    if showBolt12Page(offerExists: offerExists, needsAmount: needsAmount) { pages.append(.bolt12) }
+    if asyncOfferExists && !needsAmount { pages.append(.async) }
+    return pages
+}
+
 /// The label under the QR (PWA `Receive.tsx:993-1001`).
 func qrCaption(page: QrPage, invoicePath: InvoicePath, openingFeeSats: UInt64?) -> String {
+    if page == .async { return "Experimental — payable while you're offline" }
     if page == .bolt12 { return "Reusable QR code" }
     if invoicePath == .jit, let openingFeeSats {
         return "Setup fee: \(FormatKt.formatBtc(sats: Int64(bitPattern: openingFeeSats)))"
@@ -145,14 +170,32 @@ func qrCaption(page: QrPage, invoicePath: InvoicePath, openingFeeSats: UInt64?) 
 
 /// The copy sheet's title (PWA `Receive.tsx:1027-1029`).
 func copySheetTitle(page: QrPage) -> String {
-    page == .bolt12 ? "Reusable payment request" : "Payment request"
+    switch page {
+    case .async: return "Offline payment request"
+    case .bolt12: return "Reusable payment request"
+    case .unified: return "Payment request"
+    }
 }
 
 /// What Copy/Share put on the pasteboard (PWA `Receive.tsx:385-387`): the
-/// offer page copies the PWA's `buildBip321Uri({ lno })` form; the unified
+/// offer pages copy the PWA's `buildBip321Uri({ lno })` form; the unified
 /// page copies the bundle's copy-form URI.
-func copyValue(page: QrPage, bip321Uri: String, offer: String?) -> String {
-    if page == .bolt12, let offer { return "bitcoin:?lno=\(offer)" }
+///
+/// Falls back to the unified URI whenever the page's offer is missing, so a
+/// transiently absent offer copies something payable rather than nothing.
+func copyValue(
+    page: QrPage,
+    bip321Uri: String,
+    offer: String?,
+    asyncOffer: String? = nil
+) -> String {
+    let pageOffer: String?
+    switch page {
+    case .unified: pageOffer = nil
+    case .bolt12: pageOffer = offer
+    case .async: pageOffer = asyncOffer
+    }
+    if let pageOffer { return "bitcoin:?lno=\(pageOffer)" }
     return bip321Uri
 }
 

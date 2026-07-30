@@ -990,6 +990,18 @@ extension WalletModel: ReceivePort {
     func bolt12Uri(offer: String) async throws -> String {
         try await Self.runBlockingFFI { Wallet_core_nativeKt.buildBolt12Uri(offer: offer) }
     }
+
+    // Non-blocking in the core (LDK owns the retry schedule and persistence),
+    // but kept off the main actor for consistency with its neighbours.
+    func asyncReceiveOffer() async throws -> String? {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { wallet.asyncReceiveOffer() }
+    }
+
+    func asyncReceiveStatus() async throws -> AsyncReceiveStatus {
+        let wallet = try requireWallet()
+        return try await Self.runBlockingFFI { wallet.asyncReceiveStatus() }
+    }
 }
 
 // MARK: - SettingsPort (U22, R14)

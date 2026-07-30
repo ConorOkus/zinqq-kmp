@@ -379,6 +379,14 @@ class WalletHolder internal constructor(
     override suspend fun bolt12Uri(offer: String): String =
         withContext(Dispatchers.IO) { uniffi.wallet_core.buildBolt12Uri(offer) }
 
+    // Non-blocking in the core (LDK owns the retry schedule and persistence),
+    // but kept on IO for consistency with its neighbours.
+    override suspend fun asyncReceiveOffer(): String? =
+        withContext(Dispatchers.IO) { wallet.asyncReceiveOffer() }
+
+    override suspend fun asyncReceiveStatus(): uniffi.wallet_core.AsyncReceiveStatus =
+        withContext(Dispatchers.IO) { wallet.asyncReceiveStatus() }
+
     // ------------------------------------------------------------------
     // SettingsPort (U17, R14): thin passthroughs to the core's mnemonic and
     // channels/peers FFI. Bounds, guards, close estimates, and the connect
