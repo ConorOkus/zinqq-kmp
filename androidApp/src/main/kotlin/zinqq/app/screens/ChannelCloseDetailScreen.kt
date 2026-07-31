@@ -89,6 +89,7 @@ fun ChannelCloseDetailScreen(
             detail.record == null -> CenteredNote("Close record not found")
             else -> CloseDetailBody(
                 record = detail.record,
+                explorerBaseUrl = holder.explorerBaseUrl,
                 needsDepositLink = needsDeposit(state.recoveryState, channelId),
                 onRecover = onRecover,
             )
@@ -99,6 +100,7 @@ fun ChannelCloseDetailScreen(
 @Composable
 private fun CloseDetailBody(
     record: CloseRecordView,
+    explorerBaseUrl: String,
     needsDepositLink: Boolean,
     onRecover: () -> Unit,
 ) {
@@ -221,7 +223,11 @@ private fun CloseDetailBody(
                     fontWeight = FontWeight.Medium,
                 )
                 record.txs.forEachIndexed { index, tx ->
-                    CloseTxRow(tx = tx, lastRow = index == record.txs.lastIndex)
+                    CloseTxRow(
+                        explorerBaseUrl = explorerBaseUrl,
+                        tx = tx,
+                        lastRow = index == record.txs.lastIndex,
+                    )
                 }
             }
         }
@@ -229,7 +235,7 @@ private fun CloseDetailBody(
 }
 
 @Composable
-private fun CloseTxRow(tx: CloseTxView, lastRow: Boolean) {
+private fun CloseTxRow(explorerBaseUrl: String, tx: CloseTxView, lastRow: Boolean) {
     val colors = ZinqqTheme.colors
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
@@ -274,7 +280,7 @@ private fun CloseTxRow(tx: CloseTxView, lastRow: Boolean) {
                     .weight(1f)
                     .clickable {
                         context.startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse(explorerTxUrl(tx.txid))),
+                            Intent(Intent.ACTION_VIEW, Uri.parse(explorerTxUrl(explorerBaseUrl, tx.txid))),
                         )
                     },
             )

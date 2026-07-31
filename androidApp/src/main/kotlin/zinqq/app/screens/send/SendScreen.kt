@@ -140,7 +140,7 @@ fun SendScreen(
                                     context.startActivity(
                                         Intent(
                                             Intent.ACTION_VIEW,
-                                            Uri.parse(explorerTxUrl(txid)),
+                                            Uri.parse(explorerTxUrl(port.explorerBaseUrl, txid)),
                                         ),
                                     )
                                 }

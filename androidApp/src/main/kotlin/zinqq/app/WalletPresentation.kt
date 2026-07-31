@@ -29,10 +29,15 @@ import zinqq.main.msatToSatFloor
  * `RecoverFunds.tsx`, `RecoveryBanner.tsx`, `PendingSweepBanner.tsx`).
  */
 
-/** The PWA's hard-coded explorer base (`TransactionDetail.tsx:7`). */
-const val EXPLORER_TX_URL = "https://mempool.space/tx"
-
-fun explorerTxUrl(txid: String): String = "$EXPLORER_TX_URL/$txid"
+/**
+ * A transaction's explorer link, given the base the core resolved for this
+ * build's network ([WalletHolder.explorerBaseUrl]).
+ *
+ * The base is a parameter rather than a constant because it is
+ * network-dependent: a Mutinynet build linking to mempool.space opens a
+ * mainnet explorer with a signet txid and shows "transaction not found".
+ */
+fun explorerTxUrl(baseUrl: String, txid: String): String = "${baseUrl.trimEnd('/')}/tx/$txid"
 
 // ---------------------------------------------------------------------------
 // Activity list (Activity.tsx)

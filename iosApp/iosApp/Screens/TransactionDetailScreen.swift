@@ -80,7 +80,7 @@ struct TransactionDetailScreen: View {
                     value: tx.kind == .lightning ? "Lightning" : "On-chain"
                 )
                 if tx.kind == .onchain {
-                    ExplorerLinkRow(txid: tx.id)
+                    ExplorerLinkRow(explorerBaseUrl: model.explorerBaseUrl, txid: tx.id)
                 }
             }
             .padding(.horizontal, 24)
@@ -130,6 +130,7 @@ struct DetailRow: View {
 
 /// "Transaction" row: mid-truncated txid opening mempool.space externally.
 private struct ExplorerLinkRow: View {
+    let explorerBaseUrl: String
     let txid: String
 
     @Environment(\.zinqqColors) private var colors
@@ -141,7 +142,7 @@ private struct ExplorerLinkRow: View {
                 .foregroundColor(colors.onDarkMuted)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button {
-                if let url = URL(string: explorerTxUrl(txid)) {
+                if let url = URL(string: explorerTxUrl(explorerBaseUrl, txid)) {
                     UIApplication.shared.open(url)
                 }
             } label: {

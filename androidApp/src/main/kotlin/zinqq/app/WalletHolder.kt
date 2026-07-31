@@ -120,6 +120,15 @@ class WalletHolder internal constructor(
     private val wallet: Wallet
         get() = requireNotNull(node.wallet) { "this WalletNode has no native handle" }
 
+    /**
+     * Explorer base for this build's network, resolved once from the core.
+     * Configuration, not node state, so it is readable while stopped.
+     *
+     * Read rather than hardcoded because a Mutinynet build linking to
+     * mempool.space opens a mainnet explorer with a signet txid.
+     */
+    override val explorerBaseUrl: String by lazy { wallet.explorerBaseUrl() }
+
     // The synchronous read is deliberate (KTD-11): the persisted appearance
     // mode must be in the very first emitted state so no frame renders in the
     // wrong theme. It runs once, at process start, against a tiny local file.

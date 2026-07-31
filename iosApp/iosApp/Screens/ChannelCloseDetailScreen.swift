@@ -28,6 +28,7 @@ struct ChannelCloseDetailScreen: View {
                 if let record = detail.record {
                     CloseDetailBody(
                         record: record,
+                        explorerBaseUrl: model.explorerBaseUrl,
                         needsDepositLink: needsDeposit(model.recoveryState, channelId: channelId),
                         onRecover: onRecover
                     )
@@ -48,6 +49,7 @@ struct ChannelCloseDetailScreen: View {
 
 private struct CloseDetailBody: View {
     let record: CloseRecordView
+    let explorerBaseUrl: String
     let needsDepositLink: Bool
     let onRecover: () -> Void
 
@@ -139,7 +141,11 @@ private struct CloseDetailBody: View {
                             .font(ZinqqFont.sans(14, weight: .medium))
                             .foregroundColor(colors.onDarkMuted)
                         ForEach(Array(record.txs.enumerated()), id: \.element.txid) { index, tx in
-                            CloseTxRow(tx: tx, lastRow: index == record.txs.count - 1)
+                            CloseTxRow(
+                                explorerBaseUrl: explorerBaseUrl,
+                                tx: tx,
+                                lastRow: index == record.txs.count - 1
+                            )
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -164,6 +170,7 @@ private struct CloseDetailBody: View {
 }
 
 private struct CloseTxRow: View {
+    let explorerBaseUrl: String
     let tx: CloseTxView
     let lastRow: Bool
 
@@ -183,7 +190,7 @@ private struct CloseTxRow: View {
             }
             HStack {
                 Button {
-                    if let url = URL(string: explorerTxUrl(tx.txid)) {
+                    if let url = URL(string: explorerTxUrl(explorerBaseUrl, tx.txid)) {
                         UIApplication.shared.open(url)
                     }
                 } label: {

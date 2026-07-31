@@ -10,9 +10,13 @@ import Shared
 /// `PendingSweepBanner.tsx`).
 
 /// The PWA's hard-coded explorer base (`TransactionDetail.tsx:7`).
-let explorerTxBaseUrl = "https://mempool.space/tx"
+// Explorer base comes from the core (`WalletModel.explorerBaseUrl`) because
+// it is network-dependent: a Mutinynet build linking to mempool.space opens a
+// mainnet explorer with a signet txid and shows "transaction not found".
 
-func explorerTxUrl(_ txid: String) -> String { "\(explorerTxBaseUrl)/\(txid)" }
+func explorerTxUrl(_ baseUrl: String, _ txid: String) -> String {
+    "\(baseUrl.hasSuffix("/") ? String(baseUrl.dropLast()) : baseUrl)/tx/\(txid)"
+}
 
 // MARK: - Activity list (Activity.tsx)
 

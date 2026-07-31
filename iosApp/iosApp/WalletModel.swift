@@ -183,6 +183,15 @@ struct CloseDetailUi {
 /// as pure functions; this class only snapshots core queries.
 @MainActor
 final class WalletModel: ObservableObject {
+    /// Explorer base for this build's network, resolved once from the core.
+    /// Configuration, not node state, so it is readable while stopped.
+    ///
+    /// Read rather than hardcoded because a Mutinynet build linking to
+    /// mempool.space opens a mainnet explorer with a signet txid.
+    lazy var explorerBaseUrl: String = {
+        (try? ensureWallet().explorerBaseUrl()) ?? "https://mempool.space"
+    }()
+
     @Published private(set) var running = false
     @Published private(set) var balanceMsat: UInt64 = 0
     @Published private(set) var lastOutcome: String?

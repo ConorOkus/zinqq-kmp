@@ -1210,6 +1210,17 @@ impl Wallet {
         self.node.offer_available()
     }
 
+    /// Base URL for block-explorer transaction links, e.g.
+    /// `https://mempool.space` on mainnet and `https://mutinynet.com` on
+    /// Mutinynet.
+    ///
+    /// Network-dependent, so the shells must read it rather than hardcode one:
+    /// a Mutinynet build linking to mempool.space opens a mainnet explorer
+    /// with a signet txid and shows "transaction not found".
+    pub fn explorer_base_url(&self) -> String {
+        self.node.explorer_base_url()
+    }
+
     /// Async receive state and offer together (U4) — the receive screen's one
     /// async payments call, and the async payments protocol's receive half.
     ///
@@ -1821,6 +1832,21 @@ mod tests {
             rendered.contains("only pays bitcoin invoices"),
             "{rendered}"
         );
+    }
+
+    /// R8: explorer links follow the build's network. A Mutinynet build
+    /// linking to mempool.space would open a mainnet explorer with a signet
+    /// txid — a dead link on exactly the network this is used to test.
+    #[test]
+    fn the_explorer_base_url_follows_the_network() {
+        let mainnet = apply_config_overrides(base_config()).unwrap();
+        assert_eq!(mainnet.explorer_url, "https://mempool.space");
+
+        let mut ffi_config = base_config();
+        ffi_config.network = Some(WalletNetwork::Mutinynet);
+        let mutiny = apply_config_overrides(ffi_config).unwrap();
+        assert_eq!(mutiny.explorer_url, "https://mutinynet.com");
+        assert_ne!(mainnet.explorer_url, mutiny.explorer_url);
     }
 
     /// U2/R6: the default is empty — async receive stays inert unless a

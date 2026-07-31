@@ -132,7 +132,7 @@ fun TransactionDetailScreen(
                         value = if (tx.kind == ActivityKind.LIGHTNING) "Lightning" else "On-chain",
                     )
                     if (tx.kind == ActivityKind.ONCHAIN) {
-                        ExplorerLinkRow(txid = tx.id)
+                        ExplorerLinkRow(explorerBaseUrl = holder.explorerBaseUrl, txid = tx.id)
                     }
                 }
             }
@@ -167,7 +167,7 @@ internal fun DetailRow(label: String, value: String) {
 
 /** "Transaction" row: mid-truncated txid opening mempool.space externally. */
 @Composable
-private fun ExplorerLinkRow(txid: String) {
+private fun ExplorerLinkRow(explorerBaseUrl: String, txid: String) {
     val colors = ZinqqTheme.colors
     val context = LocalContext.current
     Row(
@@ -190,7 +190,7 @@ private fun ExplorerLinkRow(txid: String) {
             textDecoration = TextDecoration.Underline,
             modifier = Modifier.clickable {
                 context.startActivity(
-                    Intent(Intent.ACTION_VIEW, Uri.parse(explorerTxUrl(txid))),
+                    Intent(Intent.ACTION_VIEW, Uri.parse(explorerTxUrl(explorerBaseUrl, txid))),
                 )
             },
         )

@@ -33,6 +33,7 @@ import uniffi.wallet_core.ResolvedView
 class SendControllerTest {
 
     private class FakePort(private val classified: ClassifiedView) : SendPort {
+        override val explorerBaseUrl: String = "https://mempool.space"
         val events = MutableSharedFlow<Event>(extraBufferCapacity = 8)
         var bolt11Sends = 0
         var offerPayments = 0

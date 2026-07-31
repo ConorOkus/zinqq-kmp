@@ -951,6 +951,12 @@ impl Node {
             && crate::receive::read_persisted_offer(&kv_store).is_some()
     }
 
+    /// Base URL for block-explorer transaction links on this build's network.
+    /// Available while stopped — it is configuration, not node state.
+    pub fn explorer_base_url(&self) -> String {
+        self.config.explorer_url.clone()
+    }
+
     /// Async receive state and offer together (U4) — the receive screen's one
     /// async payments call.
     ///
