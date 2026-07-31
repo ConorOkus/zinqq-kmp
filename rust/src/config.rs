@@ -666,6 +666,26 @@ mod tests {
         );
     }
 
+    /// U3/R3: the accessor the startup probe now calls resolves each
+    /// network's own genesis. The probe itself needs a reachable backend, so
+    /// the end-to-end mismatch is covered by the `#[ignore]`d live test in
+    /// `chain.rs`; this pins the mapping the probe depends on.
+    #[test]
+    fn each_network_reports_its_own_genesis() {
+        assert_eq!(
+            WalletNetwork::Mainnet.genesis_block_hash(),
+            mainnet::genesis_block_hash()
+        );
+        assert_eq!(
+            WalletNetwork::Mutinynet.genesis_block_hash(),
+            mutinynet::genesis_block_hash()
+        );
+        assert_ne!(
+            WalletNetwork::Mainnet.genesis_block_hash(),
+            WalletNetwork::Mutinynet.genesis_block_hash()
+        );
+    }
+
     /// U1/R4: mainnet keeps the bare storage dir; Mutinynet gets a segment.
     #[test]
     fn only_non_mainnet_networks_get_a_storage_segment() {

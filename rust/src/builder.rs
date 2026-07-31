@@ -402,12 +402,17 @@ pub(crate) fn build(
         })?,
     );
 
-    // U12/KTD-12: genesis-hash network check. A backend that ANSWERS with a
-    // non-mainnet genesis fails the start hard; an unreachable one only
-    // logs — the fresh-node degraded start (and the monitors-present hard
-    // failure below) keep their existing semantics.
+    // U12/KTD-12: genesis-hash network check, keyed to the configured network
+    // (U3/R3). A backend that ANSWERS with a genesis other than this build's
+    // fails the start hard; an unreachable one only logs — the fresh-node
+    // degraded start (and the monitors-present hard failure below) keep their
+    // existing semantics.
+    //
+    // This is what makes a custom signet safe to add: point a Mutinynet build
+    // at mainnet infrastructure (or the reverse) and it refuses to start
+    // rather than syncing the wrong chain into the wrong wallet's monitors.
     match runtime
-        .block_on(chain_source.check_genesis_hash(crate::config::mainnet::genesis_block_hash()))
+        .block_on(chain_source.check_genesis_hash(config.wallet_network.genesis_block_hash()))
     {
         Ok(()) => {}
         Err(ChainError::WrongNetworkBackend { got }) => {

@@ -1136,4 +1136,64 @@ mod tests {
         assert!(!outcome.is_success());
         assert_eq!(pending.pending_txids().len(), 1);
     }
+
+    // =====================================================================
+    // Live-network genesis probe (U3/R3/AE5). Talks to real Esplora backends,
+    // so it is #[ignore]d like the other live tests:
+    //   cargo test --lib -- --ignored live_cross_network_genesis_is_rejected
+    // =====================================================================
+
+    /// The probe must reject a backend serving a DIFFERENT chain than the
+    /// build expects, in BOTH directions. A probe that only catches one
+    /// direction would let a Mutinynet build quietly sync mainnet — the exact
+    /// failure the network split exists to prevent.
+    #[tokio::test]
+    #[ignore = "live network: queries the mainnet and Mutinynet Esplora backends"]
+    async fn live_cross_network_genesis_is_rejected() {
+        use crate::config::{mainnet, mutinynet, WalletNetwork};
+
+        fn backend(url: &str, network: bitcoin::Network) -> ChainSource {
+            let dir = tempfile::tempdir().unwrap();
+            let kv_store = Arc::new(FilesystemStore::new(dir.path().to_path_buf()));
+            let logger = Arc::new(Logger);
+            ChainSource::new(
+                url,
+                network,
+                Arc::new(CachedFeeEstimator::new()),
+                Arc::new(PendingBroadcasts::new(kv_store, Arc::clone(&logger))),
+                logger,
+            )
+            .unwrap()
+        }
+
+        // A Mutinynet build pointed at mainnet infrastructure.
+        let mainnet_backend = backend(
+            crate::config::DEFAULT_ESPLORA_URL,
+            bitcoin::Network::Bitcoin,
+        );
+        assert!(matches!(
+            mainnet_backend
+                .check_genesis_hash(WalletNetwork::Mutinynet.genesis_block_hash())
+                .await,
+            Err(ChainError::WrongNetworkBackend { .. })
+        ));
+        // ...and the same backend accepts the build it actually serves.
+        assert!(mainnet_backend
+            .check_genesis_hash(mainnet::genesis_block_hash())
+            .await
+            .is_ok());
+
+        // A mainnet build pointed at Mutinynet.
+        let mutiny_backend = backend(mutinynet::ESPLORA_URL, mutinynet::NETWORK);
+        assert!(matches!(
+            mutiny_backend
+                .check_genesis_hash(WalletNetwork::Mainnet.genesis_block_hash())
+                .await,
+            Err(ChainError::WrongNetworkBackend { .. })
+        ));
+        assert!(mutiny_backend
+            .check_genesis_hash(mutinynet::genesis_block_hash())
+            .await
+            .is_ok());
+    }
 }
