@@ -774,11 +774,14 @@ final class WalletModel: ObservableObject {
         if let wallet { return wallet }
         let dir = try walletStorageDirectory()
         // Kotlin default args don't export to Swift: pass the URL overrides
-        // explicitly (nil = production defaults).
+        // and the network explicitly (nil URLs = production defaults). The
+        // network is the build's, per the Info.plist value (U7, KTD-1); the
+        // core isolates each network's storage and VSS store beneath this dir.
         let created = WalletCore.shared.create(
             storageDir: dir.path,
             esploraUrl: nil,
-            rgsUrl: nil
+            rgsUrl: nil,
+            network: buildWalletNetwork()
         )
         wallet = created
         return created
