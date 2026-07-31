@@ -391,6 +391,13 @@ pub struct Config {
     pub network: Network,
     /// App-private data directory holding the mnemonic, channel monitors, and
     /// all other persisted state.
+    ///
+    /// **Already network-scoped** (U4/R4): [`Config::for_network`] resolves
+    /// this from the caller's base path plus
+    /// [`WalletNetwork::storage_segment`], so every reader is isolated by
+    /// construction and no call site has to remember to apply the segment
+    /// itself. Mainnet resolves to the base path verbatim, so an existing
+    /// install keeps finding its data.
     pub storage_dir: String,
     /// Esplora REST endpoint.
     pub esplora_url: String,
@@ -451,6 +458,19 @@ impl Config {
     /// constants module, so adding a third network means adding a module and a
     /// match arm rather than hunting call sites.
     pub fn for_network(wallet_network: WalletNetwork, storage_dir: String) -> Self {
+        // Scope the data directory to the network HERE, once, so that every
+        // consumer of `storage_dir` — the KV store, the mnemonic file, the
+        // instance lock, the fenced flag, restore — is isolated without
+        // knowing networks exist. Resolving it at each call site instead
+        // would leave one missed reader able to cross the boundary, which is
+        // exactly the class of bug this field's shape now prevents.
+        let storage_dir = match wallet_network.storage_segment() {
+            None => storage_dir,
+            Some(segment) => std::path::Path::new(&storage_dir)
+                .join(segment)
+                .to_string_lossy()
+                .into_owned(),
+        };
         let (esplora_url, rgs_url, explorer_url, lsp, trusted_lsp_id) = match wallet_network {
             WalletNetwork::Mainnet => (
                 DEFAULT_ESPLORA_URL,
@@ -485,20 +505,6 @@ impl Config {
             static_invoice_server_paths: Vec::new(),
             #[cfg(test)]
             vss_transport_override: None,
-        }
-    }
-
-    /// The data directory this network's node actually uses (U4/R4).
-    ///
-    /// Mainnet is [`Config::storage_dir`] verbatim — an existing install must
-    /// keep finding its mnemonic and channel monitors, and moving them would
-    /// present as a wiped wallet. Every other network gets a subdirectory, so
-    /// two networks pointed at the same `storage_dir` never share a byte.
-    pub fn network_storage_dir(&self) -> std::path::PathBuf {
-        let base = std::path::PathBuf::from(&self.storage_dir);
-        match self.wallet_network.storage_segment() {
-            None => base,
-            Some(segment) => base.join(segment),
         }
     }
 
@@ -685,24 +691,25 @@ mod tests {
     /// the two never share a mnemonic, a KV store, or a lock.
     #[test]
     fn each_network_gets_its_own_data_directory() {
-        let mainnet_dir = Config::for_network(WalletNetwork::Mainnet, "/tmp/wallet".to_string())
-            .network_storage_dir();
-        let mutiny_dir = Config::for_network(WalletNetwork::Mutinynet, "/tmp/wallet".to_string())
-            .network_storage_dir();
+        let mainnet_dir =
+            Config::for_network(WalletNetwork::Mainnet, "/tmp/wallet".to_string()).storage_dir;
+        let mutiny_dir =
+            Config::for_network(WalletNetwork::Mutinynet, "/tmp/wallet".to_string()).storage_dir;
 
+        // Asserted on the FIELD, not a helper: the KV store, mnemonic file,
+        // instance lock, fenced flag, and restore all read this field
+        // directly, so scoping it here is what actually isolates them. A
+        // helper would leave any missed reader able to cross the boundary.
         assert_eq!(
-            mainnet_dir,
-            std::path::PathBuf::from("/tmp/wallet"),
-            "mainnet keeps the historical path"
+            mainnet_dir, "/tmp/wallet",
+            "mainnet keeps the historical path, so an existing install still resolves"
         );
-        assert_eq!(
-            mutiny_dir,
-            std::path::PathBuf::from("/tmp/wallet/mutinynet")
-        );
+        assert_eq!(mutiny_dir, "/tmp/wallet/mutinynet");
         assert_ne!(mainnet_dir, mutiny_dir);
-        assert!(
-            !mutiny_dir.starts_with(&mainnet_dir) || mutiny_dir != mainnet_dir,
-            "the Mutinynet subtree is nested but never equal"
+        assert_eq!(
+            mutiny_dir.matches("mutinynet").count(),
+            1,
+            "the segment must be applied exactly once, never stacked"
         );
     }
 
