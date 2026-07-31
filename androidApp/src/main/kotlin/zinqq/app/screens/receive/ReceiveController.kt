@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import uniffi.wallet_core.AsyncReceiveStatus
+import uniffi.wallet_core.AsyncReceiveView
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.JitInvoice
 import uniffi.wallet_core.JitQuote
@@ -50,6 +52,16 @@ interface ReceivePort {
     /** The core's `build_bolt12_page_uri` — the offer page's copy form. */
     suspend fun bolt12Uri(offer: String): String
 
+    /**
+     * Async receive state and offer together — payable while this wallet is
+     * offline. `DISABLED` with a null offer in shipped builds.
+     *
+     * Call this at most **once** per receive visit: the core reads LDK's
+     * offer cache exactly once per call, and that read consumes the freshest
+     * unused offer. Cheap and non-blocking, unlike [getOrCreateOffer].
+     */
+    suspend fun asyncReceive(): AsyncReceiveView
+
     /** The core's live event stream ([Event.PaymentReceived] settles the visit). */
     val walletEvents: Flow<Event>
 }
@@ -69,6 +81,9 @@ data class ReceiveUiState(
     val qrValue: String = "",
     val offer: String? = null,
     val offerQrValue: String? = null,
+    /** The async payments offer, when the core reports it Ready. */
+    val asyncOffer: String? = null,
+    val asyncOfferQrValue: String? = null,
     /** PWA `Receive.tsx:290`: amounted standard invoice failed; QR still renders. */
     val invoiceError: String? = null,
     /** The displayed invoice's hash — what [applyPaymentReceived] awaits. */
@@ -108,6 +123,7 @@ class ReceiveController(
 
     private var requestJob: Job? = null
     private var expiryJob: Job? = null
+    private var asyncOfferJob: Job? = null
     private var started = false
 
     /** Screen entry: floor fetch + the amountless default bundle + settlement watch. */
@@ -160,6 +176,7 @@ class ReceiveController(
                 // (rust/src/receive.rs `needs_jit`), so this is exactly the
                 // offer gate: mint only when the offer page could render.
                 if (!bundle.needsJit && bundle.offer == null) mintOffer()
+                if (!bundle.needsJit) loadAsyncOffer()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -396,6 +413,37 @@ class ReceiveController(
                 throw e
             } catch (e: Exception) {
                 // Offer creation NEVER degrades receive (core contract, R6).
+            }
+        }
+    }
+
+    /**
+     * The async payments offer, loaded beside the screen on its own coroutine
+     * exactly like [mintOffer] — additive only. It resolves to nothing in
+     * every shipped build (no static invoice server is configured), so it
+     * must never be able to delay, gate, or fail the receive screen.
+     *
+     * Exactly one [ReceivePort.asyncReceive] call: the core's read consumes an
+     * offer from LDK's cache, so asking twice would burn two per visit and
+     * could report a status about a different offer than the one rendered.
+     * Status and offer arrive together, so they cannot disagree.
+     */
+    private fun loadAsyncOffer() {
+        asyncOfferJob?.cancel()
+        asyncOfferJob = scope.launch {
+            try {
+                val view = port.asyncReceive()
+                // Both halves required: the core pairs them, but a page with
+                // no payload must never render.
+                if (view.status != AsyncReceiveStatus.READY) return@launch
+                val offer = view.offer ?: return@launch
+                val qrValue = port.bolt12Uri(offer).uppercase()
+                _state.update { it.copy(asyncOffer = offer, asyncOfferQrValue = qrValue) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Async receive NEVER degrades receive — same contract as the
+                // standard offer above.
             }
         }
     }

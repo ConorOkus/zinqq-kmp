@@ -6,8 +6,8 @@ This is the **production native client** for Zinqq — a mainnet Lightning walle
 
 ## What it does
 
-- **Unified send** — one input classifies BIP321 URIs, BOLT11 (including amountless with amount entry), BOLT12 offers, BIP353 names (DNSSEC-verified over DoH), LNURL-pay, and on-chain addresses.
-- **Unified receive** — one QR combining an on-chain address and BOLT11 invoice (BIP321), a reusable BOLT12 offer page, and LSPS2 just-in-time inbound channels from Megalith with a live fee floor and quote review.
+- **Unified send** — one input classifies BIP321 URIs, BOLT11 (including amountless with amount entry), BOLT12 offers, BIP353 names (DNSSEC-verified over DoH), LNURL-pay, and on-chain addresses. Paying an offer that resolves to a BOLT12 static invoice holds the outbound HTLCs at the next hop (async payments), so the phone can go offline before an often-offline recipient wakes up to claim — where the next hop supports `htlc_hold`, which Megalith does not yet.
+- **Unified receive** — one QR combining an on-chain address and BOLT11 invoice (BIP321), a reusable BOLT12 offer page, and LSPS2 just-in-time inbound channels from Megalith with a live fee floor and quote review. Async payments *receiving* is wired but inert: it needs a static invoice server configured at construction, and no shipped build configures one — see [the runbook](docs/runbooks/async-payments-static-invoice-server.md).
 - **VSS encrypted cloud backup** — channel monitors, channel manager, known peers, close records, and recovery state dual-written VSS-first with client-side ChaCha20-Poly1305 encryption and HMAC key obfuscation. Restore from the 12-word seed alone.
 - **On-chain wallet** — send with a 10,000-sat anchor reserve while channels exist, send-max, fee guards, and a review-to-broadcast drift guard.
 - **Force-close pipeline** — close records with chain-truth reconciliation, a recovery flow with deposit calculation, anchor CPFP fee-bumping, and a sweep engine with a subsidized near-dust rescue.

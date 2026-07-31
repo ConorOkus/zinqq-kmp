@@ -31,7 +31,7 @@ struct ReceiveScreen: View {
             if showSheet {
                 CopySheet(
                     title: copySheetTitle(page: page),
-                    value: copyValue(page: page, bip321Uri: state.bip321Uri, offer: state.offer),
+                    value: copyValue(page: page, bip321Uri: state.bip321Uri, offer: state.offer, asyncOffer: state.asyncOffer),
                     onClose: { showSheet = false }
                 )
             }
@@ -174,8 +174,12 @@ private struct QrDisplay: View {
 
     @Environment(\.zinqqColors) private var colors
 
-    private var showBolt12: Bool {
-        showBolt12Page(offerExists: state.offerQrValue != nil, needsAmount: state.needsAmount)
+    private var pages: [QrPage] {
+        receivePages(
+            offerExists: state.offerQrValue != nil,
+            asyncOfferExists: state.asyncOfferQrValue != nil,
+            needsAmount: state.needsAmount
+        )
     }
 
     private var invoicePath: InvoicePath {
@@ -215,7 +219,7 @@ private struct QrDisplay: View {
                         )
                         .padding(.horizontal, 16)
                         .tag(QrPage.unified)
-                        if showBolt12 {
+                        if pages.contains(.bolt12) {
                             QrView(
                                 payload: state.offerQrValue ?? "",
                                 accessibilityLabel: "QR code for BOLT 12 offer"
@@ -223,21 +227,31 @@ private struct QrDisplay: View {
                             .padding(.horizontal, 16)
                             .tag(QrPage.bolt12)
                         }
+                        if pages.contains(.async) {
+                            QrView(
+                                payload: state.asyncOfferQrValue ?? "",
+                                accessibilityLabel:
+                                    "QR code for offline-payable BOLT 12 offer (experimental)"
+                            )
+                            .padding(.horizontal, 16)
+                            .tag(QrPage.async)
+                        }
                     }
                     .tabViewStyle(.page(indexDisplayMode: .never))
                     .frame(maxWidth: 300)
                     .aspectRatio(1, contentMode: .fit)
                     .padding(.top, 16)
-                    // Reset to the unified page when the BOLT12 page is
+                    // Reset to the unified page when the current page is
                     // removed (PWA:373-375).
-                    .onChange(of: showBolt12) { available in
-                        if !available { page = .unified }
+                    .onChange(of: pages) { available in
+                        if !available.contains(page) { page = .unified }
                     }
 
-                    // Dot indicators (PWA:980-989).
-                    if showBolt12 {
+                    // Dot indicators (PWA:980-989) — one per live page, so a
+                    // page the pager cannot reach never gets a dot.
+                    if pages.count > 1 {
                         HStack(spacing: 8) {
-                            ForEach(QrPage.allCases, id: \.self) { dot in
+                            ForEach(pages, id: \.self) { dot in
                                 Circle()
                                     .fill(dot == page ? colors.onDark : colors.dotIdle)
                                     .frame(width: 8, height: 8)
@@ -295,7 +309,7 @@ private struct QrDisplay: View {
                     // System share = the PWA's navigator.share (R12: platform
                     // share sheet is a sanctioned deviation).
                     ShareLink(
-                        item: copyValue(page: page, bip321Uri: state.bip321Uri, offer: state.offer)
+                        item: copyValue(page: page, bip321Uri: state.bip321Uri, offer: state.offer, asyncOffer: state.asyncOffer)
                     ) {
                         SecondaryButtonLabel(label: "Share")
                     }

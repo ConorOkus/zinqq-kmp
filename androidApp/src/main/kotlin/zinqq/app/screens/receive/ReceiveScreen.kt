@@ -230,7 +230,7 @@ fun ReceiveScreen(
     if (showSheet) {
         val clipboard = LocalClipboardManager.current
         var copied by rememberCopiedFlash(COPY_FEEDBACK_MS)
-        val value = copyValue(page, state.bip321Uri, state.offer)
+        val value = copyValue(page, state.bip321Uri, state.offer, state.asyncOffer)
         BottomSheet(open = true, onClose = { showSheet = false }) {
             Text(
                 text = copySheetTitle(page),
@@ -283,15 +283,28 @@ private fun QrDisplay(
 ) {
     val colors = ZinqqTheme.colors
     val context = LocalContext.current
-    val showBolt12 = showBolt12Page(state.offerQrValue != null, state.needsAmount)
-    val pagerState = rememberPagerState(pageCount = { if (showBolt12) 2 else 1 })
+    val pages = receivePages(
+        offerExists = state.offerQrValue != null,
+        asyncOfferExists = state.asyncOfferQrValue != null,
+        needsAmount = state.needsAmount,
+    )
+    val pagerState = rememberPagerState(pageCount = { pages.size })
 
-    // Reset to the unified page when the BOLT12 page is removed (PWA:373-375).
-    LaunchedEffect(showBolt12) {
-        if (!showBolt12 && pagerState.currentPage != 0) pagerState.scrollToPage(0)
+    // Follow the selected PAGE across membership changes, not its index
+    // (PWA:373-375, extended): a late-minting BOLT12 offer inserts ahead of
+    // the async page, and an index-keyed pager would swap the QR under the
+    // user. `pagerIndexFor` owns that decision so it can be tested.
+    LaunchedEffect(pages) {
+        pagerIndexFor(pages, page, pagerState.currentPage)?.let { target ->
+            pagerState.scrollToPage(target)
+            onPageChanged(pages.getOrElse(target) { QrPage.UNIFIED })
+        }
     }
+    // Keyed on the index alone: a `pages` change is the effect above's job,
+    // and re-deriving the page from a stale index here would reintroduce the
+    // swap it prevents.
     LaunchedEffect(pagerState.currentPage) {
-        onPageChanged(if (pagerState.currentPage == 1) QrPage.BOLT12 else QrPage.UNIFIED)
+        onPageChanged(pages.getOrElse(pagerState.currentPage) { QrPage.UNIFIED })
     }
 
     val invoicePath = (state.step as? ReceiveStep.Display)?.invoicePath ?: InvoicePath.NONE
@@ -337,26 +350,32 @@ private fun QrDisplay(
                         .fillMaxWidth()
                         .widthIn(max = 300.dp),
                 ) { index ->
-                    val payload =
-                        if (index == 1) state.offerQrValue.orEmpty() else state.qrValue
+                    val pageAt = pages.getOrElse(index) { QrPage.UNIFIED }
                     QrView(
-                        payload = payload,
-                        contentDescription = if (index == 1) {
-                            "QR code for BOLT 12 offer"
-                        } else {
-                            "QR code for Bitcoin address ${state.address}"
+                        payload = when (pageAt) {
+                            QrPage.UNIFIED -> state.qrValue
+                            QrPage.BOLT12 -> state.offerQrValue.orEmpty()
+                            QrPage.ASYNC -> state.asyncOfferQrValue.orEmpty()
+                        },
+                        contentDescription = when (pageAt) {
+                            QrPage.UNIFIED ->
+                                "QR code for Bitcoin address ${state.address}"
+                            QrPage.BOLT12 -> "QR code for BOLT 12 offer"
+                            QrPage.ASYNC ->
+                                "QR code for offline-payable BOLT 12 offer (experimental)"
                         },
                         modifier = Modifier.padding(horizontal = 16.dp),
                     )
                 }
 
-                // Dot indicators (PWA:980-989).
-                if (showBolt12) {
+                // Dot indicators (PWA:980-989) — one per live page, so a
+                // page the pager cannot reach never gets a dot.
+                if (pages.size > 1) {
                     Row(
                         modifier = Modifier.padding(top = 16.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        QrPage.entries.forEach { dot ->
+                        pages.forEach { dot ->
                             Box(
                                 modifier = Modifier
                                     .size(8.dp)
@@ -421,7 +440,7 @@ private fun QrDisplay(
                             type = "text/plain"
                             putExtra(
                                 Intent.EXTRA_TEXT,
-                                copyValue(page, state.bip321Uri, state.offer),
+                                copyValue(page, state.bip321Uri, state.offer, state.asyncOffer),
                             )
                         }
                         context.startActivity(Intent.createChooser(send, null))

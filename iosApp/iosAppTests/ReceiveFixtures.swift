@@ -12,6 +12,7 @@ let testReceiveAddress = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
 let testReceiveBolt11 = "lnbc1fakeinvoice"
 let testPaymentHash = "abc123"
 let testReceiveOffer = "lno1fakeoffer"
+let testAsyncReceiveOffer = "lno1fakeasyncoffer"
 
 func makeBundle(
     address: String = testReceiveAddress,

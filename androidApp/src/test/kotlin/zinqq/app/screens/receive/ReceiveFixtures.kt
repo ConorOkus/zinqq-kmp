@@ -17,6 +17,7 @@ const val TEST_RECEIVE_ADDRESS = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
 const val TEST_RECEIVE_BOLT11 = "lnbc1fakeinvoice"
 const val TEST_PAYMENT_HASH = "abc123"
 const val TEST_RECEIVE_OFFER = "lno1fakeoffer"
+const val TEST_ASYNC_RECEIVE_OFFER = "lno1fakeasyncoffer"
 
 fun makeBundle(
     address: String = TEST_RECEIVE_ADDRESS,

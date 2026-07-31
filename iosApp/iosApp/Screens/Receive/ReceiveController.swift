@@ -32,6 +32,14 @@ protocol ReceivePort: AnyObject {
     /// The core's `build_bolt12_page_uri` — the offer page's copy form.
     func bolt12Uri(offer: String) async throws -> String
 
+    /// Async receive state and offer together — payable while this wallet is
+    /// offline. `.disabled` with a nil offer in shipped builds.
+    ///
+    /// Call this at most **once** per receive visit: the core reads LDK's
+    /// offer cache exactly once per call, and that read consumes the freshest
+    /// unused offer. Cheap and non-blocking, unlike `getOrCreateOffer`.
+    func asyncReceive() async throws -> AsyncReceiveView
+
     /// The core's live event rebroadcast (`paymentReceived` settles the
     /// visit). Each access is a fresh subscription registered synchronously
     /// at creation (Android's `walletEvents` shared-flow twin).
@@ -54,6 +62,9 @@ struct ReceiveUiState: Equatable {
     var qrValue = ""
     var offer: String?
     var offerQrValue: String?
+    /// The async payments offer, when the core reports it Ready.
+    var asyncOffer: String?
+    var asyncOfferQrValue: String?
     /// PWA `Receive.tsx:290`: amounted standard invoice failed; QR still renders.
     var invoiceError: String?
     /// The displayed invoice's hash — what `applyPaymentReceived` awaits.
@@ -97,6 +108,7 @@ final class ReceiveController: ObservableObject {
     private var requestTask: Task<Void, Never>?
     private var expiryTask: Task<Void, Never>?
     private var offerTask: Task<Void, Never>?
+    private var asyncOfferTask: Task<Void, Never>?
     private var started = false
 
     init(
@@ -116,6 +128,7 @@ final class ReceiveController: ObservableObject {
         requestTask?.cancel()
         expiryTask?.cancel()
         offerTask?.cancel()
+        asyncOfferTask?.cancel()
     }
 
     /// Screen entry: floor fetch + the amountless default bundle + settlement watch.
@@ -167,6 +180,7 @@ final class ReceiveController: ObservableObject {
                 // (rust/src/receive.rs `needs_jit`), so this is exactly the
                 // offer gate: mint only when the offer page could render.
                 if !bundle.needsJit, bundle.offer == nil { self.mintOffer() }
+                if !bundle.needsJit { self.loadAsyncOffer() }
             } catch {
                 guard !Task.isCancelled else { return }
                 self.state.loading = false
@@ -385,6 +399,33 @@ final class ReceiveController: ObservableObject {
             else { return }
             self.state.offer = offer
             self.state.offerQrValue = uri.uppercased()
+        }
+    }
+
+    /// The async payments offer, loaded beside the screen on its own task
+    /// exactly like `mintOffer` — additive only. It resolves to nothing in
+    /// every shipped build (no static invoice server is configured), so it
+    /// must never be able to delay, gate, or fail the receive screen.
+    ///
+    /// Exactly one `asyncReceive()` call: the core's read consumes an offer
+    /// from LDK's cache, so asking twice would burn two per visit and could
+    /// report a status about a different offer than the one rendered. Status
+    /// and offer arrive together, so they cannot disagree.
+    private func loadAsyncOffer() {
+        asyncOfferTask?.cancel()
+        asyncOfferTask = Task { [weak self] in
+            guard let self else { return }
+            // Async receive NEVER degrades receive — same contract as the
+            // standard offer above. Both halves required: the core pairs
+            // them, but a page with no payload must never render.
+            guard let view = try? await self.port.asyncReceive(),
+                  view.status == .ready,
+                  let offer = view.offer,
+                  let uri = try? await self.port.bolt12Uri(offer: offer),
+                  !Task.isCancelled
+            else { return }
+            self.state.asyncOffer = offer
+            self.state.asyncOfferQrValue = uri.uppercased()
         }
     }
 

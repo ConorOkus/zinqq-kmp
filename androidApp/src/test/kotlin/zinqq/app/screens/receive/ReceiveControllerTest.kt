@@ -17,6 +17,8 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import uniffi.wallet_core.AsyncReceiveStatus
+import uniffi.wallet_core.AsyncReceiveView
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.JitInvoice
 import uniffi.wallet_core.JitQuote
@@ -46,6 +48,17 @@ class ReceiveControllerTest {
 
         /** Held open, this stands in for the core's retry schedule still running. */
         var mintGate: CompletableDeferred<Unit>? = null
+
+        /** Async receive: DISABLED is the shipped default. */
+        var asyncStatus: AsyncReceiveStatus = AsyncReceiveStatus.DISABLED
+        var asyncOffer: String? = TEST_ASYNC_RECEIVE_OFFER
+        var asyncFails = false
+
+        /**
+         * Counts core reads. Each one consumes an offer from LDK's cache, so
+         * the controller must make exactly one per visit.
+         */
+        var asyncReceiveCalls = 0
 
         val events = MutableSharedFlow<Event>(extraBufferCapacity = 8)
 
@@ -81,6 +94,14 @@ class ReceiveControllerTest {
         }
 
         override suspend fun bolt12Uri(offer: String): String = "bitcoin:?lno=$offer"
+
+        override suspend fun asyncReceive(): AsyncReceiveView {
+            asyncReceiveCalls++
+            if (asyncFails) throw WalletException.NotRunning()
+            // Mirrors the core's pairing: an offer only ever accompanies READY.
+            val offer = if (asyncStatus == AsyncReceiveStatus.READY) asyncOffer else null
+            return AsyncReceiveView(status = asyncStatus, offer = offer)
+        }
 
         override val walletEvents: Flow<Event> = events
     }
@@ -466,4 +487,137 @@ class ReceiveControllerTest {
             assertTrue(state.loadError != null)
         }
     }
+
+    // --- async payments receive (U5) ---
+
+    /** A visit with a usable channel: the standard offer page is eligible. */
+    private fun asyncPort() = FakePort().apply {
+        bundleFor = { makeBundle(offer = TEST_RECEIVE_OFFER) }
+        inboundMsat = 500_000_000uL
+    }
+
+    /**
+     * READY plus an offer is the only state that adds the page — and it adds
+     * it BESIDE the standard offer page, never instead of it.
+     */
+    @Test
+    fun readyAsyncOfferAddsAPageBesideTheStandardOffer() {
+        val port = asyncPort().apply { asyncStatus = AsyncReceiveStatus.READY }
+        controllerTest(port) { c ->
+            val state = c.state.value
+            assertEquals(TEST_ASYNC_RECEIVE_OFFER, state.asyncOffer)
+            assertEquals(
+                "bitcoin:?lno=$TEST_ASYNC_RECEIVE_OFFER".uppercase(),
+                state.asyncOfferQrValue,
+            )
+            assertEquals(TEST_RECEIVE_OFFER, state.offer, "the standard offer survives")
+            assertEquals(
+                listOf(QrPage.UNIFIED, QrPage.BOLT12, QrPage.ASYNC),
+                pagesFor(state),
+            )
+        }
+    }
+
+    /** The shipped default: nothing changes anywhere. */
+    @Test
+    fun disabledAsyncReceiveLeavesTheScreenUnchanged() {
+        controllerTest(asyncPort()) { c ->
+            val state = c.state.value
+            assertNull(state.asyncOffer)
+            assertNull(state.asyncOfferQrValue)
+            assertEquals(listOf(QrPage.UNIFIED, QrPage.BOLT12), pagesFor(state))
+        }
+    }
+
+    /** Configured but still handshaking: no page, and no empty placeholder. */
+    @Test
+    fun awaitingServerAddsNoPage() {
+        val port = asyncPort().apply { asyncStatus = AsyncReceiveStatus.AWAITING_SERVER }
+        controllerTest(port) { c ->
+            val state = c.state.value
+            assertNull(state.asyncOffer)
+            assertEquals(listOf(QrPage.UNIFIED, QrPage.BOLT12), pagesFor(state))
+        }
+    }
+
+    /**
+     * A READY view with no offer is inconsistent — the core never produces
+     * it — but the page must not render off a status alone. No page, no crash.
+     */
+    @Test
+    fun readyWithoutAnOfferAddsNoPage() {
+        val port = asyncPort().apply {
+            asyncStatus = AsyncReceiveStatus.READY
+            asyncOffer = null
+        }
+        controllerTest(port) { c ->
+            val state = c.state.value
+            assertNull(state.asyncOffer)
+            assertEquals(listOf(QrPage.UNIFIED, QrPage.BOLT12), pagesFor(state))
+        }
+    }
+
+    /**
+     * Each core read consumes an offer from LDK's ten-slot cache and asks for
+     * a ChannelManager persist, so a visit must read exactly once — never
+     * once for the status and again for the offer.
+     */
+    @Test
+    fun aVisitReadsAsyncReceiveExactlyOnce() {
+        val port = asyncPort().apply { asyncStatus = AsyncReceiveStatus.READY }
+        controllerTest(port) { c ->
+            assertEquals(TEST_ASYNC_RECEIVE_OFFER, c.state.value.asyncOffer)
+            assertEquals(1, port.asyncReceiveCalls)
+        }
+    }
+
+    /**
+     * The DISABLED path reads once too — the core short-circuits before
+     * touching LDK's cache (asserted in the Rust suite), so the shell need
+     * not special-case it.
+     */
+    @Test
+    fun aDisabledVisitStillReadsOnlyOnce() {
+        val port = asyncPort()
+        controllerTest(port) { c ->
+            assertNull(c.state.value.asyncOffer)
+            assertEquals(1, port.asyncReceiveCalls)
+        }
+    }
+
+    /** Async receive NEVER degrades receive — the core's standing contract. */
+    @Test
+    fun aThrowingAsyncPortLeavesTheRestOfReceiveIntact() {
+        val port = asyncPort().apply {
+            asyncStatus = AsyncReceiveStatus.READY
+            asyncFails = true
+        }
+        controllerTest(port) { c ->
+            val state = c.state.value
+            assertNull(state.loadError)
+            assertEquals(TEST_RECEIVE_ADDRESS, state.address)
+            assertEquals(TEST_RECEIVE_OFFER, state.offer)
+            assertNull(state.asyncOffer)
+            assertEquals(listOf(QrPage.UNIFIED, QrPage.BOLT12), pagesFor(state))
+        }
+    }
+
+    /** The no-channel mandatory-amount visit shows no reusable page at all. */
+    @Test
+    fun aFreshWalletNeverShowsTheAsyncPage() {
+        val port = freshWalletPort().apply {
+            asyncStatus = AsyncReceiveStatus.READY
+        }
+        controllerTest(port) { c ->
+            val state = c.state.value
+            assertNull(state.asyncOffer)
+            assertEquals(listOf(QrPage.UNIFIED), pagesFor(state))
+        }
+    }
+
+    private fun pagesFor(state: ReceiveUiState) = receivePages(
+        offerExists = state.offerQrValue != null,
+        asyncOfferExists = state.asyncOfferQrValue != null,
+        needsAmount = state.needsAmount,
+    )
 }
