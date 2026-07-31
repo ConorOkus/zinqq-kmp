@@ -41,6 +41,101 @@ pub mod mainnet {
     }
 }
 
+/// Mutinynet — a custom signet with 30-second blocks — used for local
+/// development only (KTD-1: selected at build time, never at runtime).
+///
+/// Sibling of [`mainnet`] per that module's own contract: a second network is a
+/// second module, not conditionals at call sites. Unlike [`mainnet`], whose
+/// service endpoints predate this module and stay as the top-level `DEFAULT_*`
+/// constants, everything Mutinynet needs lives here.
+pub mod mutinynet {
+    use bitcoin::Network;
+
+    /// Mutinynet is a signet, so `bitcoin` treats it as [`Network::Signet`] —
+    /// what distinguishes it from vanilla signet is the genesis below, which
+    /// the startup probe checks.
+    pub const NETWORK: Network = Network::Signet;
+
+    /// Mutinynet's genesis, read live from its own Esplora
+    /// (`/api/block-height/0`) rather than transcribed. A custom signet has a
+    /// different genesis from default signet, so this is the constant that
+    /// makes the startup probe meaningful.
+    pub const GENESIS_BLOCK_HASH: &str =
+        "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6";
+
+    /// [`GENESIS_BLOCK_HASH`] parsed.
+    pub fn genesis_block_hash() -> bitcoin::BlockHash {
+        GENESIS_BLOCK_HASH
+            .parse()
+            .expect("the Mutinynet genesis hash constant is valid")
+    }
+
+    /// Mutinynet's public Esplora.
+    pub const ESPLORA_URL: &str = "https://mutinynet.com/api";
+
+    /// Mutinynet's Rapid Gossip Sync server.
+    pub const RGS_URL: &str = "https://rgs.mutinynet.com/snapshot";
+
+    /// Mutinynet's mempool.space instance, for outbound transaction links.
+    pub const EXPLORER_URL: &str = "https://mutinynet.com";
+
+    /// Megalith's Mutinynet node. Whether it serves LSPS2 (JIT channels) as
+    /// well as LSPS1 is unconfirmed — see the local-testing runbook. Inbound
+    /// liquidity is reachable regardless via a manual channel open.
+    pub const LSP_NODE_ID: &str =
+        "03e30fda71887a916ef5548a4d02b06fe04aaa1a8de9e24134ce7f139cf79d7579";
+
+    /// Megalith's Mutinynet address.
+    pub const LSP_ADDRESS: &str = "64.23.192.68:9736";
+}
+
+/// The networks this wallet can be built for (KTD-8).
+///
+/// A closed set rather than `bitcoin::Network`: an unsupported network becomes
+/// a compile error in the shells instead of a runtime config failure, and
+/// nothing can ask for a chain whose endpoints we have not defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Enum)]
+pub enum WalletNetwork {
+    /// Bitcoin mainnet. The default everywhere, and the only network a
+    /// Release/TestFlight build can resolve.
+    #[default]
+    Mainnet,
+    /// Mutinynet, for local development.
+    Mutinynet,
+}
+
+impl WalletNetwork {
+    /// The `bitcoin` network this maps to.
+    pub fn network(self) -> Network {
+        match self {
+            Self::Mainnet => mainnet::NETWORK,
+            Self::Mutinynet => mutinynet::NETWORK,
+        }
+    }
+
+    /// The genesis this network's chain backend must report, checked at
+    /// startup so a backend serving the wrong chain fails hard.
+    pub fn genesis_block_hash(self) -> bitcoin::BlockHash {
+        match self {
+            Self::Mainnet => mainnet::genesis_block_hash(),
+            Self::Mutinynet => mutinynet::genesis_block_hash(),
+        }
+    }
+
+    /// Storage segment isolating this network's data directory from every
+    /// other network's (R4).
+    ///
+    /// Mainnet returns `None` — it keeps the bare `storage_dir` it has always
+    /// used, so an existing install still finds its mnemonic and channel
+    /// monitors. Adding a segment for mainnet would read as a wiped wallet.
+    pub fn storage_segment(self) -> Option<&'static str> {
+        match self {
+            Self::Mainnet => None,
+            Self::Mutinynet => Some("mutinynet"),
+        }
+    }
+}
+
 /// Default Esplora endpoint (KTD-5): the Zinqq PWA's own proxy, which fronts
 /// Blockstream Enterprise staging and holds the credentials server-side, so the
 /// spike shares the production client's chain infrastructure without embedding
@@ -242,6 +337,18 @@ impl LspConfig {
             token: None,
         }
     }
+
+    /// Megalith's Mutinynet node, the signet sibling of [`LspConfig::megalith`].
+    pub fn megalith_mutinynet() -> Self {
+        Self {
+            node_id: PublicKey::from_str(mutinynet::LSP_NODE_ID)
+                .expect("Megalith Mutinynet node id constant is a valid public key"),
+            address: mutinynet::LSP_ADDRESS
+                .parse()
+                .expect("Megalith Mutinynet address constant is a valid socket address"),
+            token: None,
+        }
+    }
 }
 
 /// Test-only seam (U3): replaces the VSS wire transport with an in-process
@@ -277,7 +384,10 @@ pub struct PeerInfo {
 /// a separate destructive flow (U4), not a constructor parameter.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Bitcoin network the node runs on (fixed to [`mainnet::NETWORK`]).
+    /// Which network this wallet was built for (R1). Selected at build time
+    /// by the shells (KTD-1); [`Config::network`] is its `bitcoin` mapping.
+    pub wallet_network: WalletNetwork,
+    /// Bitcoin network the node runs on, derived from [`Config::wallet_network`].
     pub network: Network,
     /// App-private data directory holding the mnemonic, channel monitors, and
     /// all other persisted state.
@@ -326,19 +436,52 @@ pub struct Config {
 
 impl Config {
     /// Mainnet defaults with the given app-private storage directory.
+    ///
+    /// Delegates to [`Config::for_network`] so there is exactly one place a
+    /// network's defaults are assembled; mainnet output is unchanged from
+    /// before that function existed, which the config tests pin.
     pub fn new(storage_dir: String) -> Self {
+        Self::for_network(WalletNetwork::Mainnet, storage_dir)
+    }
+
+    /// Defaults for `wallet_network` with the given app-private storage
+    /// directory (R1).
+    ///
+    /// Every network-dependent value resolves here from the network's own
+    /// constants module, so adding a third network means adding a module and a
+    /// match arm rather than hunting call sites.
+    pub fn for_network(wallet_network: WalletNetwork, storage_dir: String) -> Self {
+        let (esplora_url, rgs_url, explorer_url, lsp, trusted_lsp_id) = match wallet_network {
+            WalletNetwork::Mainnet => (
+                DEFAULT_ESPLORA_URL,
+                DEFAULT_RGS_URL,
+                DEFAULT_EXPLORER_URL,
+                LspConfig::megalith(),
+                MEGALITH_LSP_NODE_ID,
+            ),
+            WalletNetwork::Mutinynet => (
+                mutinynet::ESPLORA_URL,
+                mutinynet::RGS_URL,
+                mutinynet::EXPLORER_URL,
+                LspConfig::megalith_mutinynet(),
+                mutinynet::LSP_NODE_ID,
+            ),
+        };
         Self {
-            network: mainnet::NETWORK,
+            wallet_network,
+            network: wallet_network.network(),
             storage_dir,
-            esplora_url: DEFAULT_ESPLORA_URL.to_string(),
-            rgs_url: DEFAULT_RGS_URL.to_string(),
+            esplora_url: esplora_url.to_string(),
+            rgs_url: rgs_url.to_string(),
+            // VSS is network-agnostic: the same proxy serves every network,
+            // isolated by the namespaced store id (KTD-2), not by endpoint.
             vss_url: DEFAULT_VSS_URL.to_string(),
             vss_disabled: false,
-            explorer_url: DEFAULT_EXPLORER_URL.to_string(),
+            explorer_url: explorer_url.to_string(),
             peers: Vec::new(),
-            lsp: LspConfig::megalith(),
-            trusted_lsps: vec![PublicKey::from_str(MEGALITH_LSP_NODE_ID)
-                .expect("Megalith node id constant is a valid public key")],
+            lsp,
+            trusted_lsps: vec![PublicKey::from_str(trusted_lsp_id)
+                .expect("LSP node id constants are valid public keys")],
             static_invoice_server_paths: Vec::new(),
             #[cfg(test)]
             vss_transport_override: None,
@@ -442,6 +585,102 @@ mod tests {
             config.static_invoice_server_paths.is_empty(),
             "async receive stays inert unless a static invoice server is configured"
         );
+    }
+
+    /// U1/AE1: mainnet is unchanged by the network-keyed refactor. Asserted
+    /// field-for-field rather than spot-checked, because "mainnet did not
+    /// move" is the invariant the whole network split rests on.
+    #[test]
+    fn mainnet_for_network_equals_the_historical_new() {
+        let via_new = Config::new("/tmp/data".to_string());
+        let via_for_network = Config::for_network(WalletNetwork::Mainnet, "/tmp/data".to_string());
+
+        assert_eq!(via_new.wallet_network, WalletNetwork::Mainnet);
+        assert_eq!(via_new.network, Network::Bitcoin);
+        assert_eq!(via_new.esplora_url, via_for_network.esplora_url);
+        assert_eq!(via_new.rgs_url, via_for_network.rgs_url);
+        assert_eq!(via_new.vss_url, via_for_network.vss_url);
+        assert_eq!(via_new.explorer_url, via_for_network.explorer_url);
+        assert_eq!(via_new.lsp.node_id, via_for_network.lsp.node_id);
+        assert_eq!(via_new.lsp.address, via_for_network.lsp.address);
+        assert_eq!(via_new.trusted_lsps, via_for_network.trusted_lsps);
+        assert_eq!(
+            via_new.storage_dir, via_for_network.storage_dir,
+            "mainnet keeps the bare storage dir so existing installs still resolve"
+        );
+    }
+
+    /// U1/AE2: every Mutinynet endpoint resolves to Mutinynet's own service,
+    /// not a mainnet one. A single leaked mainnet endpoint would make the
+    /// genesis probe the only thing standing between a test build and the
+    /// real chain.
+    #[test]
+    fn mutinynet_resolves_its_own_services() {
+        let config = Config::for_network(WalletNetwork::Mutinynet, "/tmp/data".to_string());
+
+        assert_eq!(config.wallet_network, WalletNetwork::Mutinynet);
+        assert_eq!(config.network, Network::Signet);
+        assert_eq!(config.esplora_url, "https://mutinynet.com/api");
+        assert_eq!(config.rgs_url, "https://rgs.mutinynet.com/snapshot");
+        assert_eq!(config.explorer_url, "https://mutinynet.com");
+        assert_eq!(
+            config.lsp.node_id,
+            PublicKey::from_str(mutinynet::LSP_NODE_ID).unwrap()
+        );
+        assert_eq!(config.lsp.address.to_string(), "64.23.192.68:9736");
+        assert!(
+            config.static_invoice_server_paths.is_empty(),
+            "async receive stays opt-in on every network"
+        );
+    }
+
+    /// U1: each network trusts its OWN LSP for 0-conf and not the other's —
+    /// a cross-network trusted id would extend 0-conf trust to a node on a
+    /// chain this build never talks to.
+    #[test]
+    fn each_network_trusts_only_its_own_lsp() {
+        let mainnet_cfg = Config::for_network(WalletNetwork::Mainnet, "/tmp/d".to_string());
+        let mutiny_cfg = Config::for_network(WalletNetwork::Mutinynet, "/tmp/d".to_string());
+        let mainnet_lsp = PublicKey::from_str(MEGALITH_LSP_NODE_ID).unwrap();
+        let mutiny_lsp = PublicKey::from_str(mutinynet::LSP_NODE_ID).unwrap();
+
+        assert!(mainnet_cfg.is_trusted_lsp(&mainnet_lsp));
+        assert!(!mainnet_cfg.is_trusted_lsp(&mutiny_lsp));
+        assert!(mutiny_cfg.is_trusted_lsp(&mutiny_lsp));
+        assert!(!mutiny_cfg.is_trusted_lsp(&mainnet_lsp));
+    }
+
+    /// U1: the Mutinynet genesis constant parses, mirroring the mainnet
+    /// module's own constant test.
+    #[test]
+    fn mutinynet_module_pins_the_genesis_hash_and_network() {
+        assert_eq!(mutinynet::NETWORK, Network::Signet);
+        assert_eq!(
+            mutinynet::genesis_block_hash().to_string(),
+            mutinynet::GENESIS_BLOCK_HASH
+        );
+        assert_ne!(
+            mutinynet::GENESIS_BLOCK_HASH,
+            mainnet::GENESIS_BLOCK_HASH,
+            "a custom signet must not share mainnet's genesis"
+        );
+    }
+
+    /// U1/R4: mainnet keeps the bare storage dir; Mutinynet gets a segment.
+    #[test]
+    fn only_non_mainnet_networks_get_a_storage_segment() {
+        assert_eq!(WalletNetwork::Mainnet.storage_segment(), None);
+        assert_eq!(
+            WalletNetwork::Mutinynet.storage_segment(),
+            Some("mutinynet")
+        );
+    }
+
+    /// U1: the enum's default is the safe one — anything that falls back to
+    /// `Default` lands on mainnet, never a test network.
+    #[test]
+    fn the_default_network_is_mainnet() {
+        assert_eq!(WalletNetwork::default(), WalletNetwork::Mainnet);
     }
 
     /// U1: the payer half of async payments is ON — a zinqq user paying an
