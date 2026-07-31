@@ -66,8 +66,10 @@ pub enum SendError {
     AmountOverrideNotAllowed,
     /// The offer string failed to parse or verify (U6).
     InvalidOffer(String),
-    /// The offer is for a different network than the node's (U6).
-    OfferWrongNetwork,
+    /// The offer is for a different network than the node's (U6). Carries the
+    /// node's network so the copy names it (R8); the offer's own chain is not
+    /// recoverable here, since `supports_chain` answers only yes/no.
+    OfferWrongNetwork { expected: Network },
     /// The offer is already expired (U6).
     OfferExpired,
     /// A payment for the same payment hash is already pending in the channel
@@ -101,9 +103,9 @@ impl fmt::Display for SendError {
                 "an amount override is only allowed for requests without an embedded amount"
             ),
             SendError::InvalidOffer(message) => write!(f, "invalid bolt12 offer: {message}"),
-            SendError::OfferWrongNetwork => write!(
+            SendError::OfferWrongNetwork { expected } => write!(
                 f,
-                "the offer is for a different network, this wallet only pays bitcoin offers"
+                "the offer is for a different network, this wallet only pays {expected} offers"
             ),
             SendError::OfferExpired => write!(f, "the offer is expired"),
             SendError::DuplicatePayment => {
@@ -259,7 +261,7 @@ pub(crate) fn validate_offer(
     let offer =
         Offer::from_str(offer_str).map_err(|e| SendError::InvalidOffer(format!("{e:?}")))?;
     if !offer.supports_chain(ChainHash::using_genesis_block(network)) {
-        return Err(SendError::OfferWrongNetwork);
+        return Err(SendError::OfferWrongNetwork { expected: network });
     }
     if offer.is_expired_no_std(now_since_epoch) {
         return Err(SendError::OfferExpired);
@@ -319,16 +321,18 @@ pub(crate) fn send_bolt12(
     };
     payer
         .pay_offer(&offer, ldk_amount, payment_id, payer_note, SEND_RETRY)
-        .map_err(map_offer_error)?;
+        .map_err(|e| map_offer_error(e, network))?;
     Ok(resolved_msat)
 }
 
 /// Maps LDK's synchronous `pay_for_offer` failures onto typed [`SendError`]s.
-fn map_offer_error(error: Bolt12SemanticError) -> SendError {
+/// `network` is the node's own, carried so an unsupported-chain failure can
+/// name it (R8).
+fn map_offer_error(error: Bolt12SemanticError, network: Network) -> SendError {
     match error {
         Bolt12SemanticError::DuplicatePaymentId => SendError::DuplicatePayment,
         Bolt12SemanticError::AlreadyExpired => SendError::OfferExpired,
-        Bolt12SemanticError::UnsupportedChain => SendError::OfferWrongNetwork,
+        Bolt12SemanticError::UnsupportedChain => SendError::OfferWrongNetwork { expected: network },
         Bolt12SemanticError::MissingAmount => SendError::AmountMissing,
         other => SendError::SendFailed(format!("{other:?}")),
     }
@@ -722,7 +726,9 @@ mod tests {
             SendError::AmountMissing,
             SendError::AmountOverrideNotAllowed,
             SendError::InvalidOffer("bad bech32".to_string()),
-            SendError::OfferWrongNetwork,
+            SendError::OfferWrongNetwork {
+                expected: Network::Bitcoin,
+            },
             SendError::OfferExpired,
             SendError::DuplicatePayment,
             SendError::RouteNotFound,
@@ -927,7 +933,12 @@ mod tests {
             RANDOM_ID,
         )
         .unwrap_err();
-        assert_eq!(err, SendError::OfferWrongNetwork);
+        assert_eq!(
+            err,
+            SendError::OfferWrongNetwork {
+                expected: Network::Bitcoin
+            }
+        );
 
         let expired = lightning::offers::offer::OfferBuilder::new(offer_signing_pubkey())
             .description("t".to_string())
@@ -958,7 +969,9 @@ mod tests {
             ),
             (
                 Bolt12SemanticError::UnsupportedChain,
-                SendError::OfferWrongNetwork,
+                SendError::OfferWrongNetwork {
+                    expected: Network::Bitcoin,
+                },
             ),
             (Bolt12SemanticError::AlreadyExpired, SendError::OfferExpired),
             (Bolt12SemanticError::MissingAmount, SendError::AmountMissing),
