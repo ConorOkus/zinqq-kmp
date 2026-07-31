@@ -9,6 +9,7 @@ import kotlinx.coroutines.withContext
 import uniffi.wallet_core.Event
 import uniffi.wallet_core.Wallet
 import uniffi.wallet_core.WalletConfig
+import uniffi.wallet_core.WalletNetwork
 import uniffi.wallet_core.coreVersion as coreVersionBinding
 import uniffi.wallet_core.pingAsync as pingAsyncBinding
 
@@ -25,19 +26,30 @@ object WalletCore {
 
     /**
      * Creates a stopped wallet over an app-private storage directory,
-     * reloading any persisted (unacked) events. Mainnet only; no seed input
-     * (AE2). The URL overrides exist for tests and fallback.
+     * reloading any persisted (unacked) events. No seed input (AE2). The URL
+     * overrides exist for tests and fallback.
+     *
+     * [network] is chosen at build time by the shell — debug builds may target
+     * Mutinynet, Release/TestFlight is always mainnet. `null` means mainnet,
+     * so anything that says nothing gets the production network. Note that
+     * Kotlin default arguments do not export to Swift, so iOS passes this
+     * explicitly.
+     *
+     * The core isolates each network's storage directory and VSS store, so two
+     * networks over the same [storageDir] never share state.
      */
     fun create(
         storageDir: String,
         esploraUrl: String? = null,
         rgsUrl: String? = null,
+        network: WalletNetwork? = null,
     ): Wallet =
         Wallet(
             WalletConfig(
                 storageDir = storageDir,
                 esploraUrl = esploraUrl,
                 rgsUrl = rgsUrl,
+                network = network,
             ),
         )
 

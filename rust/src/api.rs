@@ -17,7 +17,7 @@ use crate::channels::{ChannelView, ChannelsError, CloseEstimate, OpenFeeEstimate
 use crate::close_records::{
     derive_close_status, CloseRecord, CloseTxRole, CloseType, Initiator, Resolution,
 };
-use crate::config::Config;
+use crate::config::{Config, WalletNetwork};
 use crate::events::{Event, EventQueue};
 use crate::history::{ActivityRow, CloseStatusLabel, PersistedPayment};
 use crate::keys::{self, KeysError};
@@ -72,6 +72,15 @@ pub struct WalletConfig {
     /// Megalith seed and the configured LSP (KTD-10: a set + predicate).
     #[uniffi(default = [])]
     pub trusted_lsp_node_ids: Vec<String>,
+    /// Which network to build the wallet for (R1, R2). Selected at build time
+    /// by the shell (KTD-1) — there is deliberately no runtime switch.
+    ///
+    /// `None` means mainnet. It is an `Option` rather than a defaulted enum
+    /// because uniffi record defaults accept literals only, and it matches the
+    /// `Option`-plus-`None` shape every other override on this record uses.
+    /// Either way a shell that says nothing gets the production network.
+    #[uniffi(default = None)]
+    pub network: Option<WalletNetwork>,
     /// Blinded message paths to a BOLT12 static invoice server, each the hex
     /// of LDK's own `BlindedMessagePath` serialization — the async payments
     /// protocol's receive half (see [`Wallet::async_receive`]).
@@ -526,9 +535,11 @@ pub enum WalletError {
     InvalidInvoice { detail: String },
     /// `send()` with an invoice that is already expired.
     InvoiceExpired,
-    /// `send()` with an invoice for a different network (this wallet pays
-    /// mainnet invoices only); `network` names the invoice's network.
-    WrongNetwork { network: String },
+    /// `send()` with an invoice for a different network than this build's.
+    /// `network` names the invoice's network, `expected` this wallet's (R8 —
+    /// both are carried so the copy is truthful on any network, not just
+    /// mainnet).
+    WrongNetwork { network: String, expected: String },
     /// An amountless invoice/offer sent without an amount (U6: supply
     /// `amount_msat` for amountless requests).
     AmountlessInvoice,
@@ -540,8 +551,9 @@ pub enum WalletError {
     InvalidOffer { detail: String },
     /// `pay_offer()` with an offer that is already expired (U6).
     OfferExpired,
-    /// `pay_offer()` with an offer for a different network (U6).
-    OfferWrongNetwork,
+    /// `pay_offer()` with an offer for a different network (U6). `expected`
+    /// names this wallet's network (R8).
+    OfferWrongNetwork { expected: String },
     /// `resolve_input()`/`fetch_lnurl_invoice()` failed; `detail` is the
     /// PWA's user-facing resolution error, verbatim (U6, R5).
     ResolveFailed { detail: String },
@@ -637,10 +649,10 @@ impl std::fmt::Display for WalletError {
                 write!(f, "invalid bolt11 invoice: {detail}")
             }
             WalletError::InvoiceExpired => write!(f, "the invoice is expired"),
-            WalletError::WrongNetwork { network } => write!(
+            WalletError::WrongNetwork { network, expected } => write!(
                 f,
-                "the invoice is for the {network} network, this wallet only pays bitcoin \
-                 (mainnet) invoices"
+                "the invoice is for the {network} network, this wallet only pays \
+                 {expected} invoices"
             ),
             // The PWA's copy, verbatim (context.tsx:981).
             WalletError::AmountlessInvoice => write!(
@@ -654,7 +666,10 @@ impl std::fmt::Display for WalletError {
                 write!(f, "invalid bolt12 offer: {detail}")
             }
             WalletError::OfferExpired => write!(f, "{}", SendError::OfferExpired),
-            WalletError::OfferWrongNetwork => write!(f, "{}", SendError::OfferWrongNetwork),
+            WalletError::OfferWrongNetwork { expected } => write!(
+                f,
+                "the offer is for a different network, this wallet only pays {expected} offers"
+            ),
             // The resolution taxonomy already carries the PWA's exact
             // user-facing strings — render them untouched.
             WalletError::ResolveFailed { detail } => write!(f, "{detail}"),
@@ -888,14 +903,17 @@ impl From<SendError> for WalletError {
             SendError::NotRunning => WalletError::NotRunning,
             SendError::InvalidInvoice(message) => WalletError::InvalidInvoice { detail: message },
             SendError::InvoiceExpired => WalletError::InvoiceExpired,
-            SendError::WrongNetwork { found, .. } => WalletError::WrongNetwork {
+            SendError::WrongNetwork { found, expected } => WalletError::WrongNetwork {
                 network: found.to_string(),
+                expected: expected.to_string(),
             },
             SendError::AmountMissing => WalletError::AmountlessInvoice,
             SendError::AmountOverrideNotAllowed => WalletError::AmountOverrideNotAllowed,
             SendError::InvalidOffer(detail) => WalletError::InvalidOffer { detail },
             SendError::OfferExpired => WalletError::OfferExpired,
-            SendError::OfferWrongNetwork => WalletError::OfferWrongNetwork,
+            SendError::OfferWrongNetwork { expected } => WalletError::OfferWrongNetwork {
+                expected: expected.to_string(),
+            },
             SendError::DuplicatePayment => WalletError::DuplicatePayment,
             // Attempt failures: the same reason string the queued
             // Event::PaymentFailed carries.
@@ -914,7 +932,13 @@ impl From<SendError> for WalletError {
 fn apply_config_overrides(config: WalletConfig) -> Result<Config, WalletError> {
     use std::str::FromStr as _;
 
-    let mut core_config = Config::new(config.storage_dir);
+    // Network first: it decides every default below, so an explicit URL or LSP
+    // override still lands on top of the right network's baseline rather than
+    // being silently replaced by it. `None` is mainnet (R2).
+    let mut core_config = Config::for_network(
+        config.network.unwrap_or(WalletNetwork::Mainnet),
+        config.storage_dir,
+    );
     if let Some(esplora_url) = config.esplora_url {
         core_config.esplora_url = esplora_url;
     }
@@ -1184,6 +1208,17 @@ impl Wallet {
     /// while stopped.
     pub fn offer_available(&self) -> bool {
         self.node.offer_available()
+    }
+
+    /// Base URL for block-explorer transaction links, e.g.
+    /// `https://mempool.space` on mainnet and `https://mutinynet.com` on
+    /// Mutinynet.
+    ///
+    /// Network-dependent, so the shells must read it rather than hardcode one:
+    /// a Mutinynet build linking to mempool.space opens a mainnet explorer
+    /// with a signet txid and shows "transaction not found".
+    pub fn explorer_base_url(&self) -> String {
+        self.node.explorer_base_url()
     }
 
     /// Async receive state and offer together (U4) — the receive screen's one
@@ -1598,6 +1633,7 @@ mod tests {
             lsp_host: None,
             lsp_port: None,
             trusted_lsp_node_ids: Vec::new(),
+            network: None,
             static_invoice_server_paths: Vec::new(),
         }
     }
@@ -1716,6 +1752,101 @@ mod tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+
+    /// U2/R2: a config that says nothing about the network gets mainnet. This
+    /// is the safe-default guarantee every shell relies on.
+    #[test]
+    fn an_unspecified_network_resolves_to_mainnet() {
+        let config = apply_config_overrides(base_config()).unwrap();
+        assert_eq!(config.wallet_network, WalletNetwork::Mainnet);
+        assert_eq!(config.esplora_url, DEFAULT_ESPLORA_URL);
+    }
+
+    /// U2/AE2: an explicit Mutinynet request reaches the core's own defaults.
+    #[test]
+    fn an_explicit_mutinynet_request_resolves_its_services() {
+        let mut ffi_config = base_config();
+        ffi_config.network = Some(WalletNetwork::Mutinynet);
+
+        let config = apply_config_overrides(ffi_config).unwrap();
+        assert_eq!(config.wallet_network, WalletNetwork::Mutinynet);
+        assert_eq!(config.network, bitcoin::Network::Signet);
+        assert_eq!(config.esplora_url, "https://mutinynet.com/api");
+        assert_eq!(config.rgs_url, "https://rgs.mutinynet.com/snapshot");
+    }
+
+    /// U2: the network sets the baseline, an explicit URL still wins over it.
+    /// Ordering matters — resolving the network second would silently discard
+    /// a caller's override.
+    #[test]
+    fn an_explicit_url_override_still_beats_the_network_default() {
+        let mut ffi_config = base_config();
+        ffi_config.network = Some(WalletNetwork::Mutinynet);
+        ffi_config.esplora_url = Some("http://127.0.0.1:1/esplora".to_string());
+
+        let config = apply_config_overrides(ffi_config).unwrap();
+        assert_eq!(config.esplora_url, "http://127.0.0.1:1/esplora");
+        assert_eq!(
+            config.rgs_url, "https://rgs.mutinynet.com/snapshot",
+            "the un-overridden defaults still come from the network"
+        );
+    }
+
+    /// U2/R8: wrong-network copy names the wallet's ACTUAL network. The old
+    /// wording hardcoded "bitcoin (mainnet)", which on a Mutinynet build told
+    /// the user the opposite of the truth.
+    #[test]
+    fn wrong_network_copy_names_the_configured_network() {
+        let signet_invoice = WalletError::WrongNetwork {
+            network: "bitcoin".to_string(),
+            expected: "signet".to_string(),
+        };
+        let rendered = signet_invoice.to_string();
+        assert!(rendered.contains("only pays signet invoices"), "{rendered}");
+        assert!(
+            !rendered.contains("mainnet"),
+            "the copy must not assert mainnet on a signet build: {rendered}"
+        );
+
+        let signet_offer = WalletError::OfferWrongNetwork {
+            expected: "signet".to_string(),
+        };
+        assert!(
+            signet_offer.to_string().contains("only pays signet offers"),
+            "{signet_offer}"
+        );
+    }
+
+    /// U2/R8: the mainnet wording still reads correctly, so the fix did not
+    /// trade one wrong message for another.
+    #[test]
+    fn wrong_network_copy_still_reads_correctly_on_mainnet() {
+        let err = WalletError::WrongNetwork {
+            network: "testnet".to_string(),
+            expected: "bitcoin".to_string(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("for the testnet network"), "{rendered}");
+        assert!(
+            rendered.contains("only pays bitcoin invoices"),
+            "{rendered}"
+        );
+    }
+
+    /// R8: explorer links follow the build's network. A Mutinynet build
+    /// linking to mempool.space would open a mainnet explorer with a signet
+    /// txid — a dead link on exactly the network this is used to test.
+    #[test]
+    fn the_explorer_base_url_follows_the_network() {
+        let mainnet = apply_config_overrides(base_config()).unwrap();
+        assert_eq!(mainnet.explorer_url, "https://mempool.space");
+
+        let mut ffi_config = base_config();
+        ffi_config.network = Some(WalletNetwork::Mutinynet);
+        let mutiny = apply_config_overrides(ffi_config).unwrap();
+        assert_eq!(mutiny.explorer_url, "https://mutinynet.com");
+        assert_ne!(mainnet.explorer_url, mutiny.explorer_url);
     }
 
     /// U2/R6: the default is empty — async receive stays inert unless a

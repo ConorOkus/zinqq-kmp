@@ -951,6 +951,12 @@ impl Node {
             && crate::receive::read_persisted_offer(&kv_store).is_some()
     }
 
+    /// Base URL for block-explorer transaction links on this build's network.
+    /// Available while stopped — it is configuration, not node state.
+    pub fn explorer_base_url(&self) -> String {
+        self.config.explorer_url.clone()
+    }
+
     /// Async receive state and offer together (U4) — the receive screen's one
     /// async payments call.
     ///
@@ -2692,6 +2698,15 @@ mod tests {
         PaymentHash([byte; 32])
     }
 
+    /// [`offline_config`]'s overrides applied to an already-built config, so a
+    /// test can pick the network and still run without a network.
+    fn offline_config_for(mut config: Config) -> Config {
+        config.esplora_url = "http://127.0.0.1:1".to_string();
+        config.rgs_url = "http://127.0.0.1:1/snapshot".to_string();
+        config.vss_disabled = true;
+        config
+    }
+
     /// A real `BlindedMessagePath` to stand in for one a static invoice
     /// server operator would hand over (U3).
     fn static_invoice_server_path() -> lightning::blinded_path::message::BlindedMessagePath {
@@ -2706,6 +2721,43 @@ mod tests {
             &keys,
             &bitcoin::secp256k1::Secp256k1::new(),
         )
+    }
+
+    /// U4/R4: two nodes over the same base path, on different networks, share
+    /// nothing. Asserted through the node's OWN readers — the KV store,
+    /// mnemonic, and lock all resolve from `config.storage_dir` — because
+    /// review caught the first cut scoping the path in the builder only,
+    /// leaving those readers pointed at the mainnet directory.
+    #[test]
+    fn two_networks_over_one_base_path_share_no_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_str().unwrap().to_string();
+
+        let mainnet = Config::for_network(crate::config::WalletNetwork::Mainnet, base.clone());
+        let mutiny = Config::for_network(crate::config::WalletNetwork::Mutinynet, base.clone());
+
+        assert_eq!(mainnet.storage_dir, base, "mainnet keeps the base path");
+        assert_ne!(mainnet.storage_dir, mutiny.storage_dir);
+
+        // Start each in turn; each must mint its OWN mnemonic beneath its own
+        // directory. A shared path would have the second node read the first's
+        // seed words.
+        let mainnet_node = Node::new(offline_config_for(mainnet.clone()));
+        mainnet_node.start().expect("mainnet offline start");
+        let mainnet_words = mainnet_node.reveal_mnemonic();
+        mainnet_node.stop().unwrap();
+
+        let mutiny_node = Node::new(offline_config_for(mutiny.clone()));
+        mutiny_node.start().expect("mutinynet offline start");
+        let mutiny_words = mutiny_node.reveal_mnemonic();
+        mutiny_node.stop().unwrap();
+
+        assert!(mainnet_words.is_some() && mutiny_words.is_some());
+        assert_ne!(
+            mainnet_words, mutiny_words,
+            "each network's node must own its own seed, not read the other's"
+        );
+        assert!(std::path::Path::new(&mutiny.storage_dir).exists());
     }
 
     /// U3/U4, AE3 and R6: with no static invoice server configured — the

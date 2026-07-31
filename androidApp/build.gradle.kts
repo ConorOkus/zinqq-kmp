@@ -6,6 +6,20 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+/**
+ * The network a debug build targets: Mutinynet unless `-Pzinqq.network=mainnet`
+ * says otherwise (KTD-4).
+ *
+ * An unrecognized value falls back to the debug default rather than failing the
+ * build — a typo should not silently produce some third behaviour, and the only
+ * value worth honouring here is the deliberate mainnet opt-in.
+ */
+fun Project.debugWalletNetwork(): String =
+    when (providers.gradleProperty("zinqq.network").orNull?.lowercase()) {
+        "mainnet" -> "mainnet"
+        else -> "mutinynet"
+    }
+
 android {
     // U13: the spike package graduated to the product id. Safe because spike
     // installs are disposable (plan Key Decisions: no migration is built).
@@ -19,8 +33,26 @@ android {
         versionName = "0.1.0"
         ndk.abiFilters += setOf("arm64-v8a", "x86_64")
     }
+    buildTypes {
+        // Debug targets Mutinynet so local testing never touches real funds
+        // (KTD-1: build-time selection, no runtime switch). `-Pzinqq.network=
+        // mainnet` overrides it when a production bug needs reproducing with a
+        // debugger attached (KTD-4) — an escape hatch Release deliberately
+        // does not get.
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+            buildConfigField("String", "WALLET_NETWORK", "\"${debugWalletNetwork()}\"")
+        }
+        // Release — and therefore TestFlight — is hard-wired to mainnet. It
+        // reads no property, so no build invocation can put a shipped binary
+        // on a test network.
+        getByName("release") {
+            buildConfigField("String", "WALLET_NETWORK", "\"mainnet\"")
+        }
+    }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

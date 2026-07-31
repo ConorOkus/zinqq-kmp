@@ -47,6 +47,14 @@ an LSP that supports holding is in the path.
 
 To re-check, watch a peer's `Init` line in the node log for `HtlcHold`.
 
+## Where to run this
+
+Debug builds target Mutinynet (see
+[the Mutinynet local-testing runbook](mutinynet-local-testing.md)), which is
+where this procedure belongs — the receive half needs a static invoice server
+and a payer node, and standing that up on mainnet means risking real sats on a
+protocol LDK labels pre-production.
+
 ## Standing up a server
 
 The server is a separate always-online LDK node — **not** this wallet. It needs

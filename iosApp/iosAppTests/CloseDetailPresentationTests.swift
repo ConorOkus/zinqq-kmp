@@ -146,6 +146,20 @@ final class CloseDetailPresentationTests: XCTestCase {
     }
 
     func testExplorerLinksPointAtMempoolSpace() {
-        XCTAssertEqual("https://mempool.space/tx/abc123", explorerTxUrl("abc123"))
+        XCTAssertEqual(
+            "https://mempool.space/tx/abc123",
+            explorerTxUrl("https://mempool.space", "abc123")
+        )
+        // R8: the link follows the build's network, so a Mutinynet build does
+        // not send a signet txid to a mainnet explorer.
+        XCTAssertEqual(
+            "https://mutinynet.com/tx/abc123",
+            explorerTxUrl("https://mutinynet.com", "abc123")
+        )
+        // A trailing slash on the configured base must not double up.
+        XCTAssertEqual(
+            "https://mempool.space/tx/abc123",
+            explorerTxUrl("https://mempool.space/", "abc123")
+        )
     }
 }

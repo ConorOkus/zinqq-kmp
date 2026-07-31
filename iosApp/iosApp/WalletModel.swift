@@ -183,6 +183,15 @@ struct CloseDetailUi {
 /// as pure functions; this class only snapshots core queries.
 @MainActor
 final class WalletModel: ObservableObject {
+    /// Explorer base for this build's network, resolved once from the core.
+    /// Configuration, not node state, so it is readable while stopped.
+    ///
+    /// Read rather than hardcoded because a Mutinynet build linking to
+    /// mempool.space opens a mainnet explorer with a signet txid.
+    lazy var explorerBaseUrl: String = {
+        (try? ensureWallet().explorerBaseUrl()) ?? "https://mempool.space"
+    }()
+
     @Published private(set) var running = false
     @Published private(set) var balanceMsat: UInt64 = 0
     @Published private(set) var lastOutcome: String?
@@ -774,11 +783,14 @@ final class WalletModel: ObservableObject {
         if let wallet { return wallet }
         let dir = try walletStorageDirectory()
         // Kotlin default args don't export to Swift: pass the URL overrides
-        // explicitly (nil = production defaults).
+        // and the network explicitly (nil URLs = production defaults). The
+        // network is the build's, per the Info.plist value (U7, KTD-1); the
+        // core isolates each network's storage and VSS store beneath this dir.
         let created = WalletCore.shared.create(
             storageDir: dir.path,
             esploraUrl: nil,
-            rgsUrl: nil
+            rgsUrl: nil,
+            network: buildWalletNetwork()
         )
         wallet = created
         return created

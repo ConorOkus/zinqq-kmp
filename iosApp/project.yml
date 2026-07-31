@@ -49,6 +49,18 @@ targets:
         FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/../shared/build/xcode-frameworks/$(CONFIGURATION)/$(SDK_NAME)
         OTHER_LDFLAGS: $(inherited) -framework Shared
         ENABLE_USER_SCRIPT_SANDBOXING: NO
+      configs:
+        # Network selection (U7, KTD-1/KTD-4): build-time, never runtime.
+        # Debug targets Mutinynet and installs under its own bundle id so the
+        # test wallet sits beside the real one rather than replacing it —
+        # the iOS half of Android's `.debug` application id suffix.
+        Debug:
+          WALLET_NETWORK: mutinynet
+          PRODUCT_BUNDLE_IDENTIFIER: zinqq.ios.debug
+        # Release — and therefore TestFlight — is mainnet with no override
+        # path, so no build invocation can ship a test network.
+        Release:
+          WALLET_NETWORK: mainnet
     info:
       path: iosApp/Info.plist
       properties:
@@ -64,6 +76,11 @@ targets:
         # QR codes; iOS shows this string on the permission prompt.
         NSCameraUsageDescription: >-
           Zinqq uses the camera to scan payment QR codes.
+        # Surfaces the per-configuration WALLET_NETWORK setting above to Swift
+        # (U7). An Info.plist key rather than a generated constant: XcodeGen
+        # regenerates the project, so a checked-in constant would drift, and
+        # the plist already carries the other build-time facts.
+        WalletNetwork: $(WALLET_NETWORK)
         # Bundled OFL fonts matching the PWA's self-hosted set (KTD-11, R12):
         # Inter 400-700 (sans) + Space Grotesk 500-700 (display). The TTFs live
         # in iosApp/Fonts/ and are copied flat into the bundle as resources.

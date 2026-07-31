@@ -97,7 +97,14 @@ class WalletHolder internal constructor(
             // directory data_extraction_rules.xml excludes from backup and
             // device transfer (R6).
             NativeWalletNode(
-                WalletCore.create(File(context.filesDir, "wallet").absolutePath),
+                WalletCore.create(
+                    storageDir = File(context.filesDir, "wallet").absolutePath,
+                    // Build-time network (U6, KTD-1). The core gives each
+                    // network its own subdirectory under this path and its own
+                    // VSS store, so a debug Mutinynet build cannot reach the
+                    // mainnet wallet's state.
+                    network = walletNetworkFor(BuildConfig.WALLET_NETWORK),
+                ),
             )
         },
     )
@@ -112,6 +119,15 @@ class WalletHolder internal constructor(
     // per-screen Port passthroughs are thin FFI calls (R14).
     private val wallet: Wallet
         get() = requireNotNull(node.wallet) { "this WalletNode has no native handle" }
+
+    /**
+     * Explorer base for this build's network, resolved once from the core.
+     * Configuration, not node state, so it is readable while stopped.
+     *
+     * Read rather than hardcoded because a Mutinynet build linking to
+     * mempool.space opens a mainnet explorer with a signet txid.
+     */
+    override val explorerBaseUrl: String by lazy { wallet.explorerBaseUrl() }
 
     // The synchronous read is deliberate (KTD-11): the persisted appearance
     // mode must be in the very first emitted state so no frame renders in the

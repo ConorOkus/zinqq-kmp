@@ -29,6 +29,9 @@ import zinqq.main.NumpadKey
  * implements this; tests can fake it.
  */
 interface SendPort {
+    /** Explorer base for this build's network (see [explorerTxUrl]). */
+    val explorerBaseUrl: String
+
     suspend fun classify(input: String): ClassifiedView
     suspend fun resolve(input: String): ResolvedView
     suspend fun fetchLnurlInvoice(lnurl: LnurlPayView, amountMsat: ULong): ClassifiedView

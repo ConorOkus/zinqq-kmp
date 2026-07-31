@@ -25,6 +25,7 @@ fn test_wallet(storage_dir: &Path) -> Wallet {
         lsp_host: None,
         lsp_port: None,
         trusted_lsp_node_ids: Vec::new(),
+        network: None,
         static_invoice_server_paths: Vec::new(),
     })
     .expect("default overrides are valid")
