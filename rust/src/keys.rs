@@ -214,7 +214,27 @@ pub(crate) fn derive_wallet_keys(mnemonic: &Mnemonic, network: Network) -> Walle
     let vss_encryption_key = priv_at(&[hardened(535), hardened(1)]);
     let vss_signing_key = priv_at(&[hardened(535), hardened(2)]);
     // hex(SHA-256(ldk_seed)) — sha256's Display is forward lowercase hex.
-    let vss_store_id = sha256::Hash::hash(&ldk_seed).to_string();
+    //
+    // U4/R5/KTD-2: BIP32 master-key BYTES do not vary by network —
+    // `Xpriv::new_master`'s network argument only sets the serialization
+    // prefix — so `ldk_seed`, and therefore this id, would otherwise be
+    // IDENTICAL on every network. A Mutinynet build would then write signet
+    // state into the mainnet wallet's cloud store under the same seed.
+    //
+    // Mainnet is left byte-identical (the PWA vectors below pin it); every
+    // other network mixes its own name into the hash. Namespacing happens
+    // here, never in the derivation paths above: shifting those would change
+    // every existing mainnet wallet's identity.
+    let vss_store_id = match network {
+        Network::Bitcoin => sha256::Hash::hash(&ldk_seed).to_string(),
+        other => {
+            let mut namespaced = ldk_seed.to_vec();
+            namespaced.extend_from_slice(other.to_string().as_bytes());
+            let id = sha256::Hash::hash(&namespaced).to_string();
+            namespaced.zeroize();
+            id
+        }
+    };
     let channel_keys_id_hmac_key = hmac_sha256(&ldk_seed, CHANNEL_KEYS_ID_HMAC_TAG);
 
     // BIP84 descriptors, string-identical to the PWA's deriveBdkDescriptors:
@@ -300,6 +320,55 @@ pub(crate) mod tests {
         assert_eq!(hex(&keys.vss_encryption_key), EXPECTED_VSS_ENCRYPTION_KEY);
         assert_eq!(hex(&keys.vss_signing_key), EXPECTED_VSS_SIGNING_KEY);
         assert_eq!(keys.vss_store_id, EXPECTED_VSS_STORE_ID);
+    }
+
+    /// U4/AE4/KTD-2: the same seed must NOT resolve to the same VSS store on
+    /// two networks. BIP32 master-key bytes are network-independent, so
+    /// without namespacing a Mutinynet build would write signet channel
+    /// monitors into the mainnet wallet's cloud store.
+    #[test]
+    fn the_vss_store_id_is_namespaced_per_network() {
+        let mnemonic = parse_mnemonic(TEST_MNEMONIC).unwrap();
+        let mainnet = derive_wallet_keys(&mnemonic, Network::Bitcoin);
+        let signet = derive_wallet_keys(&mnemonic, Network::Signet);
+
+        assert_ne!(mainnet.vss_store_id, signet.vss_store_id);
+        assert_eq!(
+            mainnet.vss_store_id, EXPECTED_VSS_STORE_ID,
+            "mainnet's store id is byte-identical to the PWA vector — every \
+             existing wallet's cloud identity depends on it"
+        );
+        assert_eq!(
+            signet.vss_store_id.len(),
+            EXPECTED_VSS_STORE_ID.len(),
+            "namespacing must preserve the id's hex shape"
+        );
+    }
+
+    /// U4: namespacing is deterministic, not salted — the same wallet must
+    /// find the same store on every start.
+    #[test]
+    fn the_namespaced_store_id_is_stable_across_derivations() {
+        let mnemonic = parse_mnemonic(TEST_MNEMONIC).unwrap();
+        assert_eq!(
+            derive_wallet_keys(&mnemonic, Network::Signet).vss_store_id,
+            derive_wallet_keys(&mnemonic, Network::Signet).vss_store_id
+        );
+    }
+
+    /// U4/R6: only the store id is namespaced. The derived key MATERIAL stays
+    /// network-independent, because changing it would alter every existing
+    /// mainnet wallet's identity — the store id is a lookup key, the seed is
+    /// the wallet.
+    #[test]
+    fn namespacing_does_not_touch_derived_key_material() {
+        let mnemonic = parse_mnemonic(TEST_MNEMONIC).unwrap();
+        let mainnet = derive_wallet_keys(&mnemonic, Network::Bitcoin);
+        let signet = derive_wallet_keys(&mnemonic, Network::Signet);
+
+        assert_eq!(mainnet.ldk_seed, signet.ldk_seed);
+        assert_eq!(mainnet.vss_encryption_key, signet.vss_encryption_key);
+        assert_eq!(mainnet.vss_signing_key, signet.vss_signing_key);
     }
 
     #[test]

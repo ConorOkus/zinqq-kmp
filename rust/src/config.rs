@@ -488,6 +488,20 @@ impl Config {
         }
     }
 
+    /// The data directory this network's node actually uses (U4/R4).
+    ///
+    /// Mainnet is [`Config::storage_dir`] verbatim — an existing install must
+    /// keep finding its mnemonic and channel monitors, and moving them would
+    /// present as a wiped wallet. Every other network gets a subdirectory, so
+    /// two networks pointed at the same `storage_dir` never share a byte.
+    pub fn network_storage_dir(&self) -> std::path::PathBuf {
+        let base = std::path::PathBuf::from(&self.storage_dir);
+        match self.wallet_network.storage_segment() {
+            None => base,
+            Some(segment) => base.join(segment),
+        }
+    }
+
     /// Whether `node_id` may open 0-conf channels to us (KTD-10). The
     /// configured LSP is implicitly trusted, so an LSP override does not need
     /// to be repeated in [`Config::trusted_lsps`].
@@ -663,6 +677,32 @@ mod tests {
             mutinynet::GENESIS_BLOCK_HASH,
             mainnet::GENESIS_BLOCK_HASH,
             "a custom signet must not share mainnet's genesis"
+        );
+    }
+
+    /// U4/R4: mainnet resolves to the bare storage dir — an existing install
+    /// must keep finding its data — while Mutinynet gets its own subtree, so
+    /// the two never share a mnemonic, a KV store, or a lock.
+    #[test]
+    fn each_network_gets_its_own_data_directory() {
+        let mainnet_dir = Config::for_network(WalletNetwork::Mainnet, "/tmp/wallet".to_string())
+            .network_storage_dir();
+        let mutiny_dir = Config::for_network(WalletNetwork::Mutinynet, "/tmp/wallet".to_string())
+            .network_storage_dir();
+
+        assert_eq!(
+            mainnet_dir,
+            std::path::PathBuf::from("/tmp/wallet"),
+            "mainnet keeps the historical path"
+        );
+        assert_eq!(
+            mutiny_dir,
+            std::path::PathBuf::from("/tmp/wallet/mutinynet")
+        );
+        assert_ne!(mainnet_dir, mutiny_dir);
+        assert!(
+            !mutiny_dir.starts_with(&mainnet_dir) || mutiny_dir != mainnet_dir,
+            "the Mutinynet subtree is nested but never equal"
         );
     }
 

@@ -15,7 +15,6 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
@@ -334,7 +333,11 @@ pub(crate) fn build(
     event_sink: Arc<dyn EventSink>,
 ) -> Result<NodeComponents, BuildError> {
     let logger = Arc::new(Logger);
-    let storage_dir = PathBuf::from(&config.storage_dir);
+    // U4/R4: every network gets its own data directory, so a Mutinynet build
+    // cannot read or overwrite the mainnet wallet's mnemonic, channel
+    // monitors, or lock. Mainnet keeps the BARE path it has always used — a
+    // segment there would make an existing install look wiped.
+    let storage_dir = config.network_storage_dir();
     fs::create_dir_all(&storage_dir).map_err(|_| BuildError::WriteFailed)?;
 
     // U4 crash-prefix resume, BEFORE the fence check and the mnemonic load:
