@@ -96,6 +96,28 @@ targets:
       - name: Build Shared KMP Framework
         script: |
           cd "$SRCROOT/.."
+
+          # Java resolution before the wrapper runs. Xcode's build-phase shell
+          # does not inherit an interactive shell's Java setup, and the Gradle
+          # *wrapper* must find a `java` executable before Gradle reads any
+          # properties — so `org.gradle.java.home` cannot rescue a machine
+          # where java is undiscoverable. CI never sees this (actions/setup-java
+          # injects JAVA_HOME); a GUI-launched archive on a developer Mac can.
+          if [ -n "$JAVA_HOME" ] && [ ! -x "$JAVA_HOME/bin/java" ]; then
+            echo "warning: JAVA_HOME ($JAVA_HOME) has no bin/java; ignoring it."
+            unset JAVA_HOME
+          fi
+          # `java -version`, not `command -v java`: macOS ships a /usr/bin/java
+          # stub that exists on every Mac and only reports "Unable to locate a
+          # Java Runtime" when run, so presence on PATH proves nothing.
+          if [ -z "$JAVA_HOME" ] && ! java -version > /dev/null 2>&1; then
+            JAVA_HOME=$(/usr/libexec/java_home -v 21+ 2>/dev/null) || {
+              echo "error: No JDK 21+ found. Building the shared KMP framework needs a java the Gradle wrapper can resolve, and this build shell has neither JAVA_HOME nor java on PATH. See the Java note in docs/runbooks/testflight-upload.md."
+              exit 1
+            }
+            export JAVA_HOME
+          fi
+
           ./gradlew :shared:embedAndSignAppleFrameworkForXcode
         basedOnDependencyAnalysis: false
 
