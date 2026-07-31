@@ -28,6 +28,13 @@ androidApp/  Compose shell: 16 screens, three appearance modes
 iosApp/      SwiftUI shell: the same 16 screens (XcodeGen project.yml)
 ```
 
+**Networks.** Release and TestFlight builds are always mainnet. Debug builds
+target [Mutinynet](https://www.nobsbitcoin.com/mutinynet/) — a signet with
+30-second blocks — so local testing never touches real funds, and install under
+a separate app id so both wallets coexist on one device. The network is chosen
+at build time, never at runtime. See
+[the local-testing runbook](docs/runbooks/mutinynet-local-testing.md).
+
 ## Prerequisites
 
 - Rust (stable) with mobile targets: `rustup target add aarch64-linux-android x86_64-linux-android aarch64-apple-ios aarch64-apple-ios-sim`
