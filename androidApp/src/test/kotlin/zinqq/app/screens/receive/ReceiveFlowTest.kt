@@ -275,6 +275,47 @@ class ReceiveFlowTest {
         assertFalse(showBolt12Page(offerExists = false, needsAmount = true))
     }
 
+    // --- pager index reconciliation (index-keyed pager, mutable membership) ---
+
+    /**
+     * The regression this exists for: the async page is showing at index 1,
+     * then the standard offer finishes minting (up to ~93 s later) and
+     * inserts ahead of it. Without reconciliation the pager would keep index
+     * 1 and silently show BOLT12 where the user put ASYNC.
+     */
+    @Test
+    fun aLateBolt12PageDoesNotStealTheAsyncPagesIndex() {
+        val before = listOf(QrPage.UNIFIED, QrPage.ASYNC)
+        val after = listOf(QrPage.UNIFIED, QrPage.BOLT12, QrPage.ASYNC)
+        assertEquals(1, before.indexOf(QrPage.ASYNC))
+        assertEquals(2, pagerIndexFor(after, selected = QrPage.ASYNC, currentIndex = 1))
+    }
+
+    @Test
+    fun aStablePageNeedsNoScroll() {
+        val pages = listOf(QrPage.UNIFIED, QrPage.BOLT12, QrPage.ASYNC)
+        assertNull(pagerIndexFor(pages, selected = QrPage.UNIFIED, currentIndex = 0))
+        assertNull(pagerIndexFor(pages, selected = QrPage.ASYNC, currentIndex = 2))
+    }
+
+    /** A removed page falls back to the unified QR, which always exists. */
+    @Test
+    fun aRemovedPageFallsBackToUnified() {
+        val pages = listOf(QrPage.UNIFIED, QrPage.BOLT12)
+        assertEquals(0, pagerIndexFor(pages, selected = QrPage.ASYNC, currentIndex = 1))
+    }
+
+    /**
+     * The shrink case the old index guard covered: the pager sits past the
+     * end after pages collapse to one.
+     */
+    @Test
+    fun anOutOfRangePagerFallsBackToUnified() {
+        val pages = listOf(QrPage.UNIFIED)
+        assertEquals(0, pagerIndexFor(pages, selected = QrPage.UNIFIED, currentIndex = 2))
+        assertEquals(0, pagerIndexFor(pages, selected = QrPage.BOLT12, currentIndex = 1))
+    }
+
     // --- caption + copy derivation (PWA Receive.tsx:993-1001, 1027-1029) ---
 
     @Test

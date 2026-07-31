@@ -171,6 +171,29 @@ fun receivePages(
     if (asyncOfferExists && !needsAmount) add(QrPage.ASYNC)
 }
 
+/**
+ * Which index the pager should show after [pages] changes, given the page the
+ * user had selected and where the pager currently sits. `null` means leave it
+ * alone.
+ *
+ * Compose's pager is keyed by **index**, and page membership can change in the
+ * middle of the list: the standard BOLT12 offer mints on a 3/6/12/24/48 s
+ * retry schedule while the async offer resolves immediately, so BOLT12 can
+ * insert at index 1 and push an already-visible async page to index 2. Without
+ * this reconciliation the QR under the user's eyes silently becomes a
+ * different offer — they think they are showing the offline-payable one.
+ *
+ * SwiftUI's `TabView` selects by tag rather than index, so iOS needs no
+ * equivalent; this is the Android half of that parity.
+ */
+fun pagerIndexFor(pages: List<QrPage>, selected: QrPage, currentIndex: Int): Int? {
+    val target = pages.indexOf(selected)
+    // Selected page is gone (or the pager is out of range) — fall back to the
+    // unified QR, which is always present.
+    if (target < 0 || currentIndex !in pages.indices) return 0
+    return target.takeIf { it != currentIndex }
+}
+
 /** The label under the QR (PWA `Receive.tsx:993-1001`). */
 fun qrCaption(page: QrPage, invoicePath: InvoicePath, openingFeeSats: ULong?): String = when {
     page == QrPage.ASYNC -> "Experimental — payable while you're offline"

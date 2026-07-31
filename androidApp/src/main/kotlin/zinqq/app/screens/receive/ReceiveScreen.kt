@@ -290,11 +290,20 @@ private fun QrDisplay(
     )
     val pagerState = rememberPagerState(pageCount = { pages.size })
 
-    // Reset to the unified page when the current page is removed (PWA:373-375).
+    // Follow the selected PAGE across membership changes, not its index
+    // (PWA:373-375, extended): a late-minting BOLT12 offer inserts ahead of
+    // the async page, and an index-keyed pager would swap the QR under the
+    // user. `pagerIndexFor` owns that decision so it can be tested.
     LaunchedEffect(pages) {
-        if (pagerState.currentPage >= pages.size) pagerState.scrollToPage(0)
+        pagerIndexFor(pages, page, pagerState.currentPage)?.let { target ->
+            pagerState.scrollToPage(target)
+            onPageChanged(pages.getOrElse(target) { QrPage.UNIFIED })
+        }
     }
-    LaunchedEffect(pagerState.currentPage, pages) {
+    // Keyed on the index alone: a `pages` change is the effect above's job,
+    // and re-deriving the page from a stale index here would reintroduce the
+    // swap it prevents.
+    LaunchedEffect(pagerState.currentPage) {
         onPageChanged(pages.getOrElse(pagerState.currentPage) { QrPage.UNIFIED })
     }
 
