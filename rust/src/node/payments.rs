@@ -599,10 +599,10 @@ mod tests {
     use crate::builder::KV_STORE_SUBDIR;
     use crate::events::EventQueue;
     use crate::history::{ActivityStatus, PaymentStore, PAYMENT_HISTORY_PRIMARY_NAMESPACE};
+    use crate::node::event_handler::{record_payment_claimed, settle_payment_sent};
     use crate::node::tests::{
         offline_config, payment_hash, static_invoice_server_path, store_in, CapturingSink,
     };
-    use crate::node::{record_payment_claimed, settle_payment_sent};
 
     /// U3/U4, AE3 and R6: with no static invoice server configured — the
     /// shipped default — async receive is inert. Both endpoints degrade
