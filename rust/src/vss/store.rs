@@ -333,25 +333,21 @@ pub(crate) struct MonitorKeySet {
 }
 
 impl MonitorKeySet {
+    fn with_provenance(keys: impl IntoIterator<Item = String>, provenance: KeyProvenance) -> Self {
+        Self {
+            keys: keys.into_iter().map(|key| (key, provenance)).collect(),
+        }
+    }
+
     /// Tracks every key with no publication evidence — the fund-safe default.
     pub(crate) fn tracked_only(keys: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            keys: keys
-                .into_iter()
-                .map(|key| (key, KeyProvenance::Unverified))
-                .collect(),
-        }
+        Self::with_provenance(keys, KeyProvenance::Unverified)
     }
 
     /// Tracks every key as publishable. Callers use this only where a blob was
     /// demonstrably written or observed under each exact key.
     pub(crate) fn all_publishable(keys: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            keys: keys
-                .into_iter()
-                .map(|key| (key, KeyProvenance::Publishable))
-                .collect(),
-        }
+        Self::with_provenance(keys, KeyProvenance::Publishable)
     }
 
     /// Tracks `tracked` in full, marking the `publishable` subset as safe to
@@ -386,6 +382,15 @@ impl MonitorKeySet {
         self.keys.insert(key, KeyProvenance::Publishable);
     }
 
+    /// Records positive evidence for every key in `keys` — the
+    /// merge-on-conflict path, where the server's own manifest is the proof
+    /// those keys are published and must not be dropped.
+    pub(crate) fn extend_publishable(&mut self, keys: impl IntoIterator<Item = String>) {
+        for key in keys {
+            self.mark_publishable(key);
+        }
+    }
+
     pub(crate) fn remove(&mut self, key: &str) {
         self.keys.remove(key);
     }
@@ -396,12 +401,13 @@ impl MonitorKeySet {
     }
 
     /// The subset that may be published, in sorted order. May be empty even
-    /// when the set tracks monitors — see [`Inner::manifest_payload`], which
-    /// must never put an empty array.
+    /// when the set tracks monitors, which is why every publication path checks
+    /// it before serializing: an empty `_monitor_keys` array is rejected as
+    /// corrupt by [`parse_monitor_manifest`] and must never be put.
     pub(crate) fn publishable(&self) -> Vec<String> {
         self.keys
             .iter()
-            .filter(|(_, provenance)| **provenance == KeyProvenance::Publishable)
+            .filter(|(_, provenance)| matches!(provenance, KeyProvenance::Publishable))
             .map(|(key, _)| key.clone())
             .collect()
     }
@@ -725,10 +731,10 @@ impl Inner {
                                 // so they are publishable by provenance: merging
                                 // them back is what keeps a manifest write from
                                 // dropping a key another device tracks.
-                                let mut set = self.monitor_keys.lock().unwrap();
-                                for key in server_keys {
-                                    set.mark_publishable(key);
-                                }
+                                self.monitor_keys
+                                    .lock()
+                                    .unwrap()
+                                    .extend_publishable(server_keys);
                             }
                             Err(e) => log_error!(
                                 self.logger,
@@ -791,10 +797,10 @@ impl Inner {
                     Ok(Some((remote_bytes, remote_version))) => {
                         self.record_version(MONITOR_MANIFEST_KEY, remote_version);
                         if let Ok(server_keys) = parse_monitor_manifest(&remote_bytes) {
-                            let mut set = self.monitor_keys.lock().unwrap();
-                            for key in server_keys {
-                                set.mark_publishable(key);
-                            }
+                            self.monitor_keys
+                                .lock()
+                                .unwrap()
+                                .extend_publishable(server_keys);
                         }
                     }
                     Ok(None) => self.record_version(MONITOR_MANIFEST_KEY, 0),
