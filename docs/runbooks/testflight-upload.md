@@ -10,7 +10,7 @@ Uploads go through **Xcode Organizer** (or the Transporter app). Never `altool` 
 - Xcode with the iOS SDK, `xcodegen` (`brew install xcodegen`), and a JDK 21 for Gradle.
 - The Rust device target: `rustup target add aarch64-apple-ios` (the Gobley plugin also auto-installs it on first build).
 
-**Java note (known hazard):** Gradle runs inside Xcode's build-phase shell, which does not inherit your interactive shell's Java setup — and the Gradle *wrapper* must find a `java` executable before Gradle reads any properties, so `org.gradle.java.home` alone cannot rescue a machine where `java` is not discoverable. If the archive's "Build Shared KMP Framework" phase dies immediately with a Java-location error, make a JDK 21 discoverable system-wide. With Homebrew:
+**Java note (known hazard):** Gradle runs inside Xcode's build-phase shell, which does not inherit your interactive shell's Java setup — and the Gradle *wrapper* must find a `java` executable before Gradle reads any properties, so `org.gradle.java.home` alone cannot rescue a machine where `java` is not discoverable. The "Build Shared KMP Framework" phase now falls back to `/usr/libexec/java_home -v 21+` and, failing that, stops with an error pointing here rather than letting the wrapper produce a cryptic one — but the fallback only finds a JDK that is *installed*. If it fires, make a JDK 21 discoverable system-wide. With Homebrew:
 
 ```bash
 brew install openjdk@21
