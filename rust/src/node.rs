@@ -12,6 +12,7 @@
 //! parent's private items, so the split needs no visibility widening outside
 //! the test helpers below.
 
+mod onchain;
 mod payments;
 mod tasks;
 
@@ -23,7 +24,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
-use lightning::chain::chaininterface::BroadcasterInterface as _;
 use lightning::events::{Event, PaymentFailureReason, ReplayEvent};
 use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::log_error;
@@ -52,7 +52,7 @@ use crate::history::{
 };
 use crate::liquidity::LiquiditySource;
 use crate::lock::DataDirLock;
-use crate::onchain_send::{self, OnchainSendError};
+use crate::onchain_send;
 use crate::payment::describe_failure_reason;
 use crate::recovery::{self, RecoveryState, RecoveryStore, RecoverySweeper};
 use crate::sweep::{PendingSweepInfo, SweepBroadcast, SweepEngine, SweepStore};
@@ -219,20 +219,6 @@ struct ChannelHandles {
     chain_source: Arc<crate::chain::ChainSource>,
     liquidity_source: Arc<LiquiditySource>,
     runtime_handle: tokio::runtime::Handle,
-}
-
-/// The handles a single on-chain send/estimate needs, cloned out of the
-/// state lock so the send never holds it (U8).
-struct OnchainHandles {
-    wallet: Arc<crate::wallet::OnchainWallet>,
-    broadcaster: Arc<crate::chain::Broadcaster>,
-    /// 6-block rate, ceil'd, clamped >= 2 sat/vB (KTD-9).
-    fee_rate_sat_per_vb: u64,
-    /// 10,000 sats iff at least one channel is open (R7), read from the
-    /// channel manager at call time.
-    reserve_sats: u64,
-    sync_paused: Arc<AtomicBool>,
-    sync_now: Arc<tokio::sync::Notify>,
 }
 
 /// A foreground-only mainnet LDK node over the wallet-core stack.
@@ -831,145 +817,6 @@ impl Node {
                 .map(|balance| balance.claimable_amount_satoshis() * 1_000)
                 .sum()
         })
-    }
-
-    /// Clones the U8 send handles out of the state lock; reserve and fee
-    /// rate are read at call time (channel count from the channel manager,
-    /// rate from the fee cache).
-    fn onchain_handles(&self) -> Result<OnchainHandles, OnchainSendError> {
-        let state_lock = self.state.lock().unwrap();
-        let state = state_lock.as_ref().ok_or(OnchainSendError::NotRunning)?;
-        Ok(OnchainHandles {
-            wallet: Arc::clone(&state.components.onchain_wallet),
-            broadcaster: Arc::clone(&state.components.broadcaster),
-            fee_rate_sat_per_vb: state
-                .components
-                .chain_source
-                .onchain_send_fee_rate_sat_per_vb(),
-            reserve_sats: onchain_send::anchor_reserve_sats(
-                state.components.channel_manager.list_channels().len(),
-            ),
-            sync_paused: Arc::clone(&state.onchain_sync_paused),
-            sync_now: Arc::clone(&state.onchain_sync_now),
-        })
-    }
-
-    /// Broadcasts a built-and-signed on-chain send via the persist-first
-    /// Broadcaster (U12/KTD-9 sentinels), then wakes the immediate wallet
-    /// sync (the PWA's post-broadcast `syncNow`). Returns the txid.
-    fn dispatch_onchain_tx(handles: &OnchainHandles, tx: &bitcoin::Transaction) -> String {
-        handles.broadcaster.broadcast_transactions(&[tx]);
-        handles.sync_now.notify_one();
-        tx.compute_txid().to_string()
-    }
-
-    /// Fee estimate for an exact-amount on-chain send (U8, R7): builds the
-    /// tx at the 6-block rate WITHOUT broadcasting; fees above 50,000 sats
-    /// are the typed too-high error (KTD-9).
-    pub fn estimate_onchain_fee(
-        &self,
-        address: &str,
-        amount_sats: u64,
-    ) -> Result<crate::onchain_send::FeeEstimate, OnchainSendError> {
-        let handles = self.onchain_handles()?;
-        onchain_send::estimate_fee(
-            &handles.wallet,
-            self.config.network,
-            address,
-            amount_sats,
-            handles.fee_rate_sat_per_vb,
-        )
-    }
-
-    /// Max-sendable estimate (U8, R7): drain build minus the anchor reserve
-    /// when channels exist; dust floor from the recipient script.
-    pub fn estimate_max_sendable(
-        &self,
-        address: &str,
-    ) -> Result<crate::onchain_send::MaxSendEstimate, OnchainSendError> {
-        let handles = self.onchain_handles()?;
-        onchain_send::estimate_max_sendable(
-            &handles.wallet,
-            self.config.network,
-            address,
-            handles.reserve_sats,
-            handles.fee_rate_sat_per_vb,
-        )
-    }
-
-    /// Exact-amount on-chain send (U8, R7): reserve post-check, then the
-    /// broadcast-boundary drift + fee guards, then the persist-first
-    /// broadcast; sync is paused around the build and `sync_now` follows the
-    /// dispatch. `expected_*` are the review-screen values (R5 drift guard).
-    pub fn send_onchain(
-        &self,
-        address: &str,
-        amount_sats: u64,
-        expected_amount_sats: u64,
-        expected_fee_sats: u64,
-    ) -> Result<String, OnchainSendError> {
-        let handles = self.onchain_handles()?;
-        let expected = onchain_send::DriftGuard::for_address(
-            address,
-            self.config.network,
-            expected_amount_sats,
-            expected_fee_sats,
-        )?;
-        let _pause = OnchainSyncPause::engage(&handles.sync_paused);
-        let tx = onchain_send::send_to_address(
-            &handles.wallet,
-            self.config.network,
-            address,
-            amount_sats,
-            &expected,
-            handles.reserve_sats,
-            handles.fee_rate_sat_per_vb,
-        )?;
-        Ok(Self::dispatch_onchain_tx(&handles, &tx))
-    }
-
-    /// On-chain send-max (U8, AE6): drains fully at zero channels; with
-    /// channels the built tx leaves exactly 10,000 sats as an explicit
-    /// reserve output to an internal address. Same drift guard, pause, and
-    /// persist-first broadcast as [`Node::send_onchain`].
-    pub fn send_onchain_max(
-        &self,
-        address: &str,
-        expected_amount_sats: u64,
-        expected_fee_sats: u64,
-    ) -> Result<String, OnchainSendError> {
-        let handles = self.onchain_handles()?;
-        let expected = onchain_send::DriftGuard::for_address(
-            address,
-            self.config.network,
-            expected_amount_sats,
-            expected_fee_sats,
-        )?;
-        let _pause = OnchainSyncPause::engage(&handles.sync_paused);
-        let tx = onchain_send::send_max(
-            &handles.wallet,
-            self.config.network,
-            address,
-            &expected,
-            handles.reserve_sats,
-            handles.fee_rate_sat_per_vb,
-        )?;
-        Ok(Self::dispatch_onchain_tx(&handles, &tx))
-    }
-
-    /// Next unused receive address on the external keychain (U8): the
-    /// changeset is persisted after the reveal, so a restart keeps the index.
-    pub fn next_receive_address(&self) -> Result<String, OnchainSendError> {
-        let wallet = {
-            let state_lock = self.state.lock().unwrap();
-            let state = state_lock.as_ref().ok_or(OnchainSendError::NotRunning)?;
-            Arc::clone(&state.components.onchain_wallet)
-        };
-        wallet
-            .next_receive_address()
-            .map_err(|()| OnchainSendError::BuildFailed {
-                detail: "failed to persist the address reveal".to_string(),
-            })
     }
 
     /// Clones the U9 peer/channel handles out of the state lock, so no call
@@ -1904,54 +1751,6 @@ mod tests {
             PaymentStatus::Pending,
             "a just-dispatched row must survive the reconcile"
         );
-        node.stop().unwrap();
-    }
-
-    /// U8 at the Node seam: every on-chain endpoint is NotRunning while
-    /// stopped; once started (offline, degraded), the receive path serves a
-    /// mainnet address and persists the reveal across a restart, and an
-    /// empty wallet's estimates fail typed, never panic.
-    #[test]
-    fn onchain_endpoints_follow_the_node_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = Node::new(offline_config(dir.path()));
-        const ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-
-        assert_eq!(
-            node.next_receive_address().unwrap_err(),
-            OnchainSendError::NotRunning
-        );
-        assert_eq!(
-            node.estimate_onchain_fee(ADDR, 10_000).unwrap_err(),
-            OnchainSendError::NotRunning
-        );
-        assert_eq!(
-            node.send_onchain(ADDR, 10_000, 10_000, 100).unwrap_err(),
-            OnchainSendError::NotRunning
-        );
-        assert_eq!(
-            node.send_onchain_max(ADDR, 10_000, 100).unwrap_err(),
-            OnchainSendError::NotRunning
-        );
-
-        node.start().expect("offline degraded start");
-        let address = node.next_receive_address().unwrap();
-        assert!(address.starts_with("bc1q"), "BIP84 mainnet address");
-        // Zero channels: the reserve is inactive, so an empty wallet's max
-        // estimate fails on the balance, not the reserve (R7).
-        assert_eq!(
-            node.estimate_max_sendable(ADDR).unwrap_err(),
-            OnchainSendError::BalanceTooLow
-        );
-        assert!(matches!(
-            node.estimate_onchain_fee(ADDR, 10_000).unwrap_err(),
-            OnchainSendError::BuildFailed { .. }
-        ));
-        node.stop().unwrap();
-
-        // The reveal survives the restart (address-reveal learning).
-        node.start().expect("offline degraded restart");
-        assert_eq!(node.next_receive_address().unwrap(), address);
         node.stop().unwrap();
     }
 
