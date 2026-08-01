@@ -1903,6 +1903,105 @@ mod tests {
         );
     }
 
+    /// An UPDATE to a monitor whose key we could not verify heals it: the update
+    /// writes a real blob under the key we derived, so the key now names
+    /// something remotely and becomes publishable. Promotion therefore fires on
+    /// every successful put, not only `is_new` — scoping it to new channels
+    /// would leave an adopted orphan unpublishable forever even after its key
+    /// became real.
+    #[test]
+    fn an_update_under_a_derived_key_heals_it_into_publishability() {
+        let h = harness();
+        let write = monitor_write(0xbb, 7, b"an update to an adopted monitor");
+        let key = write.vss_key.clone();
+
+        // Enters the set the way `register_loaded_monitor` would: tracked off
+        // local disk, with nothing proving the remote blob lives under this
+        // spelling.
+        h.store
+            .inner
+            .monitor_keys
+            .lock()
+            .unwrap()
+            .insert_unverified(key.clone());
+        assert!(
+            h.store
+                .inner
+                .monitor_keys
+                .lock()
+                .unwrap()
+                .publishable()
+                .is_empty(),
+            "unverified to begin with"
+        );
+
+        // is_new = false: an ordinary update, which takes no manifest gate.
+        h.store.queue_monitor_write(write, false);
+        wait_until(&h.rt, || h.transport.value(&key).is_some());
+        wait_until(&h.rt, || {
+            h.store.inner.monitor_keys.lock().unwrap().provenance(&key)
+                == Some(KeyProvenance::Publishable)
+        });
+
+        // And it now reaches a published manifest: the next whole-set write
+        // carries the healed key.
+        h.store.backfill_manifest_if_needed();
+        wait_until(&h.rt, || {
+            !h.transport
+                .put_payloads_for(MONITOR_MANIFEST_KEY)
+                .is_empty()
+        });
+        let published = h.transport.put_payloads_for(MONITOR_MANIFEST_KEY);
+        assert!(
+            published
+                .iter()
+                .any(|payload| parse_monitor_manifest(payload)
+                    .expect("every published payload must be a VALID manifest")
+                    .contains(&key)),
+            "the healed key must be publishable once a blob exists under it"
+        );
+    }
+
+    /// A conflicting retire is ABANDONED, never retried or forced: a 409 means
+    /// another client has written a newer manifest that is now authoritative.
+    /// The two tempting wrong fixes — retry until it wins, or delete at the
+    /// server version — would both destroy that client's manifest.
+    #[test]
+    fn a_conflicting_manifest_retire_is_abandoned_not_forced() {
+        let h = harness();
+        let theirs = format!("{}:0", "cc".repeat(32));
+        // A newer manifest exists remotely (version 9) than our cache knows
+        // about (0 -> primed to a stale 4 below), so the delete 409s.
+        h.transport.seed(
+            MONITOR_MANIFEST_KEY,
+            &serde_json::to_vec(&vec![theirs.clone()]).unwrap(),
+            9,
+        );
+        h.store.inner.record_version(MONITOR_MANIFEST_KEY, 4);
+
+        // Nothing publishable and a known (stale) version: the retire branch.
+        h.rt.block_on(async {
+            h.store.inner.write_manifest_once_best_effort().await;
+        });
+
+        let (bytes, version) = h
+            .transport
+            .value(MONITOR_MANIFEST_KEY)
+            .expect("the other client's manifest must survive a conflicting retire");
+        assert_eq!(
+            parse_monitor_manifest(&bytes).unwrap(),
+            vec![theirs],
+            "and must still list their key, untouched"
+        );
+        assert_eq!(version, 9, "at their version, not ours");
+        assert!(
+            h.transport
+                .put_payloads_for(MONITOR_MANIFEST_KEY)
+                .is_empty(),
+            "no empty-array payload may be published on the way out"
+        );
+    }
+
     /// The backfill route with a non-empty TRACKED set whose publishable subset
     /// is empty, and no known manifest version: neither a put nor a delete may
     /// reach the transport. Putting `[]` would brick every later restore;
