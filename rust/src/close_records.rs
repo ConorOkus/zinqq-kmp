@@ -1394,7 +1394,6 @@ mod tests {
     use crate::node::{CoreEvent, EventSink};
     use crate::vss::store::{RetryTuning, VssTransport};
     use crate::vss::test_support::MockTransport;
-    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -1770,7 +1769,7 @@ mod tests {
                 cm_attempt_timeout: Duration::from_millis(200),
             },
             HashMap::new(),
-            BTreeSet::new(),
+            crate::vss::store::MonitorKeySet::default(),
             false,
         ));
         (transport, vss)

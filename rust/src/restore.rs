@@ -842,6 +842,20 @@ pub(crate) async fn backfill_manifest(
     known_version: i64,
     logger: &Arc<Logger>,
 ) {
+    if monitor_keys.is_empty() {
+        // Nothing is publishable — every recovered monitor was adopted under a
+        // key we could not confirm. Putting the empty array here would be a
+        // brick of its own: `parse_monitor_manifest` rejects `[]` as corrupt, so
+        // the courtesy write would make every later restore fail with
+        // `ValidationFailed`. Leaving no manifest is correct and recoverable —
+        // the orphans are re-adopted by `verify_unexplained_keys` next time.
+        log_info!(
+            logger,
+            "Post-restore manifest backfill has no publishable keys; leaving the manifest absent \
+             rather than publishing an empty one"
+        );
+        return;
+    }
     let mut keys: BTreeSet<String> = monitor_keys.clone();
     let payload = serde_json::to_vec(&keys).expect("a set of strings always serializes to JSON");
     match transport
@@ -1376,6 +1390,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use lightning::util::persist::read_channel_monitors;
+
     use crate::config::VssTransportOverride;
     use crate::history::{PaymentDirection, PaymentStore};
     use crate::node::{EventSink, LoggingEventSink, Node};
@@ -1602,6 +1618,110 @@ mod tests {
             listed.raw_key,
             (unlisted.raw_key, unlisted.display_key, unlisted.bytes),
         )
+    }
+
+    /// A backup whose ONLY monitor blob is stored under a key this client
+    /// cannot re-derive, with NO `_monitor_keys` manifest at all.
+    ///
+    /// This is the all-adopted shape the manifest hazard actually needs:
+    /// nothing seeds a manifest version, so on the next start
+    /// `backfill_manifest_if_needed` is the route that publishes, and the set
+    /// it would publish is the re-derived key that names no remote blob.
+    /// Returns `(derived_key, stored_key, a spare real monitor)` — the spare
+    /// stands in for a brand-new channel opened after the restart, so the
+    /// new-channel publication route can be exercised with a blob that actually
+    /// deserializes on the restore afterwards.
+    fn seed_backup_with_only_a_divergently_stored_monitor(
+        transport: &MockTransport,
+    ) -> (String, String, MonitorVector) {
+        let mut vectors = monitor_vectors();
+        let unlisted = vectors.pop().expect("fixture has two monitors");
+        let spare = vectors.pop().expect("fixture has two monitors");
+        assert_ne!(
+            unlisted.display_key, unlisted.raw_key,
+            "the fixture's two spellings must differ for this scenario to exist"
+        );
+        transport.seed(CHANNEL_MANAGER_VSS_KEY, &[7u8; 64], 1);
+        transport.seed(&unlisted.display_key, &unlisted.bytes, 1);
+        (unlisted.raw_key, unlisted.display_key, spare)
+    }
+
+    /// What a restart leaves live: the runtime the store's background writes
+    /// run on, and the store itself. Both must outlive the assertions, so the
+    /// helper hands back the runtime rather than dropping it.
+    struct Restarted {
+        rt: tokio::runtime::Runtime,
+        store: Arc<crate::vss::store::VssBackedStore>,
+    }
+
+    /// The NEXT boot over `dir`, reproducing `builder::build`'s startup order:
+    /// re-resolve the VSS startup state, construct the store from that seed,
+    /// and pre-register every monitor read back off local disk
+    /// (`builder.rs:539-541`). This is where the store re-derives a monitor's
+    /// VSS key from its funding outpoint with no knowledge of whether the
+    /// remote blob is stored under that spelling.
+    fn restart_over(dir: &Path, transport: &Arc<MockTransport>) -> Restarted {
+        let (keys_manager, signer_provider) = validation_stack(dir);
+        let kv_store = Arc::new(FilesystemStore::new(dir.join(KV_STORE_SUBDIR)));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let event_sink: Arc<dyn EventSink> = Arc::new(LoggingEventSink::new());
+        let logger = Arc::new(Logger);
+        let state = crate::vss::startup::establish_vss_state(
+            Arc::clone(transport) as Arc<dyn VssTransport>,
+            &kv_store,
+            &keys_manager,
+            &signer_provider,
+            dir,
+            &event_sink,
+            &logger,
+            &rt,
+        )
+        .expect("the restart must resolve a startup state");
+
+        let store = Arc::new(crate::vss::store::VssBackedStore::new(
+            state.remote.clone(),
+            Arc::clone(&kv_store),
+            rt.handle().clone(),
+            dir,
+            Arc::clone(&event_sink),
+            Arc::clone(&logger),
+            crate::vss::store::RetryTuning::default(),
+            state.versions.clone(),
+            state.monitor_keys.clone(),
+            state.probe_empty,
+        ));
+
+        let monitors: Vec<(BlockHash, ChannelMonitor<InMemorySigner>)> = read_channel_monitors(
+            Arc::clone(&kv_store),
+            Arc::clone(&keys_manager),
+            Arc::clone(&signer_provider),
+        )
+        .expect("the monitors written by the adoption must read back");
+        assert!(
+            !monitors.is_empty(),
+            "the restart must see the adopted monitor on local disk"
+        );
+        for (_block_hash, monitor) in &monitors {
+            store.register_loaded_monitor(monitor);
+        }
+        Restarted { rt, store }
+    }
+
+    /// Spins until `condition` holds or the budget runs out — the store's
+    /// manifest writes are fire-and-forget on the runtime.
+    fn settle(rt: &tokio::runtime::Runtime, mut condition: impl FnMut() -> bool) {
+        rt.block_on(async {
+            for _ in 0..500 {
+                if condition() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(4)).await;
+            }
+        });
     }
 
     /// Every `_monitor_keys` set the client actually ASKED the transport to
@@ -2232,9 +2352,18 @@ mod tests {
 
         assert!(state.recovered, "the recovery branch ran");
         assert_eq!(
-            state.monitor_keys,
+            state.monitor_keys.tracked(),
             BTreeSet::from([listed_key.clone(), unlisted_key.clone()]),
             "the ADOPTED monitor must be in the manifest set the store is seeded with"
+        );
+        assert_eq!(
+            state
+                .monitor_keys
+                .publishable()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([listed_key.clone(), unlisted_key.clone()]),
+            "both keys were confirmed against the remote store, so both may be published"
         );
         // ... and its version must be in the version cache seeds, so the next
         // write of that monitor puts at the real server version.
@@ -2344,7 +2473,7 @@ mod tests {
         let state = run_silent_recovery(dir.path(), &transport).expect("silent recovery");
 
         assert_eq!(
-            state.monitor_keys,
+            state.monitor_keys.tracked(),
             BTreeSet::from([monitor.raw_key.clone()])
         );
         assert_eq!(
@@ -2406,7 +2535,7 @@ mod tests {
             "both paths backfill the same manifest"
         );
         assert_eq!(
-            state.monitor_keys,
+            state.monitor_keys.tracked(),
             remote_manifest_keys(&silent_transport),
             "the seeded manifest set matches the backfilled manifest"
         );
@@ -2451,9 +2580,17 @@ mod tests {
         // GATE: total, adopted monitor included. Narrowing this would let the
         // store's next manifest write drop a key another device tracks.
         assert_eq!(
-            state.monitor_keys,
+            state.monitor_keys.tracked(),
             BTreeSet::from([listed_key.clone(), derived_key.clone()]),
             "the adopted monitor must stay in the manifest set the store is seeded with"
+        );
+        // PUBLICATION: only the key the restore could confirm. The divergent
+        // key is tracked but unpublishable, and stays that way across restarts
+        // — the store's own re-derivation must not promote it.
+        assert_eq!(
+            state.monitor_keys.publishable(),
+            vec![listed_key.clone()],
+            "the unverifiable key must never be publishable"
         );
         assert_eq!(
             state.versions.get(&derived_key),
@@ -2500,7 +2637,11 @@ mod tests {
             "a verified adopted key MUST be published — that is what makes the next \
              reconciliation need no identification pass"
         );
-        assert_eq!(state.monitor_keys, both, "gate and publication agree here");
+        assert_eq!(
+            state.monitor_keys.tracked(),
+            both,
+            "gate and publication agree here"
+        );
     }
 
     /// THE regression this split prevents, end to end: a divergent adoption must
@@ -2558,10 +2699,92 @@ mod tests {
         assert!(state.recovered);
         assert_eq!(local_monitor_blobs(third.path()), recovered);
         assert_eq!(
-            state.monitor_keys,
+            state.monitor_keys.tracked(),
             BTreeSet::from([listed_key, derived_key]),
             "and the gate still covers the adopted monitor on every later start"
         );
+    }
+
+    /// The class, not just the deterministic path: after a divergent adoption
+    /// the NEXT start re-derives the same unverifiable key off local disk and
+    /// must still never publish it — through either publication route — and
+    /// the backup must stay restorable on both doors afterwards.
+    ///
+    /// Route 1 is `backfill_manifest_if_needed`, which fires precisely here:
+    /// the backup carried no manifest, so nothing seeded a `_monitor_keys`
+    /// version. Route 2 is the whole-set rewrite a new-channel persist does.
+    #[test]
+    fn a_restart_after_a_divergent_adoption_never_republishes_the_unverifiable_key() {
+        let transport = Arc::new(MockTransport::new());
+        let (derived_key, stored_key, new_channel) =
+            seed_backup_with_only_a_divergently_stored_monitor(&transport);
+
+        // Boot 1: silent recovery adopts the divergently-stored blob and
+        // writes it to local disk.
+        let dir = tempfile::tempdir().unwrap();
+        let first = run_silent_recovery(dir.path(), &transport)
+            .expect("silent recovery must adopt the divergently-stored monitor");
+        assert!(first.recovered);
+        assert_eq!(
+            local_monitor_blobs(dir.path()).len(),
+            1,
+            "the adopted monitor is durable locally — that is what recovers the funds"
+        );
+
+        // Boot 2: the store re-derives the key off local disk, then each
+        // publication route is forced in turn.
+        let restarted = restart_over(dir.path(), &transport);
+
+        restarted.store.backfill_manifest_if_needed();
+        settle(&restarted.rt, || {
+            !transport.put_payloads_for(MONITOR_MANIFEST_KEY).is_empty()
+        });
+
+        let new_channel_local_key = new_channel.raw_key.replace(':', "_");
+        restarted.store.queue_monitor_write(
+            crate::vss::store::MonitorWrite {
+                monitor_name: new_channel_local_key.clone(),
+                vss_key: new_channel.raw_key.clone(),
+                local_key: new_channel_local_key,
+                channel_id: lightning::ln::types::ChannelId([0xab; 32]),
+                update_id: 1,
+                bytes: new_channel.bytes.clone(),
+            },
+            true,
+        );
+        settle(&restarted.rt, || {
+            transport.value(&new_channel.raw_key).is_some()
+        });
+        settle(&restarted.rt, || {
+            published_manifest_sets(&transport)
+                .iter()
+                .any(|set| set.contains(&new_channel.raw_key))
+        });
+
+        // Neither route may ever name the key we could not verify. Every
+        // published payload must also be a VALID manifest — `published_manifest_sets`
+        // parses each one, so an empty-array publication fails here too.
+        for published in published_manifest_sets(&transport) {
+            assert!(
+                !published.contains(&derived_key),
+                "a published manifest named the unverifiable key {derived_key}; the blob is \
+                 stored under {stored_key} and no restore could ever find it"
+            );
+        }
+
+        // And the resulting remote state must still restore on both doors.
+        let explicit = tempfile::tempdir().unwrap();
+        run_restore(
+            &vss_config(explicit.path(), &transport),
+            crate::keys::tests::TEST_MNEMONIC,
+            &LoggingEventSink::new(),
+            None,
+        )
+        .expect("an explicit restore after the restart must NOT be BackupInconsistent");
+
+        let silent = tempfile::tempdir().unwrap();
+        run_silent_recovery(silent.path(), &transport)
+            .expect("a start after the restart must NOT be VssRecoveryFailed");
     }
 
     // ---------- scenario 2: rollback / original intact ----------

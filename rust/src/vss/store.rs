@@ -35,7 +35,7 @@
 //! re-persists (the startup version seeding in [`super::startup`] adopts the
 //! server version so no fence trips).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -297,6 +297,132 @@ pub(crate) fn parse_monitor_manifest(bytes: &[u8]) -> Result<Vec<String>, String
     Ok(keys)
 }
 
+/// Whether the store has positive evidence that a tracked monitor key names a
+/// blob that actually exists remotely under that exact spelling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KeyProvenance {
+    /// Publishing this key is safe: the store itself wrote a blob under it,
+    /// read it back out of a server manifest, or saw its obfuscated form in a
+    /// `listKeyVersions` listing.
+    Publishable,
+    /// The key was RE-DERIVED from a monitor's funding outpoint and never
+    /// confirmed against the remote store. Safe to track locally — the local
+    /// monitor is what recovers the funds — but never safe to publish.
+    Unverified,
+}
+
+/// The `_monitor_keys` tracking set: every monitor the store is responsible
+/// for, each tagged with whether it may be PUBLISHED.
+///
+/// The set stays TOTAL on purpose (it is what gates new-channel completion and
+/// what a manifest write carries forward), while publication filters to the
+/// [`KeyProvenance::Publishable`] subset. Publishing a key whose blob is not
+/// reachable under that spelling turns a recoverable backup into a permanently
+/// failing restore: `download_and_validate` treats manifest-listed-but-missing
+/// as a hard `RestoreError::BackupInconsistent`, and on the silent-recovery
+/// door that is `BuildError::VssRecoveryFailed` — a node that refuses to boot,
+/// forever. See [`crate::restore::ValidatedMonitor::key_verified`], which
+/// records the same invariant on the restore side.
+///
+/// Provenance only ever moves UP. A boot-time re-derivation
+/// ([`VssBackedStore::register_loaded_monitor`]) must not undo evidence the
+/// store legitimately holds, or the invariant would reset on every restart.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MonitorKeySet {
+    keys: BTreeMap<String, KeyProvenance>,
+}
+
+impl MonitorKeySet {
+    /// Tracks every key with no publication evidence — the fund-safe default.
+    pub(crate) fn tracked_only(keys: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            keys: keys
+                .into_iter()
+                .map(|key| (key, KeyProvenance::Unverified))
+                .collect(),
+        }
+    }
+
+    /// Tracks every key as publishable. Callers use this only where a blob was
+    /// demonstrably written or observed under each exact key.
+    pub(crate) fn all_publishable(keys: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            keys: keys
+                .into_iter()
+                .map(|key| (key, KeyProvenance::Publishable))
+                .collect(),
+        }
+    }
+
+    /// Tracks `tracked` in full, marking the `publishable` subset as safe to
+    /// publish. Keys outside the subset stay unverified.
+    pub(crate) fn from_parts(
+        tracked: impl IntoIterator<Item = String>,
+        publishable: &BTreeSet<String>,
+    ) -> Self {
+        Self {
+            keys: tracked
+                .into_iter()
+                .map(|key| {
+                    let provenance = if publishable.contains(&key) {
+                        KeyProvenance::Publishable
+                    } else {
+                        KeyProvenance::Unverified
+                    };
+                    (key, provenance)
+                })
+                .collect(),
+        }
+    }
+
+    /// Tracks `key` without asserting publishability, and NEVER demotes a key
+    /// already known publishable.
+    pub(crate) fn insert_unverified(&mut self, key: String) {
+        self.keys.entry(key).or_insert(KeyProvenance::Unverified);
+    }
+
+    /// Records positive evidence for `key`, inserting it if new. Idempotent.
+    pub(crate) fn mark_publishable(&mut self, key: String) {
+        self.keys.insert(key, KeyProvenance::Publishable);
+    }
+
+    pub(crate) fn remove(&mut self, key: &str) {
+        self.keys.remove(key);
+    }
+
+    /// Whether the store tracks no monitors at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The subset that may be published, in sorted order. May be empty even
+    /// when the set tracks monitors — see [`Inner::manifest_payload`], which
+    /// must never put an empty array.
+    pub(crate) fn publishable(&self) -> Vec<String> {
+        self.keys
+            .iter()
+            .filter(|(_, provenance)| **provenance == KeyProvenance::Publishable)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.keys.contains_key(key)
+    }
+
+    /// Total membership, publishability aside — what the completion gate covers.
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> BTreeSet<String> {
+        self.keys.keys().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provenance(&self, key: &str) -> Option<KeyProvenance> {
+        self.keys.get(key).copied()
+    }
+}
+
 /// The PWA's monitor storage key: `hex(funding txid raw bytes):{index}`. The
 /// txid hex uses the RAW serialized byte order (what the PWA's
 /// `bytesToHex(outpoint.get_txid())` produces), NOT rust-bitcoin's reversed
@@ -395,8 +521,9 @@ struct Inner {
     tuning: RetryTuning,
     /// In-memory version cache: plaintext key → last known server version.
     versions: Mutex<HashMap<String, i64>>,
-    /// The `_monitor_keys` manifest set (dedup by construction).
-    monitor_keys: Mutex<BTreeSet<String>>,
+    /// The `_monitor_keys` tracking set: total membership plus per-key
+    /// publishability (dedup by construction).
+    monitor_keys: Mutex<MonitorKeySet>,
     /// `MonitorName::to_string()` → VSS key, for `archive_persisted_channel`.
     name_to_vss_key: Mutex<HashMap<String, String>>,
     /// Serializes manifest read-modify-write cycles across channels.
@@ -566,7 +693,21 @@ impl Inner {
             if self.is_fenced() {
                 return Err(FenceStop);
             }
-            let keys: Vec<String> = self.monitor_keys.lock().unwrap().iter().cloned().collect();
+            let keys = self.monitor_keys.lock().unwrap().publishable();
+            if keys.is_empty() {
+                // Unreachable by construction: `run_monitor_job` marks the
+                // key publishable the moment its blob lands remotely, which
+                // is strictly before this gating write. Log loudly but never
+                // wedge — the monitor is already durable both remotely and
+                // locally, so halting channel operations over a state that
+                // cannot occur would be strictly worse than proceeding.
+                log_error!(
+                    self.logger,
+                    "Gating manifest write found no publishable monitor keys; skipping the put \
+                     rather than publishing an empty manifest"
+                );
+                return Ok(());
+            }
             let payload =
                 serde_json::to_vec(&keys).expect("a vec of strings always serializes to JSON");
             let version = self.cached_version(MONITOR_MANIFEST_KEY);
@@ -580,7 +721,14 @@ impl Inner {
                         self.record_version(MONITOR_MANIFEST_KEY, remote_version);
                         match parse_monitor_manifest(&remote_bytes) {
                             Ok(server_keys) => {
-                                self.monitor_keys.lock().unwrap().extend(server_keys);
+                                // Server keys came OUT of a published manifest,
+                                // so they are publishable by provenance: merging
+                                // them back is what keeps a manifest write from
+                                // dropping a key another device tracks.
+                                let mut set = self.monitor_keys.lock().unwrap();
+                                for key in server_keys {
+                                    set.mark_publishable(key);
+                                }
                             }
                             Err(e) => log_error!(
                                 self.logger,
@@ -626,7 +774,11 @@ impl Inner {
         }
         let _guard = self.manifest_lock.lock().await;
         for _ in 0..2 {
-            let keys: Vec<String> = self.monitor_keys.lock().unwrap().iter().cloned().collect();
+            let keys = self.monitor_keys.lock().unwrap().publishable();
+            if keys.is_empty() {
+                self.retire_manifest(remote.as_ref()).await;
+                return;
+            }
             let payload =
                 serde_json::to_vec(&keys).expect("a vec of strings always serializes to JSON");
             let version = self.cached_version(MONITOR_MANIFEST_KEY);
@@ -639,7 +791,10 @@ impl Inner {
                     Ok(Some((remote_bytes, remote_version))) => {
                         self.record_version(MONITOR_MANIFEST_KEY, remote_version);
                         if let Ok(server_keys) = parse_monitor_manifest(&remote_bytes) {
-                            self.monitor_keys.lock().unwrap().extend(server_keys);
+                            let mut set = self.monitor_keys.lock().unwrap();
+                            for key in server_keys {
+                                set.mark_publishable(key);
+                            }
                         }
                     }
                     Ok(None) => self.record_version(MONITOR_MANIFEST_KEY, 0),
@@ -658,6 +813,49 @@ impl Inner {
             self.logger,
             "Best-effort manifest write still conflicted after a merge retry; giving up"
         );
+    }
+
+    /// The empty-publishable-set branch of the manifest rule: never put `[]`.
+    ///
+    /// `parse_monitor_manifest` rejects an empty array as corrupt (matching the
+    /// PWA), so publishing one would brick every later restore with
+    /// `RestoreError::ValidationFailed` — the same class of permanent failure
+    /// as publishing an unreachable key. Leaving a stale manifest behind is no
+    /// better when the keys it names are gone, so:
+    ///
+    /// - a manifest version we know about means one exists remotely that we are
+    ///   responsible for; DELETE it, leaving a zero-channel backup that
+    ///   `fetch_manifest` reads as `Ok(None)`;
+    /// - no known version means no manifest of ours exists; do nothing.
+    ///
+    /// A conflicting delete is logged and abandoned, not retried: a 409 means
+    /// another client has written a newer manifest that is now authoritative,
+    /// and overwriting it from our stale view would be the wrong move.
+    async fn retire_manifest(&self, remote: &dyn VssTransport) {
+        let version = self.cached_version(MONITOR_MANIFEST_KEY);
+        if version == 0 {
+            log_info!(
+                self.logger,
+                "No publishable monitor keys and no known manifest version; leaving the remote \
+                 manifest untouched"
+            );
+            return;
+        }
+        match remote.delete(MONITOR_MANIFEST_KEY, version).await {
+            Ok(()) => {
+                self.versions.lock().unwrap().remove(MONITOR_MANIFEST_KEY);
+                log_info!(
+                    self.logger,
+                    "Last publishable monitor key is gone; retired the remote manifest so later \
+                     restores see a zero-channel backup"
+                );
+            }
+            Err(e) => log_error!(
+                self.logger,
+                "Retiring the remote manifest failed ({e}); leaving it for the next session \
+                 rather than publishing an empty one"
+            ),
+        }
     }
 
     /// Local write with indefinite retry: a failing local disk halts the
@@ -701,6 +899,16 @@ impl Inner {
         {
             return;
         }
+        // A blob now demonstrably exists under this exact key, so publishing it
+        // is safe. This fires for EVERY successful monitor put, new channel or
+        // update alike: an update writes a real blob under the key we derived,
+        // so a divergently-adopted monitor heals into publishability the first
+        // time the store updates it. Scoping this to `is_new` would leave such
+        // a monitor unpublishable forever even after its key became real.
+        self.monitor_keys
+            .lock()
+            .unwrap()
+            .mark_publishable(write.vss_key.clone());
         if is_new {
             let guard = self.manifest_lock.lock().await;
             let result = self.write_manifest_with_retry_locked().await;
@@ -908,7 +1116,7 @@ impl VssBackedStore {
         logger: Arc<Logger>,
         tuning: RetryTuning,
         versions: HashMap<String, i64>,
-        monitor_keys: BTreeSet<String>,
+        monitor_keys: MonitorKeySet,
         probe_empty: bool,
     ) -> Self {
         let fenced_flag_path = storage_dir.join(FENCED_FLAG_FILE_NAME);
@@ -957,7 +1165,16 @@ impl VssBackedStore {
             .lock()
             .unwrap()
             .insert(monitor.persistence_key().to_string(), vss_key.clone());
-        self.inner.monitor_keys.lock().unwrap().insert(vss_key);
+        // Tracked, never asserted publishable: this key was RE-DERIVED from the
+        // monitor's funding outpoint and nothing here knows whether the remote
+        // blob is stored under that spelling. The insert is non-demoting, so a
+        // key the startup seed already proved publishable keeps that evidence
+        // instead of being reset on every boot.
+        self.inner
+            .monitor_keys
+            .lock()
+            .unwrap()
+            .insert_unverified(vss_key);
     }
 
     /// Whether the fence has tripped (durable across restarts via the flag
@@ -1023,11 +1240,13 @@ impl VssBackedStore {
             };
         }
         if is_new {
+            // Tracked now so the gate covers the channel; promoted to
+            // publishable in `run_monitor_job` once the blob actually lands.
             self.inner
                 .monitor_keys
                 .lock()
                 .unwrap()
-                .insert(write.vss_key.clone());
+                .insert_unverified(write.vss_key.clone());
         }
         if self.inner.is_fenced() {
             // Poisoned: zero further puts. InProgress with no completion
@@ -1461,7 +1680,7 @@ mod tests {
             Arc::new(Logger),
             fast_tuning(),
             versions,
-            BTreeSet::new(),
+            MonitorKeySet::default(),
             false,
         ));
         let completion = Arc::new(RecordingCompletion::default());
@@ -1554,6 +1773,198 @@ mod tests {
             b"monitor-bytes".to_vec()
         );
         assert_eq!(h.sink.degraded_count(), 1, "one degraded event per outage");
+    }
+
+    // ---------- publishability of monitor keys ----------
+
+    /// Provenance moves UP only. A boot-time re-derivation
+    /// (`register_loaded_monitor` -> `insert_unverified`) must never demote a
+    /// key the startup seed or a successful put already proved publishable, or
+    /// the invariant would reset on every restart.
+    #[test]
+    fn tracking_a_key_again_never_demotes_proven_publishability() {
+        let mut set = MonitorKeySet::default();
+        let key = format!("{}:0", "11".repeat(32));
+
+        set.insert_unverified(key.clone());
+        assert_eq!(set.provenance(&key), Some(KeyProvenance::Unverified));
+        assert!(set.publishable().is_empty(), "no evidence yet");
+
+        set.mark_publishable(key.clone());
+        assert_eq!(set.provenance(&key), Some(KeyProvenance::Publishable));
+
+        // The next boot re-derives the same key off local disk.
+        set.insert_unverified(key.clone());
+        assert_eq!(
+            set.provenance(&key),
+            Some(KeyProvenance::Publishable),
+            "re-derivation must not erase evidence the store legitimately holds"
+        );
+        assert_eq!(set.publishable(), vec![key]);
+    }
+
+    /// The set stays TOTAL for the completion gate while publication filters to
+    /// the proven subset — narrowing the tracked set instead would let a later
+    /// manifest write drop a key another device tracks.
+    #[test]
+    fn tracked_membership_is_total_while_publication_is_filtered() {
+        let proven = format!("{}:0", "22".repeat(32));
+        let derived = format!("{}:1", "33".repeat(32));
+        let set = MonitorKeySet::from_parts(
+            [proven.clone(), derived.clone()],
+            &BTreeSet::from([proven.clone()]),
+        );
+
+        assert_eq!(
+            set.tracked(),
+            BTreeSet::from([proven.clone(), derived.clone()]),
+            "the gate covers both monitors"
+        );
+        assert_eq!(
+            set.publishable(),
+            vec![proven],
+            "only the confirmed key may be published"
+        );
+        assert!(
+            set.contains(&derived),
+            "the unverifiable key is still tracked"
+        );
+    }
+
+    /// `tracked_only` is the fund-safe default and `all_publishable` the
+    /// evidence-backed one; removal drops a key from both views.
+    #[test]
+    fn seed_constructors_and_removal_behave() {
+        let a = format!("{}:0", "44".repeat(32));
+        let b = format!("{}:0", "55".repeat(32));
+
+        let tracked = MonitorKeySet::tracked_only([a.clone(), b.clone()]);
+        assert!(tracked.publishable().is_empty());
+        assert_eq!(tracked.tracked().len(), 2);
+
+        let mut published = MonitorKeySet::all_publishable([a.clone(), b.clone()]);
+        assert_eq!(published.publishable(), vec![a.clone(), b.clone()]);
+
+        published.remove(&a);
+        assert!(!published.contains(&a));
+        assert_eq!(published.publishable(), vec![b]);
+        assert!(!published.is_empty());
+    }
+
+    /// A key the store merely tracks never reaches a published payload, while a
+    /// monitor the store actually WROTE does — the whole invariant, observed
+    /// through what the transport received rather than an in-process accessor.
+    #[test]
+    fn only_keys_the_store_wrote_reach_a_published_manifest() {
+        let h = harness();
+        let derived_only = format!("{}:7", "66".repeat(32));
+        // Stands in for `register_loaded_monitor` over an adopted monitor whose
+        // stored key we could not reproduce.
+        h.store
+            .inner
+            .monitor_keys
+            .lock()
+            .unwrap()
+            .insert_unverified(derived_only.clone());
+
+        let write = monitor_write(0x77, 1, b"a real new channel");
+        let written_key = write.vss_key.clone();
+        h.store.queue_monitor_write(write, true);
+        wait_until(&h.rt, || !h.completion.0.lock().unwrap().is_empty());
+
+        let published = h.transport.put_payloads_for(MONITOR_MANIFEST_KEY);
+        assert!(!published.is_empty(), "the gating manifest write happened");
+        for payload in &published {
+            let keys = parse_monitor_manifest(payload)
+                .expect("every published payload must be a VALID manifest");
+            assert!(
+                keys.contains(&written_key),
+                "the monitor we wrote must be published"
+            );
+            assert!(
+                !keys.contains(&derived_only),
+                "a merely-tracked key must never be published"
+            );
+        }
+        assert!(
+            h.store
+                .inner
+                .monitor_keys
+                .lock()
+                .unwrap()
+                .contains(&derived_only),
+            "but it stays tracked, so the completion gate still covers it"
+        );
+    }
+
+    /// The backfill route with a non-empty TRACKED set whose publishable subset
+    /// is empty, and no known manifest version: neither a put nor a delete may
+    /// reach the transport. Putting `[]` would brick every later restore;
+    /// deleting a manifest that was never ours would be equally wrong.
+    #[test]
+    fn a_backfill_with_nothing_publishable_touches_the_remote_manifest_not_at_all() {
+        let h = harness();
+        h.store
+            .inner
+            .monitor_keys
+            .lock()
+            .unwrap()
+            .insert_unverified(format!("{}:0", "88".repeat(32)));
+
+        h.store.backfill_manifest_if_needed();
+        // Give the spawned best-effort write every chance to misbehave.
+        h.rt.block_on(async { tokio::time::sleep(Duration::from_millis(60)).await });
+
+        assert!(
+            h.transport
+                .put_payloads_for(MONITOR_MANIFEST_KEY)
+                .is_empty(),
+            "no manifest payload may be published when nothing is publishable"
+        );
+        assert!(
+            h.transport.value(MONITOR_MANIFEST_KEY).is_none(),
+            "and no manifest may be created"
+        );
+    }
+
+    /// Archiving one of TWO channels still rewrites the manifest with the
+    /// survivor — the retire branch is only for the genuinely-empty case.
+    #[test]
+    fn archiving_one_of_two_channels_republishes_the_survivor() {
+        use std::str::FromStr as _;
+        let h = harness();
+        let doomed_hex = "99".repeat(32);
+        let survivor_hex = "aa".repeat(32);
+
+        h.store
+            .queue_monitor_write(monitor_write(0x99, 1, b"doomed"), true);
+        wait_until(&h.rt, || !h.completion.0.lock().unwrap().is_empty());
+        h.store
+            .queue_monitor_write(monitor_write(0xaa, 1, b"survivor"), true);
+        wait_until(&h.rt, || {
+            h.transport.value(&format!("{survivor_hex}:0")).is_some()
+        });
+
+        Persist::<lightning::sign::InMemorySigner>::archive_persisted_channel(
+            &*h.store,
+            MonitorName::V1Channel(lightning::chain::transaction::OutPoint {
+                txid: bitcoin::Txid::from_str(&doomed_hex).unwrap(),
+                index: 0,
+            }),
+        );
+
+        wait_until(&h.rt, || {
+            h.transport.value(&format!("{doomed_hex}:0")).is_none()
+        });
+        let (bytes, _) = h
+            .transport
+            .value(MONITOR_MANIFEST_KEY)
+            .expect("the manifest survives while a channel remains");
+        assert_eq!(
+            parse_monitor_manifest(&bytes).unwrap(),
+            vec![format!("{survivor_hex}:0")],
+            "the surviving channel stays listed"
+        );
     }
 
     // ---------- scenario 2: manifest gates new channels ----------
@@ -1669,7 +2080,7 @@ mod tests {
             Arc::new(Logger),
             fast_tuning(),
             HashMap::new(),
-            BTreeSet::new(),
+            MonitorKeySet::default(),
             false,
         );
         assert!(rebuilt.is_fenced(), "the fenced flag survives restart");
@@ -1770,12 +2181,14 @@ mod tests {
             &serde_json::to_vec(&vec![their_key.clone()]).unwrap(),
             3,
         );
+        // Publishable: this is a monitor we ourselves wrote and therefore
+        // republish — the merge is about not DROPPING the server's key.
         h.store
             .inner
             .monitor_keys
             .lock()
             .unwrap()
-            .insert(our_key.clone());
+            .mark_publishable(our_key.clone());
         // Stale manifest version (0) → conflict on the first put.
 
         h.rt.block_on(async {
@@ -2029,7 +2442,7 @@ mod tests {
             Arc::new(Logger),
             RetryTuning::default(),
             HashMap::new(),
-            BTreeSet::new(),
+            MonitorKeySet::default(),
             false,
         );
         let write = monitor_write(0x5e, 2, b"local-only");
@@ -2101,15 +2514,19 @@ mod tests {
             "the live monitor file is removed after the archive move"
         );
 
-        // Remote (fire-and-forget): the delete lands and the rewritten
-        // manifest no longer lists the key.
+        // Remote (fire-and-forget): the monitor blob delete lands, and because
+        // this was the ONLY channel the manifest is RETIRED rather than
+        // rewritten as `[]` — `parse_monitor_manifest` rejects an empty array,
+        // so publishing one would brick every later restore. Absent reads as a
+        // zero-channel backup, which `fetch_manifest` handles as `Ok(None)`.
         wait_until(&h.rt, || h.transport.value(&vss_key).is_none());
-        let (manifest_bytes, _) = h.transport.value(MONITOR_MANIFEST_KEY).unwrap();
-        let manifest: Vec<String> = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(
-            !manifest.contains(&vss_key),
-            "the manifest must not list the archived key"
-        );
+        wait_until(&h.rt, || h.transport.value(MONITOR_MANIFEST_KEY).is_none());
+        // While the channel was live its key was legitimately published; what
+        // must never happen is a payload `parse_monitor_manifest` would reject.
+        for payload in h.transport.put_payloads_for(MONITOR_MANIFEST_KEY) {
+            parse_monitor_manifest(&payload)
+                .expect("every published manifest payload must be a VALID manifest");
+        }
         assert!(
             !h.store
                 .inner

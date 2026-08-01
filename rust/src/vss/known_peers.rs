@@ -198,9 +198,9 @@ impl KnownPeersStore {
 mod tests {
     use super::*;
     use crate::node::{CoreEvent, EventSink};
-    use crate::vss::store::{RetryTuning, VssTransport};
+    use crate::vss::store::{MonitorKeySet, RetryTuning, VssTransport};
     use crate::vss::test_support::MockTransport;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
     use std::time::Duration;
 
     struct NullSink;
@@ -232,7 +232,7 @@ mod tests {
                 cm_attempt_timeout: Duration::from_millis(200),
             },
             HashMap::new(),
-            BTreeSet::new(),
+            MonitorKeySet::default(),
             false,
         ));
         (transport, local, vss)
