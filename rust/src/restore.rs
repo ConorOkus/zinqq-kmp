@@ -1713,15 +1713,23 @@ mod tests {
 
     /// Spins until `condition` holds or the budget runs out — the store's
     /// manifest writes are fire-and-forget on the runtime.
-    fn settle(rt: &tokio::runtime::Runtime, mut condition: impl FnMut() -> bool) {
+    ///
+    /// Returns whether the condition ever held, so a caller waiting for
+    /// something that MUST happen can assert on it. A bare `settle(..)` is a
+    /// bounded wait whose timeout is an acceptable outcome; a wait that a later
+    /// negative assertion depends on must be `assert!(settle(..), ..)`, or that
+    /// assertion passes vacuously when the awaited state never arrives.
+    #[must_use]
+    fn settle(rt: &tokio::runtime::Runtime, mut condition: impl FnMut() -> bool) -> bool {
         rt.block_on(async {
             for _ in 0..500 {
                 if condition() {
-                    return;
+                    return true;
                 }
                 tokio::time::sleep(Duration::from_millis(4)).await;
             }
-        });
+            false
+        })
     }
 
     /// Every `_monitor_keys` set the client actually ASKED the transport to
@@ -2736,7 +2744,11 @@ mod tests {
         let restarted = restart_over(dir.path(), &transport);
 
         restarted.store.backfill_manifest_if_needed();
-        settle(&restarted.rt, || {
+        // Deliberately NOT asserted: with only the unverifiable key tracked
+        // there is nothing publishable, so route 1 correctly publishes nothing
+        // and this wait is expected to time out on a fixed tree. It exists to
+        // give the spawned best-effort write every chance to misbehave.
+        let _ = settle(&restarted.rt, || {
             !transport.put_payloads_for(MONITOR_MANIFEST_KEY).is_empty()
         });
 
@@ -2752,14 +2764,27 @@ mod tests {
             },
             true,
         );
-        settle(&restarted.rt, || {
-            transport.value(&new_channel.raw_key).is_some()
-        });
-        settle(&restarted.rt, || {
-            published_manifest_sets(&transport)
-                .iter()
-                .any(|set| set.contains(&new_channel.raw_key))
-        });
+        // These two MUST happen, and the negative assertion below is only
+        // meaningful if they did: a regression that broke the legitimate
+        // new-channel publish would leave nothing published, so the loop over
+        // `published_manifest_sets` would iterate an empty vec and pass while
+        // route 2 was silently dead. Both restore doors also still succeed via
+        // orphan adoption, so nothing further in this test would catch it.
+        assert!(
+            settle(&restarted.rt, || {
+                transport.value(&new_channel.raw_key).is_some()
+            }),
+            "the new channel's monitor blob must reach the transport"
+        );
+        assert!(
+            settle(&restarted.rt, || {
+                published_manifest_sets(&transport)
+                    .iter()
+                    .any(|set| set.contains(&new_channel.raw_key))
+            }),
+            "route 2 must publish a manifest naming the new channel — without it the \
+             unverifiable-key assertion below would pass vacuously"
+        );
 
         // Neither route may ever name the key we could not verify. Every
         // published payload must also be a VALID manifest — `published_manifest_sets`
