@@ -1399,7 +1399,7 @@ mod tests {
                 cm_attempt_timeout: Duration::from_millis(200),
             },
             HashMap::new(),
-            std::collections::BTreeSet::new(),
+            crate::vss::store::MonitorKeySet::default(),
             false,
         ));
         KnownPeersStore::load(local, vss, Arc::new(Logger))

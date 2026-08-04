@@ -54,8 +54,8 @@ use lightning_persister::fs_store::FilesystemStore;
 
 use super::known_peers::{read_local_known_peers, serialize_known_peers};
 use super::store::{
-    monitor_vss_key, VssTransport, CHANNEL_MANAGER_VSS_KEY, FIXED_REMOTE_KEYS, KNOWN_PEERS_VSS_KEY,
-    MONITOR_MANIFEST_KEY,
+    monitor_vss_key, MonitorKeySet, VssTransport, CHANNEL_MANAGER_VSS_KEY, FIXED_REMOTE_KEYS,
+    KNOWN_PEERS_VSS_KEY, MONITOR_MANIFEST_KEY,
 };
 use crate::builder::BuildError;
 use crate::keys::RESTORE_IN_PROGRESS_FILE_NAME;
@@ -71,9 +71,10 @@ pub(crate) struct VssStartupState {
     pub remote: Option<Arc<dyn VssTransport>>,
     /// Version cache seeds: plaintext key → server version.
     pub versions: HashMap<String, i64>,
-    /// The `_monitor_keys` set (from the recovered manifest or local
-    /// monitors).
-    pub monitor_keys: BTreeSet<String>,
+    /// The `_monitor_keys` tracking set (from the recovered manifest or local
+    /// monitors), carrying per-key publishability so the store never publishes
+    /// a key it has no evidence names a reachable blob.
+    pub monitor_keys: MonitorKeySet,
     /// Whether `listKeyVersions` returned empty this session (KTD-3's
     /// version-0 write precondition).
     pub probe_empty: bool,
@@ -88,7 +89,7 @@ impl VssStartupState {
         Self {
             remote: None,
             versions: HashMap::new(),
-            monitor_keys: BTreeSet::new(),
+            monitor_keys: MonitorKeySet::default(),
             probe_empty: false,
             recovered: false,
         }
@@ -202,7 +203,7 @@ pub(crate) fn establish_vss_state(
             return Ok(VssStartupState {
                 remote: Some(transport),
                 versions: HashMap::new(),
-                monitor_keys: BTreeSet::new(),
+                monitor_keys: MonitorKeySet::default(),
                 probe_empty: true,
                 recovered: false,
             });
@@ -290,7 +291,9 @@ pub(crate) fn establish_vss_state(
                 Ok(VssStartupState {
                     remote: Some(transport),
                     versions,
-                    monitor_keys,
+                    // The transactional batch just wrote every monitor blob
+                    // under exactly these keys, so all of them are publishable.
+                    monitor_keys: MonitorKeySet::all_publishable(monitor_keys),
                     // The probe returned empty this session, which is what
                     // authorized the version-0 batch.
                     probe_empty: true,
@@ -311,7 +314,10 @@ pub(crate) fn establish_vss_state(
                 Ok(VssStartupState {
                     remote: None,
                     versions: HashMap::new(),
-                    monitor_keys,
+                    // Nothing reached the remote, so nothing is publishable.
+                    // (`remote: None` makes publication a no-op this session
+                    // regardless; unverified is the fund-safe default.)
+                    monitor_keys: MonitorKeySet::tracked_only(monitor_keys),
                     probe_empty: true,
                     recovered: false,
                 })
@@ -338,10 +344,26 @@ pub(crate) fn establish_vss_state(
             "Seeded {} VSS version(s) from the server listing",
             versions.len()
         );
+        // A monitor key landed in `versions` exactly when its obfuscated form
+        // appeared in the listing — i.e. a blob demonstrably exists remotely
+        // under that exact spelling — so the loop above has already computed
+        // publishability and no second `obfuscate` pass is needed.
+        //
+        // Absence is safe as NEGATIVE evidence only because
+        // `VssClient::list_key_versions` pages to exhaustion and returns
+        // `VssError::TooManyListPages` rather than silently truncating: a
+        // partial listing would mark real keys unverified and quietly drop them
+        // from later published manifests. If that guarantee ever changes, this
+        // seeding must stop treating absence as proof.
+        let observed_remotely: BTreeSet<String> = monitor_keys
+            .iter()
+            .filter(|key| versions.contains_key(*key))
+            .cloned()
+            .collect();
         Ok(VssStartupState {
             remote: Some(transport),
+            monitor_keys: MonitorKeySet::from_parts(monitor_keys, &observed_remotely),
             versions,
-            monitor_keys,
             probe_empty: false,
             recovered: false,
         })
@@ -477,7 +499,14 @@ fn silent_recovery(
     );
     Ok(VssStartupState {
         versions: plan.versions(),
-        monitor_keys: plan.monitor_keys(),
+        // Tracked in full so the gate covers every recovered monitor; only the
+        // keys the restore could CONFIRM are publishable. An adopted monitor
+        // whose stored key we could not reproduce stays tracked-but-unpublishable
+        // across this and every later start.
+        monitor_keys: MonitorKeySet::from_parts(
+            plan.monitor_keys(),
+            &plan.publishable_monitor_keys(),
+        ),
         remote: Some(transport),
         probe_empty: false,
         recovered: true,
